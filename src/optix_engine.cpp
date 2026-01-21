@@ -8,17 +8,6 @@
 
 namespace spectra {
 
-// SBT record structures with proper alignment
-struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) RaygenRecord {
-    char header[OPTIX_SBT_RECORD_HEADER_SIZE];
-    // No additional data for Phase 1
-};
-
-struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) MissRecord {
-    char header[OPTIX_SBT_RECORD_HEADER_SIZE];
-    // No additional data for Phase 1
-};
-
 // OptiX logging callback
 static void optixLogCallback(unsigned int level, const char* tag, const char* message, void* /*cbdata*/) {
     std::cerr << "[OptiX][" << level << "][" << tag << "]: " << message << "\n";
@@ -57,16 +46,33 @@ bool OptixEngine::init(CUcontext cudaContext) {
         return false;
     }
 
+    // Initialize launch params with defaults
+    m_launchParams = {};
+    m_launchParams.scene_handle = 0;
+    m_launchParams.vertex_buffers = nullptr;
+    m_launchParams.index_buffers = nullptr;
+    m_launchParams.instance_material_indices = nullptr;
+
+    // Set default camera
+    m_launchParams.camera.position = make_float3(0.0f, 0.0f, 5.0f);
+    m_launchParams.camera.forward = make_float3(0.0f, 0.0f, -1.0f);
+    m_launchParams.camera.right = make_float3(1.0f, 0.0f, 0.0f);
+    m_launchParams.camera.up = make_float3(0.0f, 1.0f, 0.0f);
+    m_launchParams.camera.fovY = 1.0472f;  // 60 degrees in radians
+    m_launchParams.camera.aspectRatio = 16.0f / 9.0f;
+    m_launchParams.camera.nearPlane = 0.01f;
+    m_launchParams.camera.farPlane = 1000.0f;
+
     return true;
 }
 
 bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
-    // Set pipeline compile options
+    // Set pipeline compile options for Phase 2
     m_pipelineCompileOptions = {};
     m_pipelineCompileOptions.usesMotionBlur = false;
     m_pipelineCompileOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
-    m_pipelineCompileOptions.numPayloadValues = 0;  // No payload for Phase 1
-    m_pipelineCompileOptions.numAttributeValues = 0;  // No attributes for Phase 1
+    m_pipelineCompileOptions.numPayloadValues = 4;      // color (3) + hitDistance (1)
+    m_pipelineCompileOptions.numAttributeValues = 2;    // barycentrics (u, v)
     m_pipelineCompileOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     m_pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";
 
@@ -82,6 +88,12 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
         return false;
     }
 
+    // Load closesthit module
+    auto closesthitPtx = ptxDir / "closesthit.ptx";
+    if (!createModule(closesthitPtx, &m_closesthitModule)) {
+        return false;
+    }
+
     // Create program groups
     if (!createProgramGroups()) {
         return false;
@@ -89,9 +101,9 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
 
     // Link pipeline
     OptixPipelineLinkOptions linkOptions = {};
-    linkOptions.maxTraceDepth = 1;  // Phase 1: no actual tracing
+    linkOptions.maxTraceDepth = 2;  // Primary ray + shadow ray
 
-    OptixProgramGroup programGroups[] = { m_raygenPG, m_missPG };
+    OptixProgramGroup programGroups[] = { m_raygenPG, m_missPG, m_hitgroupPG };
 
     char log[2048];
     size_t logSize = sizeof(log);
@@ -109,7 +121,7 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
 
     std::cout << "[OptiX] Pipeline created\n";
 
-    // Set stack sizes (conservative for Phase 1)
+    // Set stack sizes
     OPTIX_CHECK(optixPipelineSetStackSize(
         m_pipeline,
         2 * 1024,   // Direct callable stack size
@@ -118,8 +130,8 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
         2           // Max traversable depth
     ));
 
-    // Create Shader Binding Table
-    if (!createSBT()) {
+    // Create default SBT (will be updated with materials later)
+    if (!createDefaultSBT()) {
         return false;
     }
 
@@ -211,12 +223,33 @@ bool OptixEngine::createProgramGroups() {
         &m_missPG
     ));
 
+    // Hit group program group (closesthit only for now)
+    OptixProgramGroupDesc hitgroupDesc = {};
+    hitgroupDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitgroupDesc.hitgroup.moduleCH = m_closesthitModule;
+    hitgroupDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+    hitgroupDesc.hitgroup.moduleAH = nullptr;  // No anyhit
+    hitgroupDesc.hitgroup.entryFunctionNameAH = nullptr;
+    hitgroupDesc.hitgroup.moduleIS = nullptr;  // Use built-in triangle intersection
+    hitgroupDesc.hitgroup.entryFunctionNameIS = nullptr;
+
+    logSize = sizeof(log);
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(
+        m_context,
+        &hitgroupDesc,
+        1,
+        &pgOptions,
+        log,
+        &logSize,
+        &m_hitgroupPG
+    ));
+
     std::cout << "[OptiX] Program groups created\n";
 
     return true;
 }
 
-bool OptixEngine::createSBT() {
+bool OptixEngine::createDefaultSBT() {
     // Raygen record
     RaygenRecord raygenRecord;
     OPTIX_CHECK(optixSbtRecordPackHeader(m_raygenPG, &raygenRecord));
@@ -233,9 +266,10 @@ bool OptixEngine::createSBT() {
         return false;
     }
 
-    // Miss record
+    // Miss record with default background color
     MissRecord missRecord;
     OPTIX_CHECK(optixSbtRecordPackHeader(m_missPG, &missRecord));
+    missRecord.backgroundColor = make_float3(0.1f, 0.1f, 0.2f);
 
     err = cudaMalloc(reinterpret_cast<void**>(&m_missRecord), sizeof(MissRecord));
     if (err != cudaSuccess) {
@@ -249,19 +283,100 @@ bool OptixEngine::createSBT() {
         return false;
     }
 
+    // Create one default hitgroup record
+    HitGroupRecord hitgroupRecord;
+    OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroupPG, &hitgroupRecord));
+
+    // Default material (gray diffuse)
+    hitgroupRecord.material.baseColor = make_float4(0.8f, 0.8f, 0.8f, 1.0f);
+    hitgroupRecord.material.metallic = 0.0f;
+    hitgroupRecord.material.roughness = 0.5f;
+    hitgroupRecord.material.emissive = make_float3(0.0f, 0.0f, 0.0f);
+    hitgroupRecord.material.baseColorTex = 0;
+    hitgroupRecord.material.normalTex = 0;
+    hitgroupRecord.material.metallicRoughnessTex = 0;
+    hitgroupRecord.material.emissiveTex = 0;
+    hitgroupRecord.material.alphaMode = ALPHA_MODE_OPAQUE;
+    hitgroupRecord.material.alphaCutoff = 0.5f;
+    hitgroupRecord.geometryIndex = 0;
+
+    err = cudaMalloc(reinterpret_cast<void**>(&m_hitgroupRecords), sizeof(HitGroupRecord));
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to allocate hitgroup record: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    err = cudaMemcpy(reinterpret_cast<void*>(m_hitgroupRecords), &hitgroupRecord,
+                     sizeof(HitGroupRecord), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to copy hitgroup record: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    m_hitgroupRecordCount = 1;
+
     // Set up SBT
     m_sbt = {};
     m_sbt.raygenRecord = m_raygenRecord;
     m_sbt.missRecordBase = m_missRecord;
     m_sbt.missRecordStrideInBytes = sizeof(MissRecord);
     m_sbt.missRecordCount = 1;
-
-    // No hit groups for Phase 1
-    m_sbt.hitgroupRecordBase = 0;
-    m_sbt.hitgroupRecordStrideInBytes = 0;
-    m_sbt.hitgroupRecordCount = 0;
+    m_sbt.hitgroupRecordBase = m_hitgroupRecords;
+    m_sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
+    m_sbt.hitgroupRecordCount = 1;
 
     std::cout << "[OptiX] Shader Binding Table created\n";
+
+    return true;
+}
+
+bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
+                            const std::vector<uint32_t>& geometryIndices) {
+    if (materials.empty()) {
+        std::cerr << "[OptiX] No materials provided for SBT\n";
+        return false;
+    }
+
+    if (materials.size() != geometryIndices.size()) {
+        std::cerr << "[OptiX] Material and geometry index count mismatch\n";
+        return false;
+    }
+
+    // Free old hitgroup records
+    if (m_hitgroupRecords) {
+        cudaFree(reinterpret_cast<void*>(m_hitgroupRecords));
+        m_hitgroupRecords = 0;
+    }
+
+    // Create hitgroup records for each material
+    std::vector<HitGroupRecord> records(materials.size());
+
+    for (size_t i = 0; i < materials.size(); ++i) {
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroupPG, &records[i]));
+        records[i].material = materials[i];
+        records[i].geometryIndex = geometryIndices[i];
+    }
+
+    // Allocate and copy
+    size_t recordsSize = sizeof(HitGroupRecord) * records.size();
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&m_hitgroupRecords), recordsSize);
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to allocate hitgroup records: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    err = cudaMemcpy(reinterpret_cast<void*>(m_hitgroupRecords), records.data(),
+                     recordsSize, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to copy hitgroup records: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+
+    m_hitgroupRecordCount = records.size();
+
+    // Update SBT
+    m_sbt.hitgroupRecordBase = m_hitgroupRecords;
+    m_sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
+    m_sbt.hitgroupRecordCount = static_cast<unsigned int>(m_hitgroupRecordCount);
+
+    std::cout << "[OptiX] SBT updated with " << materials.size() << " materials\n";
 
     return true;
 }
@@ -279,6 +394,10 @@ void OptixEngine::shutdown() {
         cudaFree(reinterpret_cast<void*>(m_missRecord));
         m_missRecord = 0;
     }
+    if (m_hitgroupRecords) {
+        cudaFree(reinterpret_cast<void*>(m_hitgroupRecords));
+        m_hitgroupRecords = 0;
+    }
     if (m_pipeline) {
         optixPipelineDestroy(m_pipeline);
         m_pipeline = nullptr;
@@ -291,6 +410,10 @@ void OptixEngine::shutdown() {
         optixProgramGroupDestroy(m_missPG);
         m_missPG = nullptr;
     }
+    if (m_hitgroupPG) {
+        optixProgramGroupDestroy(m_hitgroupPG);
+        m_hitgroupPG = nullptr;
+    }
     if (m_raygenModule) {
         optixModuleDestroy(m_raygenModule);
         m_raygenModule = nullptr;
@@ -298,6 +421,10 @@ void OptixEngine::shutdown() {
     if (m_missModule) {
         optixModuleDestroy(m_missModule);
         m_missModule = nullptr;
+    }
+    if (m_closesthitModule) {
+        optixModuleDestroy(m_closesthitModule);
+        m_closesthitModule = nullptr;
     }
     if (m_context) {
         optixDeviceContextDestroy(m_context);
@@ -310,6 +437,19 @@ void OptixEngine::shutdown() {
 void OptixEngine::setDimensions(uint32_t width, uint32_t height) {
     m_width = width;
     m_height = height;
+}
+
+void OptixEngine::setCamera(const CameraParams& camera) {
+    m_launchParams.camera = camera;
+}
+
+void OptixEngine::setSceneHandle(OptixTraversableHandle handle) {
+    m_launchParams.scene_handle = handle;
+}
+
+void OptixEngine::setGeometryBuffers(CUdeviceptr* vertexBuffers, CUdeviceptr* indexBuffers) {
+    m_launchParams.vertex_buffers = vertexBuffers;
+    m_launchParams.index_buffers = indexBuffers;
 }
 
 void OptixEngine::render(float4* outputBuffer, cudaStream_t stream) {

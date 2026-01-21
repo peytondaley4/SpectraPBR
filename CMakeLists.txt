@@ -112,6 +112,17 @@ else()
 endif()
 
 #------------------------------------------------------------------------------
+# tinygltf - glTF 2.0 loader (header only)
+#------------------------------------------------------------------------------
+FetchContent_Declare(
+    tinygltf
+    GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+    GIT_TAG        v2.8.18
+)
+FetchContent_MakeAvailable(tinygltf)
+message(STATUS "tinygltf fetched")
+
+#------------------------------------------------------------------------------
 # OptiX PTX Compilation
 #------------------------------------------------------------------------------
 # Function to compile CUDA files to PTX for OptiX
@@ -125,6 +136,8 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
     set(include_flags
         -I${OptiX_INCLUDE_DIRS}
         -I${CUDAToolkit_INCLUDE_DIRS}
+        -I${CMAKE_CURRENT_SOURCE_DIR}/src
+        -I${CMAKE_CURRENT_SOURCE_DIR}/optix_programs
     )
 
     # NVCC flags for PTX compilation
@@ -172,8 +185,13 @@ compile_optix_ptx(spectra_ptx
     MISS_PTX
 )
 
+compile_optix_ptx(spectra_ptx
+    "${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/closesthit.cu"
+    CLOSESTHIT_PTX
+)
+
 # Custom target for PTX files
-add_custom_target(optix_ptx ALL DEPENDS ${RAYGEN_PTX} ${MISS_PTX})
+add_custom_target(optix_ptx ALL DEPENDS ${RAYGEN_PTX} ${MISS_PTX} ${CLOSESTHIT_PTX})
 
 #------------------------------------------------------------------------------
 # Main Executable
@@ -184,6 +202,12 @@ add_executable(SpectraPBR
     src/cuda_interop.cpp
     src/optix_engine.cpp
     src/shader_utils.cpp
+    src/camera.cpp
+    src/model_loader.cpp
+    src/geometry_manager.cpp
+    src/texture_manager.cpp
+    src/material_manager.cpp
+    src/scene_manager.cpp
 )
 
 # Include directories
@@ -191,6 +215,7 @@ target_include_directories(SpectraPBR PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${OptiX_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
+    ${tinygltf_SOURCE_DIR}
 )
 
 # Link libraries
@@ -230,6 +255,9 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_BINARY_DIR}/optix_programs/miss.ptx"
             "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_BINARY_DIR}/optix_programs/closesthit.ptx"
+            "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
     COMMENT "Copying PTX files to build directory"
 )
 
@@ -241,6 +269,7 @@ install(DIRECTORY shaders/ DESTINATION bin/shaders)
 install(FILES
     ${CMAKE_BINARY_DIR}/optix_programs/raygen.ptx
     ${CMAKE_BINARY_DIR}/optix_programs/miss.ptx
+    ${CMAKE_BINARY_DIR}/optix_programs/closesthit.ptx
     DESTINATION bin/optix_programs
 )
 

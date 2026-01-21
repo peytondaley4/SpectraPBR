@@ -207,18 +207,26 @@ void GLContext::setResolution(uint32_t width, uint32_t height) {
         return;
     }
 
-    m_width = width;
-    m_height = height;
-    glViewport(0, 0, width, height);
-
     if (!m_fullscreen) {
+        // In windowed mode, just set the window size.
+        // This will trigger framebufferSizeCallback which handles everything:
+        // pre-resize callback, buffer recreation, and post-resize callback.
         glfwSetWindowSize(m_window, width, height);
-    }
+    } else {
+        // In fullscreen mode, glfwSetWindowSize doesn't trigger the callback,
+        // so we need to handle everything manually here.
+        if (m_preResizeCallback) {
+            m_preResizeCallback();
+        }
 
-    recreateBuffers();
+        m_width = width;
+        m_height = height;
+        glViewport(0, 0, width, height);
+        recreateBuffers();
 
-    if (m_resizeCallback) {
-        m_resizeCallback(width, height);
+        if (m_resizeCallback) {
+            m_resizeCallback(width, height);
+        }
     }
 }
 
@@ -231,19 +239,31 @@ void GLContext::recreateBuffers() {
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    // Recreate PBO
+    // Completely delete and recreate PBO (not just reallocate)
+    // This ensures CUDA gets a fresh GL object after re-registration
     if (m_pbo) {
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glDeleteBuffers(1, &m_pbo);
+        m_pbo = 0;
     }
+    
+    glGenBuffers(1, &m_pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height << "\n";
+    std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height 
+              << " (PBO " << m_pbo << ", " << getBufferSize() / (1024 * 1024) << " MB)\n";
 }
 
 void GLContext::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
     auto* ctx = static_cast<GLContext*>(glfwGetWindowUserPointer(window));
     if (ctx && width > 0 && height > 0) {
+        // Notify pre-resize callback BEFORE recreating buffers
+        // This allows CUDA to unregister resources before the PBO is invalidated
+        if (ctx->m_preResizeCallback) {
+            ctx->m_preResizeCallback();
+        }
+
         ctx->m_width = width;
         ctx->m_height = height;
         glViewport(0, 0, width, height);

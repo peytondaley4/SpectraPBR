@@ -121,37 +121,27 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
 
     set(ptx_file "${CMAKE_BINARY_DIR}/optix_programs/${cuda_file_name}.ptx")
 
-    # Determine include paths
-    set(include_flags
-        -I${OptiX_INCLUDE_DIRS}
-        -I${CUDAToolkit_INCLUDE_DIRS}
-    )
-
-    # NVCC flags for PTX compilation
-    set(nvcc_flags
-        --ptx
-        -O3
-        --use_fast_math
-        -lineinfo
-        --machine=64
-    )
-
-    # Add architecture flags
-    foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
-        list(APPEND nvcc_flags --gpu-architecture=compute_${arch})
-    endforeach()
-
-    # Use the first architecture for PTX output
+    # Use the first architecture for PTX output (PTX is architecture-agnostic)
     list(GET CMAKE_CUDA_ARCHITECTURES 0 first_arch)
+
+    # Get first include directory from each (they may be lists)
+    list(GET OptiX_INCLUDE_DIRS 0 optix_include)
+    list(GET CUDAToolkit_INCLUDE_DIRS 0 cuda_include)
 
     add_custom_command(
         OUTPUT ${ptx_file}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs"
         COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
-                ${nvcc_flags}
-                ${include_flags}
+                --ptx
+                -O3
+                --use_fast_math
+                -lineinfo
+                --machine=64
                 --gpu-architecture=compute_${first_arch}
-                -o ${ptx_file}
+                -I${optix_include}
+                -I${cuda_include}
+                -o
+                ${ptx_file}
                 ${cuda_file_abs}
         DEPENDS ${cuda_file_abs}
         COMMENT "Compiling OptiX PTX: ${cuda_file_name}.cu -> ${cuda_file_name}.ptx"

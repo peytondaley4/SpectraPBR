@@ -139,14 +139,22 @@ int main(int argc, char* argv[]) {
     // Set initial dimensions
     optixEngine.setDimensions(glContext.getWidth(), glContext.getHeight());
 
-    // Set up resize callback
+    // Set up pre-resize callback to unregister CUDA resources BEFORE buffers are invalidated
+    glContext.setPreResizeCallback([&]() {
+        // Ensure all CUDA work is complete before unregistering
+        cudaDeviceSynchronize();
+        // Must unregister PBO before OpenGL recreates the buffer
+        cudaInterop.unregisterPBO();
+    });
+
+    // Set up resize callback to re-register AFTER buffers are recreated
     glContext.setResizeCallback([&](uint32_t width, uint32_t height) {
         std::cout << "[Main] Resize: " << width << "x" << height << "\n";
 
-        // Unregister old PBO
-        cudaInterop.unregisterPBO();
+        // Ensure OpenGL has finished with the buffer before CUDA registers it
+        glFinish();
 
-        // Re-register new PBO
+        // Re-register new PBO (old one was unregistered in pre-resize callback)
         if (!cudaInterop.registerPBO(glContext.getPBO(), glContext.getBufferSize())) {
             std::cerr << "[Main] Failed to re-register PBO after resize\n";
         }

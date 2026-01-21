@@ -52,6 +52,7 @@ struct FrameTimer {
 // Global state for keyboard callbacks
 static FrameTimer g_timer;
 static CudaInterop* g_cudaInterop = nullptr;
+static GLFWkeyfun g_previousKeyCallback = nullptr;
 
 void printTimingCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     (void)window; (void)scancode; (void)mods;
@@ -155,18 +156,16 @@ int main(int argc, char* argv[]) {
     });
 
     // Add debug key handler (T for timing, G for GPU info)
-    // Note: This is a simplified approach - in production you'd have a proper input system
-    GLFWkeyfun previousKeyCallback = glfwSetKeyCallback(glContext.getWindow(), [](GLFWwindow* window, int key, int scancode, int action, int mods) {
-        // Call the GL context's key handler first
-        auto* ctx = static_cast<GLContext*>(glfwGetWindowUserPointer(window));
-        if (ctx) {
-            // The GL context already handles ESC, V, F, 1-4
+    // Chain with existing GLContext key callback
+    g_previousKeyCallback = glfwSetKeyCallback(glContext.getWindow(), [](GLFWwindow* window, int key, int scancode, int action, int mods) {
+        // Call the original GLContext key callback first (handles ESC, V, F, 1-4)
+        if (g_previousKeyCallback) {
+            g_previousKeyCallback(window, key, scancode, action, mods);
         }
 
         // Handle our additional debug keys
         printTimingCallback(window, key, scancode, action, mods);
     });
-    (void)previousKeyCallback;
 
     std::cout << "\n[Main] Initialization complete!\n";
     std::cout << "[Main] Controls:\n";

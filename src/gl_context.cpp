@@ -59,7 +59,7 @@ bool GLContext::init(uint32_t width, uint32_t height, const char* title) {
     std::cout << "[GL] Renderer: " << glGetString(GL_RENDERER) << "\n";
 
     // Enable VSync by default
-    setVSync(true);
+    setVSync(false);
 
     // Set up viewport
     glViewport(0, 0, width, height);

@@ -126,8 +126,29 @@ __forceinline__ __device__ float3 operator/(const float3& a, float s) {
     return make_float3(a.x * invS, a.y * invS, a.z * invS);
 }
 
+__forceinline__ __device__ float3 operator/(const float3& a, const float3& b) {
+    return make_float3(a.x / b.x, a.y / b.y, a.z / b.z);
+}
+
 __forceinline__ __device__ float3 operator-(const float3& v) {
     return make_float3(-v.x, -v.y, -v.z);
+}
+
+// float4 operators
+__forceinline__ __device__ float4 operator*(float s, const float4& a) {
+    return make_float4(a.x * s, a.y * s, a.z * s, a.w * s);
+}
+
+__forceinline__ __device__ float4 operator*(const float4& a, float s) {
+    return make_float4(a.x * s, a.y * s, a.z * s, a.w * s);
+}
+
+__forceinline__ __device__ float4 operator+(const float4& a, const float4& b) {
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+__forceinline__ __device__ float4 operator-(const float4& a, const float4& b) {
+    return make_float4(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w);
 }
 
 //------------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <glad/glad.h>  // Must be included before cuda_gl_interop.h
+#include <cuda.h>       // For CUcontext
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 #include <cstdint>

@@ -161,8 +161,7 @@ void CudaInterop::printDeviceInfo() const {
     std::cout << "  Name: " << prop.name << "\n";
     std::cout << "  Compute: " << prop.major << "." << prop.minor << "\n";
     std::cout << "  SM Count: " << prop.multiProcessorCount << "\n";
-    std::cout << "  Clock: " << prop.clockRate / 1000 << " MHz\n";
-    std::cout << "  Memory Clock: " << prop.memoryClockRate / 1000 << " MHz\n";
+    // clockRate and memoryClockRate removed in CUDA 12+
     std::cout << "  Memory Bus: " << prop.memoryBusWidth << " bit\n";
     std::cout << "  Total Memory: " << prop.totalGlobalMem / (1024 * 1024) << " MB\n";
 }

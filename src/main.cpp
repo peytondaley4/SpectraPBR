@@ -67,13 +67,26 @@ struct FrameTimer {
 static FrameTimer g_timer;
 static CudaInterop* g_cudaInterop = nullptr;
 static Camera* g_camera = nullptr;
+static OptixEngine* g_optixEngine = nullptr;
 static bool g_mouseCaptured = false;
 static double g_lastMouseX = 0.0, g_lastMouseY = 0.0;
 static bool g_firstMouse = true;
+static QualityMode g_qualityMode = QUALITY_BALANCED;
 
 // Input state
 static bool g_keyW = false, g_keyS = false, g_keyA = false, g_keyD = false;
 static bool g_keyQ = false, g_keyE = false, g_keyShift = false;
+
+// Quality mode names for display
+static const char* getQualityModeName(QualityMode mode) {
+    switch (mode) {
+        case QUALITY_FAST: return "Fast";
+        case QUALITY_BALANCED: return "Balanced";
+        case QUALITY_HIGH: return "High";
+        case QUALITY_ACCURATE: return "Accurate";
+        default: return "Unknown";
+    }
+}
 
 void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     (void)scancode; (void)mods;
@@ -180,6 +193,31 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             }
             break;
 
+        // Quality mode switching (F1-F4)
+        case GLFW_KEY_F1:
+            g_qualityMode = QUALITY_FAST;
+            if (g_optixEngine) g_optixEngine->setQualityMode(g_qualityMode);
+            std::cout << "[Main] Quality mode: Fast (Lambertian + basic specular)\n";
+            break;
+
+        case GLFW_KEY_F2:
+            g_qualityMode = QUALITY_BALANCED;
+            if (g_optixEngine) g_optixEngine->setQualityMode(g_qualityMode);
+            std::cout << "[Main] Quality mode: Balanced (Full GGX)\n";
+            break;
+
+        case GLFW_KEY_F3:
+            g_qualityMode = QUALITY_HIGH;
+            if (g_optixEngine) g_optixEngine->setQualityMode(g_qualityMode);
+            std::cout << "[Main] Quality mode: High (VNDF + clearcoat/sheen)\n";
+            break;
+
+        case GLFW_KEY_F4:
+            g_qualityMode = QUALITY_ACCURATE;
+            if (g_optixEngine) g_optixEngine->setQualityMode(g_qualityMode);
+            std::cout << "[Main] Quality mode: Accurate (Full PBR + conductor Fresnel)\n";
+            break;
+
         default:
             break;
     }
@@ -250,10 +288,31 @@ int main(int argc, char* argv[]) {
         ptxDir = std::filesystem::current_path() / "optix_programs";
     }
 
+    // If no model specified, try to find the default cube model from tinygltf
+    if (modelPath.empty()) {
+        // Search paths for the default cube model
+        std::vector<std::filesystem::path> searchPaths = {
+            exePath / "_deps" / "tinygltf-src" / "models" / "Cube" / "Cube.gltf",
+            exePath.parent_path() / "_deps" / "tinygltf-src" / "models" / "Cube" / "Cube.gltf",
+            std::filesystem::current_path() / "build" / "_deps" / "tinygltf-src" / "models" / "Cube" / "Cube.gltf",
+            std::filesystem::current_path() / "_deps" / "tinygltf-src" / "models" / "Cube" / "Cube.gltf",
+        };
+
+        for (const auto& path : searchPaths) {
+            if (std::filesystem::exists(path)) {
+                modelPath = path;
+                std::cout << "[Main] Using default cube model\n";
+                break;
+            }
+        }
+    }
+
     std::cout << "[Main] Shader directory: " << shaderDir << "\n";
     std::cout << "[Main] PTX directory: " << ptxDir << "\n";
     if (!modelPath.empty()) {
         std::cout << "[Main] Model path: " << modelPath << "\n";
+    } else {
+        std::cout << "[Main] No model specified, will show gradient background\n";
     }
     std::cout << "\n";
 
@@ -279,6 +338,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Main] Failed to initialize OptiX\n";
         return 1;
     }
+    g_optixEngine = &optixEngine;
 
     // Create display resources (texture, PBO, shaders)
     if (!glContext.createDisplayResources(shaderDir)) {
@@ -353,25 +413,110 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Main] Model file not found: " << modelPath << "\n";
     }
 
+    //--------------------------------------------------------------------------
+    // Set up default lighting
+    // glTF models may have emissive materials but rarely include explicit lights,
+    // so we provide a default sun-like directional light for visibility.
+    //--------------------------------------------------------------------------
+    
+    // Default directional light (sun) - stored on GPU
+    static GpuDirectionalLight defaultDirLight;
+    defaultDirLight.direction = make_float3(0.5f, -0.8f, 0.3f);  // Sun angle
+    defaultDirLight.angularDiameter = 0.2f;  // Sharp shadows
+    defaultDirLight.irradiance = make_float3(3.0f, 2.9f, 2.7f);  // Warm sunlight
+    
+    CUdeviceptr d_dirLights = 0;
+    cudaMalloc(reinterpret_cast<void**>(&d_dirLights), sizeof(GpuDirectionalLight));
+    cudaMemcpy(reinterpret_cast<void*>(d_dirLights), &defaultDirLight, 
+               sizeof(GpuDirectionalLight), cudaMemcpyHostToDevice);
+    
+    optixEngine.setDirectionalLights(reinterpret_cast<GpuDirectionalLight*>(d_dirLights), 1);
+    
+    std::cout << "[Main] Default directional light (sun) enabled\n";
+
+    // Default area lights (studio-style lighting)
+    // Helper lambda to normalize float3 on host
+    auto normalizeFloat3 = [](float3 v) -> float3 {
+        float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        if (len > 0.0f) {
+            return make_float3(v.x / len, v.y / len, v.z / len);
+        }
+        return v;
+    };
+    
+    static GpuAreaLight defaultAreaLights[2];
+    
+    // Key light - large soft light above and to the right
+    defaultAreaLights[0].position = make_float3(3.0f, 4.0f, 2.0f);
+    defaultAreaLights[0].normal = normalizeFloat3(make_float3(-0.3f, -0.8f, -0.2f));  // Pointing down and left
+    defaultAreaLights[0].tangent = make_float3(1.0f, 0.0f, 0.0f);  // Already normalized
+    defaultAreaLights[0].emission = make_float3(200.0f, 150.0f, 160.0f);  // Slightly warm white
+    defaultAreaLights[0].size = make_float2(2.0f, 2.0f);  // 2x2 meter panel
+    defaultAreaLights[0].area = 4.0f;  // 2 * 2
+    
+    // Fill light - smaller, dimmer light to the left
+    defaultAreaLights[1].position = make_float3(-2.5f, 2.0f, 3.0f);
+    defaultAreaLights[1].normal = normalizeFloat3(make_float3(0.4f, -0.5f, -0.6f));  // Pointing right and down
+    defaultAreaLights[1].tangent = make_float3(0.0f, 0.0f, 1.0f);  // Already normalized
+    defaultAreaLights[1].emission = make_float3(100.0f, 110.0f, 120.0f);  // Cool blue-ish fill
+    defaultAreaLights[1].size = make_float2(1.5f, 1.5f);  // 1.5x1.5 meter panel
+    defaultAreaLights[1].area = 2.25f;  // 1.5 * 1.5
+    
+    CUdeviceptr d_areaLights = 0;
+    cudaMalloc(reinterpret_cast<void**>(&d_areaLights), sizeof(GpuAreaLight) * 2);
+    cudaMemcpy(reinterpret_cast<void*>(d_areaLights), defaultAreaLights, 
+               sizeof(GpuAreaLight) * 2, cudaMemcpyHostToDevice);
+    
+    optixEngine.setAreaLights(reinterpret_cast<GpuAreaLight*>(d_areaLights), 2);
+    
+    std::cout << "[Main] Default area lights (key + fill) enabled\n";
+
     // Set initial dimensions
     optixEngine.setDimensions(glContext.getWidth(), glContext.getHeight());
+
+    // Allocate accumulation buffer for progressive anti-aliasing
+    float4* d_accumulationBuffer = nullptr;
+    size_t accumulationBufferSize = glContext.getWidth() * glContext.getHeight() * sizeof(float4);
+    cudaMalloc(reinterpret_cast<void**>(&d_accumulationBuffer), accumulationBufferSize);
+    optixEngine.setAccumulationBuffer(d_accumulationBuffer);
+    std::cout << "[Main] Accumulation buffer allocated (" << accumulationBufferSize / 1024 << " KB)\n";
+
+    // Track previous camera state for accumulation reset
+    CameraParams prevCameraParams = camera.getCameraParams();
 
     // Set up callbacks
     glfwSetKeyCallback(glContext.getWindow(), keyCallback);
     glfwSetCursorPosCallback(glContext.getWindow(), cursorPosCallback);
     glfwSetScrollCallback(glContext.getWindow(), scrollCallback);
 
-    // Set up resize callback
+    // Set up pre-resize callback to unregister CUDA resources BEFORE buffers are invalidated
+    glContext.setPreResizeCallback([&]() {
+        // Ensure all CUDA work is complete before unregistering
+        cudaDeviceSynchronize();
+        // Must unregister PBO before OpenGL recreates the buffer
+        cudaInterop.unregisterPBO();
+    });
+
+    // Set up resize callback to re-register AFTER buffers are recreated
     glContext.setResizeCallback([&](uint32_t width, uint32_t height) {
         std::cout << "[Main] Resize: " << width << "x" << height << "\n";
 
-        // Unregister old PBO
-        cudaInterop.unregisterPBO();
+        // Ensure OpenGL has finished with the buffer before CUDA registers it
+        glFinish();
 
-        // Re-register new PBO
+        // Re-register new PBO (old one was unregistered in pre-resize callback)
         if (!cudaInterop.registerPBO(glContext.getPBO(), glContext.getBufferSize())) {
             std::cerr << "[Main] Failed to re-register PBO after resize\n";
         }
+
+        // Reallocate accumulation buffer
+        if (d_accumulationBuffer) {
+            cudaFree(d_accumulationBuffer);
+        }
+        accumulationBufferSize = width * height * sizeof(float4);
+        cudaMalloc(reinterpret_cast<void**>(&d_accumulationBuffer), accumulationBufferSize);
+        optixEngine.setAccumulationBuffer(d_accumulationBuffer);
+        optixEngine.resetAccumulation();
 
         // Update OptiX dimensions
         optixEngine.setDimensions(width, height);
@@ -392,10 +537,12 @@ int main(int argc, char* argv[]) {
     std::cout << "  V     - Toggle VSync\n";
     std::cout << "  F     - Toggle Fullscreen\n";
     std::cout << "  1-4   - Resolution (720p/1080p/1440p/4K)\n";
+    std::cout << "  F1-F4 - Quality mode (Fast/Balanced/High/Accurate)\n";
     std::cout << "  T     - Print timing info\n";
     std::cout << "  G     - Print GPU info\n";
     std::cout << "  C     - Print camera info\n";
     std::cout << "\n";
+    std::cout << "[Main] Current quality mode: " << getQualityModeName(g_qualityMode) << "\n\n";
 
     // Main render loop
     while (!glContext.shouldClose()) {
@@ -407,8 +554,26 @@ int main(int argc, char* argv[]) {
         // Update camera
         updateCamera(static_cast<float>(g_timer.deltaTime));
 
+        // Get current camera params
+        CameraParams currentCameraParams = camera.getCameraParams();
+
+        // Check if camera has changed (reset accumulation for anti-aliasing)
+        bool cameraChanged = 
+            currentCameraParams.position.x != prevCameraParams.position.x ||
+            currentCameraParams.position.y != prevCameraParams.position.y ||
+            currentCameraParams.position.z != prevCameraParams.position.z ||
+            currentCameraParams.forward.x != prevCameraParams.forward.x ||
+            currentCameraParams.forward.y != prevCameraParams.forward.y ||
+            currentCameraParams.forward.z != prevCameraParams.forward.z ||
+            currentCameraParams.fovY != prevCameraParams.fovY;
+
+        if (cameraChanged) {
+            optixEngine.resetAccumulation();
+            prevCameraParams = currentCameraParams;
+        }
+
         // Update OptiX camera params
-        optixEngine.setCamera(camera.getCameraParams());
+        optixEngine.setCamera(currentCameraParams);
 
         // Map PBO for CUDA access
         float4* devicePtr = reinterpret_cast<float4*>(cudaInterop.mapPBO());
@@ -444,6 +609,20 @@ int main(int argc, char* argv[]) {
     // Cleanup
     g_cudaInterop = nullptr;
     g_camera = nullptr;
+    g_optixEngine = nullptr;
+
+    // Free lighting buffers
+    if (d_dirLights) {
+        cudaFree(reinterpret_cast<void*>(d_dirLights));
+    }
+    if (d_areaLights) {
+        cudaFree(reinterpret_cast<void*>(d_areaLights));
+    }
+
+    // Free accumulation buffer
+    if (d_accumulationBuffer) {
+        cudaFree(d_accumulationBuffer);
+    }
 
     // Clear scene before managers are destroyed
     sceneManager.clear();

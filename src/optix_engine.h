@@ -91,6 +91,22 @@ public:
         return m_pipelineCompileOptions;
     }
 
+    // Set lighting data
+    void setPointLights(GpuPointLight* lights, uint32_t count);
+    void setDirectionalLights(GpuDirectionalLight* lights, uint32_t count);
+    void setAreaLights(GpuAreaLight* lights, uint32_t count);
+
+    // Set environment map
+    void setEnvironmentMap(cudaTextureObject_t envMap, float intensity);
+
+    // Set quality mode
+    void setQualityMode(QualityMode mode);
+
+    // Accumulation buffer for progressive AA
+    void setAccumulationBuffer(float4* buffer);
+    void resetAccumulation();
+    uint32_t getAccumulatedFrames() const;
+
 private:
     bool createModule(const std::filesystem::path& ptxPath, OptixModule* module);
     bool createProgramGroups();
@@ -103,13 +119,18 @@ private:
     OptixModule m_raygenModule = nullptr;
     OptixModule m_missModule = nullptr;
     OptixModule m_closesthitModule = nullptr;
+    OptixModule m_anyhitModule = nullptr;           // For alpha testing
     OptixPipeline m_pipeline = nullptr;
     OptixPipelineCompileOptions m_pipelineCompileOptions = {};
 
     // Program groups
     OptixProgramGroup m_raygenPG = nullptr;
-    OptixProgramGroup m_missPG = nullptr;
-    OptixProgramGroup m_hitgroupPG = nullptr;
+    OptixProgramGroup m_missPG = nullptr;           // Radiance miss (background)
+    OptixProgramGroup m_missShadowPG = nullptr;     // Shadow miss (visibility)
+    OptixProgramGroup m_hitgroupPG = nullptr;       // Radiance hit (opaque)
+    OptixProgramGroup m_hitgroupShadowPG = nullptr; // Shadow hit (opaque)
+    OptixProgramGroup m_hitgroupAlphaPG = nullptr;  // Radiance hit (alpha tested)
+    OptixProgramGroup m_hitgroupShadowAlphaPG = nullptr; // Shadow hit (alpha tested)
 
     // Shader Binding Table
     OptixShaderBindingTable m_sbt = {};

@@ -1,5 +1,41 @@
 #include <optix.h>
 #include "shared_device.h"
+#include "brdf.h"
+
+//------------------------------------------------------------------------------
+// Phase 3: Miss Programs
+//
+// - Background miss: Sky gradient or environment map sampling
+// - Shadow miss: Returns visibility (not occluded)
+//------------------------------------------------------------------------------
+
+// Light structures (for launch params)
+struct GpuPointLight {
+    float3 position;
+    float radius;
+    float3 intensity;
+    float _pad;
+};
+
+struct GpuDirectionalLight {
+    float3 direction;
+    float angularDiameter;
+    float3 irradiance;
+    float _pad;
+};
+
+struct GpuAreaLight {
+    float3 position;
+    float _pad0;
+    float3 normal;
+    float _pad1;
+    float3 tangent;
+    float _pad2;
+    float3 emission;
+    float area;
+    float2 size;
+    float2 _pad3;
+};
 
 // MissRecord data following the header
 struct MissData {
@@ -7,41 +43,100 @@ struct MissData {
     float _pad;
 };
 
+// Launch parameters
+extern "C" {
+__constant__ struct {
+    float4* output_buffer;
+    float4* accumulation_buffer;
+    unsigned int width;
+    unsigned int height;
+    unsigned int frame_index;
+    unsigned int accumulated_frames;
+
+    struct {
+        float3 position;
+        float _pad0;
+        float3 forward;
+        float _pad1;
+        float3 right;
+        float _pad2;
+        float3 up;
+        float _pad3;
+        float fovY;
+        float aspectRatio;
+        float nearPlane;
+        float farPlane;
+    } camera;
+
+    OptixTraversableHandle scene_handle;
+
+    CUdeviceptr* vertex_buffers;
+    CUdeviceptr* index_buffers;
+
+    unsigned int* instance_material_indices;
+
+    // Lighting
+    GpuPointLight* point_lights;
+    unsigned int point_light_count;
+    unsigned int _pad_lights0;
+    GpuDirectionalLight* directional_lights;
+    unsigned int directional_light_count;
+    unsigned int _pad_lights1;
+    GpuAreaLight* area_lights;
+    unsigned int area_light_count;
+    unsigned int _pad_lights2;
+
+    cudaTextureObject_t environment_map;
+    float environment_intensity;
+    float _pad_env;
+
+    unsigned int quality_mode;
+    unsigned int random_seed;
+} params;
+}
+
+//------------------------------------------------------------------------------
+// Background Miss (Radiance Rays)
+//------------------------------------------------------------------------------
+
 extern "C" __global__ void __miss__background() {
-    // Get SBT data for background color
+    // Get SBT data for background color override
     const MissData* sbtData = reinterpret_cast<MissData*>(optixGetSbtDataPointer());
 
-    // Get ray direction for sky gradient
+    // Get ray direction for sky/environment sampling
     const float3 rayDir = optixGetWorldRayDirection();
 
-    // Simple sky gradient based on ray Y direction
-    // Blend from horizon color to zenith color
-    const float t = 0.5f * (rayDir.y + 1.0f);  // Map [-1,1] to [0,1]
+    float3 color;
 
-    // Sky colors
-    const float3 horizonColor = make_float3(0.7f, 0.8f, 0.9f);  // Light blue-gray
-    const float3 zenithColor = make_float3(0.3f, 0.5f, 0.8f);   // Deeper blue
-
-    // Interpolate between horizon and zenith
-    float3 skyColor = make_float3(
-        (1.0f - t) * horizonColor.x + t * zenithColor.x,
-        (1.0f - t) * horizonColor.y + t * zenithColor.y,
-        (1.0f - t) * horizonColor.z + t * zenithColor.z
-    );
-
-    // Optionally use background color from SBT if set
-    if (sbtData && (sbtData->backgroundColor.x > 0.0f ||
-                    sbtData->backgroundColor.y > 0.0f ||
-                    sbtData->backgroundColor.z > 0.0f)) {
-        skyColor = sbtData->backgroundColor;
+    // Check if we have an environment map
+    if (params.environment_map != 0) {
+        // Sample environment map using equirectangular mapping
+        float2 uv = directionToEquirectangular(rayDir);
+        float4 envSample = tex2D<float4>(params.environment_map, uv.x, uv.y);
+        color = make_float3(envSample.x, envSample.y, envSample.z) * params.environment_intensity;
+    }
+    // Check for explicit background color in SBT
+    else if (sbtData && (sbtData->backgroundColor.x > 0.0f ||
+                         sbtData->backgroundColor.y > 0.0f ||
+                         sbtData->backgroundColor.z > 0.0f)) {
+        color = sbtData->backgroundColor;
+    }
+    else {
+        // Default: Black background
+        color = make_float3(0.0f, 0.0f, 0.0f);
     }
 
     // Set payload
-    setPayloadColor(skyColor);
+    setPayloadColor(color);
     setPayloadHitDistance(-1.0f);  // Negative distance indicates miss
 }
 
+//------------------------------------------------------------------------------
+// Shadow Miss (Shadow Rays)
+// When shadow ray misses, the light is visible (not occluded)
+//------------------------------------------------------------------------------
+
 extern "C" __global__ void __miss__shadow() {
-    // Shadow ray miss - no occlusion
-    setPayloadHitDistance(-1.0f);
+    // Shadow ray miss - light is visible (payload = 0 means not occluded)
+    optixSetPayload_0(0);
 }

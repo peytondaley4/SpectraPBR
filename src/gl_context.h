@@ -22,6 +22,8 @@ constexpr Resolution RESOLUTION_4K    = { 3840, 2160, "4K" };
 
 // Callback for resize events (width, height)
 using ResizeCallback = std::function<void(uint32_t, uint32_t)>;
+// Callback before resize (to unregister CUDA resources before buffers are invalidated)
+using PreResizeCallback = std::function<void()>;
 
 class GLContext {
 public:
@@ -70,8 +72,11 @@ public:
     // Get buffer size in bytes (RGBA32F)
     size_t getBufferSize() const { return m_width * m_height * 4 * sizeof(float); }
 
-    // Set resize callback
+    // Set resize callback (called AFTER buffers are recreated)
     void setResizeCallback(ResizeCallback callback) { m_resizeCallback = callback; }
+
+    // Set pre-resize callback (called BEFORE buffers are recreated - use to unregister CUDA resources)
+    void setPreResizeCallback(PreResizeCallback callback) { m_preResizeCallback = callback; }
 
     // VSync control
     void setVSync(bool enabled);
@@ -110,6 +115,7 @@ private:
     int m_windowedWidth = 0, m_windowedHeight = 0;
 
     ResizeCallback m_resizeCallback;
+    PreResizeCallback m_preResizeCallback;
 };
 
 } // namespace spectra

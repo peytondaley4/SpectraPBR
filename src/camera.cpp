@@ -63,7 +63,7 @@ void Camera::processKeyboard(float forward, float right, float up, float deltaTi
 
 void Camera::processMouseMovement(float deltaX, float deltaY) {
     m_yaw += deltaX * m_mouseSensitivity;
-    m_pitch -= deltaY * m_mouseSensitivity;  // Inverted for natural feel
+    m_pitch -= deltaY * m_mouseSensitivity;  // Inverted: screen Y down = mouse up = look up
 
     // Clamp pitch to prevent gimbal lock
     m_pitch = std::clamp(m_pitch, MIN_PITCH, MAX_PITCH);

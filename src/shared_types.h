@@ -197,6 +197,12 @@ struct LaunchParams {
     // UI selection (UINT32_MAX = no selection)
     uint32_t selected_instance_id;
     uint32_t _pad_selection;
+
+    // Picking mode
+    uint32_t* pick_result;      // Device buffer to store picked instance ID (1 element)
+    uint32_t pick_x;            // Pick pixel X coordinate
+    uint32_t pick_y;            // Pick pixel Y coordinate  
+    uint32_t pick_mode;         // 0 = normal render, 1 = pick mode (single ray)
 };
 
 //------------------------------------------------------------------------------

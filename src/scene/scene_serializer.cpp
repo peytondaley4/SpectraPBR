@@ -22,11 +22,11 @@ bool SceneSerializer::saveScene(const std::string& filepath,
         // Camera
         if (camera) {
             json cameraJson;
-            float3 pos = camera->getPosition();
+            glm::vec3 pos = camera->getPosition();
             cameraJson["position"] = { pos.x, pos.y, pos.z };
             cameraJson["yaw"] = camera->getYaw();
             cameraJson["pitch"] = camera->getPitch();
-            cameraJson["fov"] = camera->getFov();
+            cameraJson["fov"] = camera->getFOV();
             root["camera"] = cameraJson;
         }
 

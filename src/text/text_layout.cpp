@@ -29,6 +29,11 @@ void TextLayout::layout(const std::string& text, float2 pos, float scale,
             break;
     }
 
+    // Get ascent for baseline calculation
+    // Position passed in represents top-left of text area
+    // We need to offset to the baseline for proper glyph placement
+    float ascent = m_fontAtlas->getAscent() * scale;
+    
     // Process each character
     for (char c : text) {
         // Handle newlines
@@ -48,9 +53,11 @@ void TextLayout::layout(const std::string& text, float2 pos, float scale,
         }
 
         // Calculate glyph position
+        // cursor.y is top of text area, add ascent to get baseline,
+        // then add bearing (which is negative for chars above baseline)
         float2 glyphPos = make_float2(
             cursor.x + glyph->bearing.x * scale,
-            cursor.y + glyph->bearing.y * scale
+            cursor.y + ascent + glyph->bearing.y * scale
         );
 
         float2 glyphSize = make_float2(

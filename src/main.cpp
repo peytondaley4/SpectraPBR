@@ -303,26 +303,105 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
 void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     (void)window;
 
-    if (!g_mouseCaptured || !g_camera) return;
+    // Always track mouse position for UI
+    float2 mousePos = make_float2(static_cast<float>(xpos), static_cast<float>(ypos));
+    
+    // Forward to UI first (when not captured for camera)
+    if (!g_mouseCaptured && g_uiManager) {
+        g_uiManager->handleMouseMove(mousePos);
+    }
+    
+    // Handle camera movement when captured
+    if (g_mouseCaptured && g_camera) {
+        if (g_firstMouse) {
+            g_lastMouseX = xpos;
+            g_lastMouseY = ypos;
+            g_firstMouse = false;
+            return;
+        }
 
-    if (g_firstMouse) {
+        float deltaX = static_cast<float>(xpos - g_lastMouseX);
+        float deltaY = static_cast<float>(ypos - g_lastMouseY);
         g_lastMouseX = xpos;
         g_lastMouseY = ypos;
-        g_firstMouse = false;
-        return;
+
+        g_camera->processMouseMovement(deltaX, deltaY);
+    } else {
+        // Update tracking even when not captured so first movement isn't huge
+        g_lastMouseX = xpos;
+        g_lastMouseY = ypos;
+    }
+}
+
+void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    (void)mods;
+    
+    // Get current mouse position
+    double xpos, ypos;
+    glfwGetCursorPos(window, &xpos, &ypos);
+    float2 mousePos = make_float2(static_cast<float>(xpos), static_cast<float>(ypos));
+    
+    // Forward to UI first (when not captured)
+    if (!g_mouseCaptured && g_uiManager) {
+        if (action == GLFW_PRESS) {
+            if (g_uiManager->handleMouseDown(mousePos, button)) {
+                return; // UI consumed the event
+            }
+        } else if (action == GLFW_RELEASE) {
+            if (g_uiManager->handleMouseUp(mousePos, button)) {
+                return; // UI consumed the event
+            }
+        }
+    }
+    
+    // Handle left-click for picking (select model)
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !g_mouseCaptured) {
+        if (g_optixEngine && g_uiManager) {
+            uint32_t pickedId = g_optixEngine->pickInstance(
+                static_cast<uint32_t>(xpos),
+                static_cast<uint32_t>(ypos)
+            );
+            
+            // Update selection
+            g_uiManager->setSelectedInstanceId(pickedId);
+            g_optixEngine->setSelectedInstanceId(pickedId);
+            g_optixEngine->resetAccumulation();
+            
+            if (pickedId != UINT32_MAX) {
+                std::cout << "[Main] Selected instance: " << pickedId << "\n";
+            } else {
+                std::cout << "[Main] Selection cleared\n";
+            }
+        }
     }
 
-    float deltaX = static_cast<float>(xpos - g_lastMouseX);
-    float deltaY = static_cast<float>(ypos - g_lastMouseY);
-    g_lastMouseX = xpos;
-    g_lastMouseY = ypos;
-
-    g_camera->processMouseMovement(deltaX, deltaY);
+    // Handle right-click for camera capture toggle
+    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+        if (action == GLFW_PRESS) {
+            g_mouseCaptured = true;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            g_firstMouse = true;
+        } else if (action == GLFW_RELEASE) {
+            g_mouseCaptured = false;
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        }
+    }
 }
 
 void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     (void)window; (void)xoffset;
 
+    // Forward to UI first (when not captured)
+    if (!g_mouseCaptured && g_uiManager) {
+        double xpos, ypos;
+        glfwGetCursorPos(window, &xpos, &ypos);
+        float2 mousePos = make_float2(static_cast<float>(xpos), static_cast<float>(ypos));
+        if (g_uiManager->handleMouseScroll(mousePos, static_cast<float>(yoffset))) {
+            return; // UI consumed the event
+        }
+    }
+    
+    // Camera zoom
     if (g_camera) {
         g_camera->processMouseScroll(static_cast<float>(yoffset));
     }
@@ -629,6 +708,7 @@ int main(int argc, char* argv[]) {
     // Set up callbacks
     glfwSetKeyCallback(glContext.getWindow(), keyCallback);
     glfwSetCursorPosCallback(glContext.getWindow(), cursorPosCallback);
+    glfwSetMouseButtonCallback(glContext.getWindow(), mouseButtonCallback);
     glfwSetScrollCallback(glContext.getWindow(), scrollCallback);
 
     // Set up pre-resize callback to unregister CUDA resources BEFORE buffers are invalidated

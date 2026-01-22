@@ -45,6 +45,9 @@ public:
     // Get line height for this font
     float getLineHeight() const { return m_lineHeight; }
 
+    // Get font ascent (height above baseline)
+    float getAscent() const { return m_ascent; }
+
     // Get base font size
     float getFontSize() const { return m_fontSize; }
 
@@ -72,6 +75,7 @@ private:
 
     float m_fontSize = 0.0f;
     float m_lineHeight = 0.0f;
+    float m_ascent = 0.0f;
     uint32_t m_atlasWidth = 0;
     uint32_t m_atlasHeight = 0;
 };

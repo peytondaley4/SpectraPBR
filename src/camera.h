@@ -17,6 +17,8 @@ public:
 
     // Set camera orientation (yaw = horizontal, pitch = vertical)
     void setYawPitch(float yaw, float pitch);
+    void setYaw(float yaw) { setYawPitch(yaw, m_pitch); }
+    void setPitch(float pitch) { setYawPitch(m_yaw, pitch); }
     float getYaw() const { return m_yaw; }
     float getPitch() const { return m_pitch; }
 

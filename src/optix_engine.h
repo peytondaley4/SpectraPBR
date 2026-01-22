@@ -105,6 +105,9 @@ public:
     // Set selected instance for UI highlighting
     void setSelectedInstanceId(uint32_t instanceId);
 
+    // Pick instance at screen coordinates (returns UINT32_MAX if no hit)
+    uint32_t pickInstance(uint32_t screenX, uint32_t screenY, cudaStream_t stream = 0);
+
     // Accumulation buffer for progressive AA
     void setAccumulationBuffer(float4* buffer);
     void resetAccumulation();
@@ -150,6 +153,9 @@ private:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_frameIndex = 0;
+
+    // Pick buffer (single uint32_t on device)
+    CUdeviceptr m_pickBuffer = 0;
 };
 
 } // namespace spectra

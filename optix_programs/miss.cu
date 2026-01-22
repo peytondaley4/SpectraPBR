@@ -92,6 +92,16 @@ __constant__ struct {
 
     unsigned int quality_mode;
     unsigned int random_seed;
+
+    // UI selection (UINT32_MAX = no selection)
+    unsigned int selected_instance_id;
+    unsigned int _pad_selection;
+
+    // Picking mode
+    unsigned int* pick_result;
+    unsigned int pick_x;
+    unsigned int pick_y;
+    unsigned int pick_mode;
 } params;
 }
 
@@ -129,6 +139,7 @@ extern "C" __global__ void __miss__background() {
     // Set payload
     setPayloadColor(color);
     setPayloadHitDistance(-1.0f);  // Negative distance indicates miss
+    setPayloadInstanceId(0xFFFFFFFFu);  // No instance hit
 }
 
 //------------------------------------------------------------------------------

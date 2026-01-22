@@ -7,6 +7,7 @@
 #include <optix.h>
 #include <cuda_runtime.h>
 #include <vector>
+#include <string>
 #include <cstdint>
 
 namespace spectra {
@@ -67,6 +68,13 @@ public:
     size_t getInstanceCount() const { return m_instances.size(); }
     size_t getGpuMemoryUsage() const;
 
+    // Get instances (for UI scene tree)
+    const std::vector<SceneInstance>& getInstances() const { return m_instances; }
+
+    // Track loaded model paths for serialization
+    void addLoadedModelPath(const std::string& path) { m_loadedModelPaths.push_back(path); }
+    const std::vector<std::string>& getLoadedModelPaths() const { return m_loadedModelPaths; }
+
     // Build/update SBT with scene materials
     bool updateSBT();
 
@@ -84,6 +92,9 @@ private:
 
     // Instance list
     std::vector<SceneInstance> m_instances;
+
+    // Loaded model paths for serialization
+    std::vector<std::string> m_loadedModelPaths;
 
     // IAS (top-level acceleration structure)
     OptixTraversableHandle m_iasHandle = 0;

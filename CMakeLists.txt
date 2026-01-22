@@ -256,6 +256,7 @@ add_executable(SpectraPBR
     src/ui/button.cpp
     src/ui/label.cpp
     src/ui/tree_node.cpp
+    src/ui/scroll_view.cpp
     src/ui/input_handler.cpp
     src/ui/ui_manager.cpp
     src/ui/ui_renderer.cu

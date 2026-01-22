@@ -99,7 +99,7 @@ public:
     virtual void update(float deltaTime);
 
     // Generate geometry for this widget and all children
-    void collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout);
+    virtual void collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout);
 
     // Mark widget as needing geometry regeneration
     void markDirty();

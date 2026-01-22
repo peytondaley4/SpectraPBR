@@ -104,6 +104,16 @@ __constant__ struct {
 
     unsigned int quality_mode;
     unsigned int random_seed;
+
+    // UI selection (UINT32_MAX = no selection)
+    unsigned int selected_instance_id;
+    unsigned int _pad_selection;
+
+    // Picking mode
+    unsigned int* pick_result;
+    unsigned int pick_x;
+    unsigned int pick_y;
+    unsigned int pick_mode;
 } params;
 }
 
@@ -111,18 +121,23 @@ extern "C" __global__ void __raygen__simple() {
     // Get the launch index (pixel coordinates)
     const uint3 idx = optixGetLaunchIndex();
     const uint3 dim = optixGetLaunchDimensions();
-    const unsigned int linear_idx = idx.y * params.width + idx.x;
+
+    // Pick mode: use pick coordinates instead of launch index
+    unsigned int pixelX = params.pick_mode ? params.pick_x : idx.x;
+    unsigned int pixelY = params.pick_mode ? params.pick_y : idx.y;
+    const unsigned int linear_idx = pixelY * params.width + pixelX;
 
     // Generate per-pixel random seed (unique per pixel and per frame)
-    unsigned int seed = (idx.x * 1973u + idx.y * 9277u + params.frame_index * 26699u) | 1u;
+    unsigned int seed = (pixelX * 1973u + pixelY * 9277u + params.frame_index * 26699u) | 1u;
 
     // Generate sub-pixel jitter for anti-aliasing (random offset within pixel)
-    float jitterX = randomFloat(seed) - 0.5f;  // [-0.5, 0.5]
-    float jitterY = randomFloat(seed) - 0.5f;  // [-0.5, 0.5]
+    // No jitter in pick mode for precise selection
+    float jitterX = params.pick_mode ? 0.0f : (randomFloat(seed) - 0.5f);
+    float jitterY = params.pick_mode ? 0.0f : (randomFloat(seed) - 0.5f);
 
     // Calculate normalized device coordinates with jitter
-    const float u = (static_cast<float>(idx.x) + 0.5f + jitterX) / static_cast<float>(dim.x);
-    const float v = (static_cast<float>(idx.y) + 0.5f + jitterY) / static_cast<float>(dim.y);
+    const float u = (static_cast<float>(pixelX) + 0.5f + jitterX) / static_cast<float>(params.width);
+    const float v = (static_cast<float>(pixelY) + 0.5f + jitterY) / static_cast<float>(params.height);
 
     // Convert to [-1, 1] range
     // Note: Screen Y is flipped (0 at top), so we negate to get Y-up
@@ -140,11 +155,12 @@ extern "C" __global__ void __raygen__simple() {
     rayDir = normalize(rayDir);
 
     // Initialize payload
-    unsigned int p0, p1, p2, p3;
+    unsigned int p0, p1, p2, p3, p4;
     p0 = __float_as_uint(0.0f);  // color.x
     p1 = __float_as_uint(0.0f);  // color.y
     p2 = __float_as_uint(0.0f);  // color.z
     p3 = __float_as_uint(-1.0f); // hitDistance (-1 = miss)
+    p4 = 0xFFFFFFFFu;            // instanceId (UINT32_MAX = no hit)
 
     // Trace ray if we have a valid scene
     if (params.scene_handle != 0) {
@@ -160,13 +176,19 @@ extern "C" __global__ void __raygen__simple() {
             RAY_TYPE_RADIANCE,            // SBT offset (ray type 0 = radiance)
             RAY_TYPE_COUNT,               // SBT stride (2 ray types: radiance + shadow)
             RAY_TYPE_RADIANCE,            // missSBTIndex
-            p0, p1, p2, p3                // payload
+            p0, p1, p2, p3, p4            // payload (5 values)
         );
     } else {
         // No scene - render gradient for debugging
         p0 = __float_as_uint(u);
         p1 = __float_as_uint(v);
         p2 = __float_as_uint(0.2f);
+    }
+
+    // In pick mode, write instance ID to pick result buffer and return
+    if (params.pick_mode && params.pick_result != nullptr) {
+        *params.pick_result = p4;
+        return;
     }
 
     // Retrieve color from payload

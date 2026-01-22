@@ -26,6 +26,10 @@ __forceinline__ __device__ void setPayloadHitDistance(float dist) {
     optixSetPayload_3(__float_as_uint(dist));
 }
 
+__forceinline__ __device__ void setPayloadInstanceId(unsigned int instanceId) {
+    optixSetPayload_4(instanceId);
+}
+
 __forceinline__ __device__ float3 getPayloadColor() {
     return make_float3(
         __uint_as_float(optixGetPayload_0()),

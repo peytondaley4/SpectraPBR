@@ -31,7 +31,10 @@ struct UIQuad {
     UIVertex vertices[4];   // TL, TR, BL, BR order
     float depth;            // Z-order (higher = on top)
     uint32_t flags;         // QUAD_FLAG_SOLID or QUAD_FLAG_TEXT
-    float2 _pad;            // Padding for alignment
+    float clipMinX;         // Clip rect (0,0,0,0 = no clipping)
+    float clipMinY;
+    float clipMaxX;
+    float clipMaxY;
 };
 
 //------------------------------------------------------------------------------
@@ -127,7 +130,10 @@ inline UIQuad makeSolidQuad(const Rect& rect, float4 color, float depth) {
 
     quad.depth = depth;
     quad.flags = QUAD_FLAG_SOLID;
-    quad._pad = make_float2(0.0f, 0.0f);
+    quad.clipMinX = 0.0f;
+    quad.clipMinY = 0.0f;
+    quad.clipMaxX = 0.0f;
+    quad.clipMaxY = 0.0f;
 
     return quad;
 }
@@ -158,7 +164,10 @@ inline UIQuad makeTextQuad(float2 pos, float2 size, float2 uvMin, float2 uvMax,
 
     quad.depth = depth;
     quad.flags = QUAD_FLAG_TEXT;
-    quad._pad = make_float2(0.0f, 0.0f);
+    quad.clipMinX = 0.0f;
+    quad.clipMinY = 0.0f;
+    quad.clipMaxX = 0.0f;
+    quad.clipMaxY = 0.0f;
 
     return quad;
 }

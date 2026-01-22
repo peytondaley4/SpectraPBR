@@ -178,6 +178,12 @@ __constant__ struct {
     // UI selection (UINT32_MAX = no selection)
     unsigned int selected_instance_id;
     unsigned int _pad_selection;
+
+    // Picking mode
+    unsigned int* pick_result;
+    unsigned int pick_x;
+    unsigned int pick_y;
+    unsigned int pick_mode;
 } params;
 }
 
@@ -588,6 +594,7 @@ extern "C" __global__ void __closesthit__radiance() {
 
     setPayloadColor(Lo);
     setPayloadHitDistance(optixGetRayTmax());
+    setPayloadInstanceId(instanceId);
 }
 
 //------------------------------------------------------------------------------

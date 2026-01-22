@@ -85,6 +85,19 @@ bool OptixEngine::init(CUcontext cudaContext) {
     // Initialize selection (UINT32_MAX = no selection)
     m_launchParams.selected_instance_id = UINT32_MAX;
 
+    // Initialize pick mode
+    m_launchParams.pick_mode = 0;
+    m_launchParams.pick_x = 0;
+    m_launchParams.pick_y = 0;
+
+    // Allocate pick result buffer (single uint32_t)
+    err = cudaMalloc(reinterpret_cast<void**>(&m_pickBuffer), sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to allocate pick buffer: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    m_launchParams.pick_result = reinterpret_cast<uint32_t*>(m_pickBuffer);
+
     return true;
 }
 
@@ -93,7 +106,7 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
     m_pipelineCompileOptions = {};
     m_pipelineCompileOptions.usesMotionBlur = false;
     m_pipelineCompileOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
-    m_pipelineCompileOptions.numPayloadValues = 4;      // color (3) + hitDistance (1)
+    m_pipelineCompileOptions.numPayloadValues = 5;      // color (3) + hitDistance (1) + instanceId (1)
     m_pipelineCompileOptions.numAttributeValues = 2;    // barycentrics (u, v)
     m_pipelineCompileOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     m_pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";
@@ -543,6 +556,10 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
 }
 
 void OptixEngine::shutdown() {
+    if (m_pickBuffer) {
+        cudaFree(reinterpret_cast<void*>(m_pickBuffer));
+        m_pickBuffer = 0;
+    }
     if (m_launchParamsBuffer) {
         cudaFree(reinterpret_cast<void*>(m_launchParamsBuffer));
         m_launchParamsBuffer = 0;
@@ -709,6 +726,48 @@ void OptixEngine::resetAccumulation() {
 
 uint32_t OptixEngine::getAccumulatedFrames() const {
     return m_launchParams.accumulated_frames;
+}
+
+uint32_t OptixEngine::pickInstance(uint32_t screenX, uint32_t screenY, cudaStream_t stream) {
+    if (!m_pipeline || !m_pickBuffer || screenX >= m_width || screenY >= m_height) {
+        return UINT32_MAX;
+    }
+
+    // Initialize pick result to "no hit"
+    uint32_t noHit = UINT32_MAX;
+    cudaMemcpyAsync(reinterpret_cast<void*>(m_pickBuffer), &noHit, sizeof(uint32_t),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Set up pick mode
+    m_launchParams.pick_mode = 1;
+    m_launchParams.pick_x = screenX;
+    m_launchParams.pick_y = screenY;
+
+    // Copy launch params to device
+    cudaMemcpyAsync(reinterpret_cast<void*>(m_launchParamsBuffer),
+                    &m_launchParams, sizeof(LaunchParams),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Launch with 1x1 dimensions (single ray)
+    OPTIX_CHECK(optixLaunch(
+        m_pipeline,
+        stream,
+        m_launchParamsBuffer,
+        sizeof(LaunchParams),
+        &m_sbt,
+        1, 1, 1  // Single pixel launch
+    ));
+
+    // Restore normal mode
+    m_launchParams.pick_mode = 0;
+
+    // Read back result
+    uint32_t result;
+    cudaMemcpyAsync(&result, reinterpret_cast<void*>(m_pickBuffer), sizeof(uint32_t),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    return result;
 }
 
 } // namespace spectra

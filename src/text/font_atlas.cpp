@@ -29,6 +29,7 @@ void FontAtlas::release() {
     m_atlasData.clear();
     m_fontSize = 0.0f;
     m_lineHeight = 0.0f;
+    m_ascent = 0.0f;
     m_atlasWidth = 0;
     m_atlasHeight = 0;
 }
@@ -38,6 +39,8 @@ bool FontAtlas::load(const std::string& ttfPath, float fontSize,
     // Release any existing data
     release();
 
+    std::cout << "[FontAtlas] Attempting to load: " << ttfPath << "\n";
+
     // Load TTF file
     std::ifstream file(ttfPath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
@@ -46,6 +49,13 @@ bool FontAtlas::load(const std::string& ttfPath, float fontSize,
     }
 
     std::streamsize fileSize = file.tellg();
+    std::cout << "[FontAtlas] File size: " << fileSize << " bytes\n";
+    
+    if (fileSize <= 0) {
+        std::cerr << "[FontAtlas] Font file is empty or invalid size\n";
+        return false;
+    }
+    
     file.seekg(0, std::ios::beg);
 
     std::vector<uint8_t> fontBuffer(static_cast<size_t>(fileSize));
@@ -54,11 +64,21 @@ bool FontAtlas::load(const std::string& ttfPath, float fontSize,
         return false;
     }
     file.close();
+    
+    std::cout << "[FontAtlas] Read " << fontBuffer.size() << " bytes, first 4 bytes: ";
+    if (fontBuffer.size() >= 4) {
+        std::cout << std::hex << (int)fontBuffer[0] << " " << (int)fontBuffer[1] << " " 
+                  << (int)fontBuffer[2] << " " << (int)fontBuffer[3] << std::dec << "\n";
+    }
 
     // Initialize stb_truetype
     stbtt_fontinfo fontInfo;
-    if (!stbtt_InitFont(&fontInfo, fontBuffer.data(), 0)) {
+    int fontOffset = stbtt_GetFontOffsetForIndex(fontBuffer.data(), 0);
+    std::cout << "[FontAtlas] Font offset for index 0: " << fontOffset << "\n";
+    
+    if (!stbtt_InitFont(&fontInfo, fontBuffer.data(), fontOffset)) {
         std::cerr << "[FontAtlas] Failed to initialize font: " << ttfPath << "\n";
+        std::cerr << "[FontAtlas] This may not be a valid TTF/OTF file\n";
         return false;
     }
 
@@ -69,6 +89,7 @@ bool FontAtlas::load(const std::string& ttfPath, float fontSize,
     int ascent, descent, lineGap;
     stbtt_GetFontVMetrics(&fontInfo, &ascent, &descent, &lineGap);
     m_lineHeight = (ascent - descent + lineGap) * scale;
+    m_ascent = ascent * scale;
     m_fontSize = fontSize;
     m_atlasWidth = atlasSize;
     m_atlasHeight = atlasSize;
@@ -214,8 +235,14 @@ bool FontAtlas::load(const std::string& ttfPath, float fontSize,
         );
         metrics.size = make_float2(static_cast<float>(paddedWidth),
                                     static_cast<float>(paddedHeight));
-        metrics.bearing = make_float2(static_cast<float>(x0 - static_cast<int>(sdfPadding)),
-                                       static_cast<float>(y0 - static_cast<int>(sdfPadding)));
+        // Bearing: offset from cursor to quad position
+        // x0, y0 are offsets from cursor to visible glyph; we subtract sdfPadding 
+        // since the quad includes padding around the visible content
+        // Note: y0 from stbtt is typically negative (glyph extends above baseline)
+        metrics.bearing = make_float2(
+            static_cast<float>(x0) - static_cast<float>(sdfPadding),
+            static_cast<float>(y0) - static_cast<float>(sdfPadding)
+        );
         metrics.advance = advanceWidth * scale;
         metrics._pad = 0.0f;
 

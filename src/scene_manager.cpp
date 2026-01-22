@@ -469,6 +469,9 @@ void SceneManager::clear() {
     // Clear instances
     m_instances.clear();
 
+    // Clear loaded model paths
+    m_loadedModelPaths.clear();
+
     // Free temp buffer
     if (m_tempBuffer) {
         cudaFree(reinterpret_cast<void*>(m_tempBuffer));

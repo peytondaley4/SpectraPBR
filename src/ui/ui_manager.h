@@ -11,6 +11,7 @@
 #include "button.h"
 #include "label.h"
 #include "tree_node.h"
+#include "scroll_view.h"
 #include "text/font_atlas.h"
 #include "text/text_layout.h"
 
@@ -124,7 +125,8 @@ private:
     std::vector<std::unique_ptr<Widget>> m_rootWidgets;
 
     // Scene hierarchy
-    std::vector<TreeNode*> m_sceneNodes;  // Non-owning pointers to nodes in m_scenePanel
+    ScrollView* m_sceneScrollView = nullptr;  // Non-owning, owned by m_scenePanel
+    std::vector<TreeNode*> m_sceneNodes;  // Non-owning pointers to nodes in scroll view
     uint32_t m_selectedInstanceId = UINT32_MAX;
     SelectionCallback m_selectionCallback;
 };

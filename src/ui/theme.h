@@ -38,6 +38,7 @@ struct Theme {
     float4 scrollbarTrack;
     float4 scrollbarThumb;
     float4 scrollbarThumbHover;
+    float4 scrollbarThumbActive;
 
     // Separator
     float4 separator;
@@ -77,9 +78,10 @@ inline Theme createDarkTheme() {
     theme.highlightText = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
 
     // Scrollbar
-    theme.scrollbarTrack      = make_float4(0.10f, 0.10f, 0.10f, 0.5f);
-    theme.scrollbarThumb      = make_float4(0.40f, 0.40f, 0.40f, 0.8f);
-    theme.scrollbarThumbHover = make_float4(0.50f, 0.50f, 0.50f, 0.9f);
+    theme.scrollbarTrack       = make_float4(0.10f, 0.10f, 0.10f, 0.5f);
+    theme.scrollbarThumb       = make_float4(0.40f, 0.40f, 0.40f, 0.8f);
+    theme.scrollbarThumbHover  = make_float4(0.50f, 0.50f, 0.50f, 0.9f);
+    theme.scrollbarThumbActive = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
 
     // Separator
     theme.separator = make_float4(0.30f, 0.30f, 0.30f, 1.0f);
@@ -117,9 +119,10 @@ inline Theme createLightTheme() {
     theme.highlightText = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
 
     // Scrollbar
-    theme.scrollbarTrack      = make_float4(0.85f, 0.85f, 0.85f, 0.5f);
-    theme.scrollbarThumb      = make_float4(0.60f, 0.60f, 0.60f, 0.8f);
-    theme.scrollbarThumbHover = make_float4(0.50f, 0.50f, 0.50f, 0.9f);
+    theme.scrollbarTrack       = make_float4(0.85f, 0.85f, 0.85f, 0.5f);
+    theme.scrollbarThumb       = make_float4(0.60f, 0.60f, 0.60f, 0.8f);
+    theme.scrollbarThumbHover  = make_float4(0.50f, 0.50f, 0.50f, 0.9f);
+    theme.scrollbarThumbActive = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
 
     // Separator
     theme.separator = make_float4(0.70f, 0.70f, 0.70f, 1.0f);

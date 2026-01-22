@@ -65,9 +65,11 @@ void Panel::generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* te
         // Title text
         if (!m_title.empty() && textLayout) {
             float textScale = 0.7f;
+            float textHeight = textLayout->getLineHeight(textScale);
+            // Center text vertically in header - position is top-left of text area
             float2 titlePos = make_float2(
                 bounds.x + 8.0f,
-                bounds.y + m_headerHeight * 0.5f - textLayout->getLineHeight(textScale) * 0.5f
+                bounds.y + (m_headerHeight - textHeight) * 0.5f
             );
             textLayout->layout(m_title, titlePos, textScale, theme->textPrimary,
                               TextAlign::Left, depth + 0.004f, outQuads);
@@ -87,11 +89,13 @@ void Panel::generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* te
 
             // X mark
             if (textLayout) {
+                float xScale = 0.5f;
+                float xTextHeight = textLayout->getLineHeight(xScale);
                 float2 xPos = make_float2(
                     closeRect.x + closeRect.width * 0.5f,
-                    closeRect.y + closeRect.height * 0.5f - textLayout->getLineHeight(0.5f) * 0.5f
+                    closeRect.y + (closeRect.height - xTextHeight) * 0.5f
                 );
-                textLayout->layout("X", xPos, 0.5f, theme->textPrimary,
+                textLayout->layout("X", xPos, xScale, theme->textPrimary,
                                   TextAlign::Center, depth + 0.005f, outQuads);
             }
         }

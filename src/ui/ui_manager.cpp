@@ -10,13 +10,18 @@ UIManager::UIManager() = default;
 UIManager::~UIManager() = default;
 
 bool UIManager::init(text::FontAtlas* fontAtlas, uint32_t screenWidth, uint32_t screenHeight) {
+    std::cout << "[UIManager] init() called, fontAtlas=" << fontAtlas 
+              << ", isLoaded=" << (fontAtlas ? fontAtlas->isLoaded() : false) << "\n";
+    
     if (!fontAtlas || !fontAtlas->isLoaded()) {
-        std::cerr << "[UIManager] Font atlas not loaded\n";
-        return false;
+        std::cerr << "[UIManager] Font atlas not loaded - UI will be created without text\n";
+        // Continue anyway - create UI even without fonts
     }
 
     m_fontAtlas = fontAtlas;
-    m_textLayout.setFontAtlas(fontAtlas);
+    if (fontAtlas) {
+        m_textLayout.setFontAtlas(fontAtlas);
+    }
     m_screenWidth = screenWidth;
     m_screenHeight = screenHeight;
 
@@ -227,7 +232,7 @@ void UIManager::createDefaultUI() {
 
     // Scene toggle button
     auto sceneBtn = std::make_unique<Button>("Scene");
-    sceneBtn->setPosition(120.0f, 6.0f);
+    sceneBtn->setPosition(130.0f, 6.0f);
     sceneBtn->setSize(60.0f, 28.0f);
     sceneBtn->setToggleMode(true);
     sceneBtn->setToggled(true);
@@ -238,7 +243,7 @@ void UIManager::createDefaultUI() {
 
     // Theme toggle button
     auto themeBtn = std::make_unique<Button>("Theme");
-    themeBtn->setPosition(190.0f, 6.0f);
+    themeBtn->setPosition(200.0f, 6.0f);
     themeBtn->setSize(60.0f, 28.0f);
     themeBtn->setOnClick([this]() {
         toggleTheme();
@@ -259,38 +264,53 @@ void UIManager::createDefaultUI() {
         // Update the toggle button state
         // (In a real implementation, we'd have a reference to the button)
     });
+    
+    // Create scroll view for scene tree content
+    auto scrollView = std::make_unique<ScrollView>();
+    scrollView->setPosition(0.0f, 30.0f);  // Below header
+    scrollView->setSize(280.0f, 370.0f);   // Fill remaining panel space
+    scrollView->setTheme(m_theme);
+    m_sceneScrollView = scrollView.get();
+    m_scenePanel->addChild(std::move(scrollView));
+    
+    std::cout << "[UIManager] Scene panel created, visible: " << m_scenePanel->isVisible() << "\n";
 }
 
 void UIManager::buildSceneTree(const SceneManager* sceneManager) {
-    if (!sceneManager || !m_scenePanel) return;
+    if (!sceneManager || !m_sceneScrollView) return;
 
     clearSceneTree();
 
     const auto& instances = sceneManager->getInstances();
-    float yOffset = 30.0f;  // Start below header
+    float yOffset = 4.0f;  // Small padding from top
 
     for (size_t i = 0; i < instances.size(); i++) {
         auto node = std::make_unique<TreeNode>("Instance " + std::to_string(i));
         node->setPosition(4.0f, yOffset);
-        node->setSize(272.0f, TreeNode::ROW_HEIGHT);
+        node->setSize(260.0f, TreeNode::ROW_HEIGHT);  // Narrower to leave room for scrollbar
         node->setUserData(static_cast<uint32_t>(i));
         node->setOnSelect([this](TreeNode* n) {
             onSceneNodeSelected(n);
         });
 
         m_sceneNodes.push_back(node.get());
-        m_scenePanel->addChild(std::move(node));
+        m_sceneScrollView->addChild(std::move(node));
 
         yOffset += TreeNode::ROW_HEIGHT;
     }
+
+    // Set content height for scroll view
+    m_sceneScrollView->setContentHeight(yOffset + 4.0f);
 
     std::cout << "[UIManager] Built scene tree with " << instances.size() << " instances\n";
 }
 
 void UIManager::clearSceneTree() {
     m_sceneNodes.clear();
-    if (m_scenePanel) {
-        m_scenePanel->clearChildren();
+    if (m_sceneScrollView) {
+        m_sceneScrollView->clearChildren();
+        m_sceneScrollView->setContentHeight(0.0f);
+        m_sceneScrollView->setScrollOffset(0.0f);
     }
 }
 
@@ -312,7 +332,11 @@ void UIManager::setSelectedInstanceId(uint32_t id) {
 
 void UIManager::toggleScenePanel() {
     if (m_scenePanel) {
-        m_scenePanel->setVisible(!m_scenePanel->isVisible());
+        bool wasVisible = m_scenePanel->isVisible();
+        m_scenePanel->setVisible(!wasVisible);
+        std::cout << "[UIManager] toggleScenePanel: " << wasVisible << " -> " << m_scenePanel->isVisible() << "\n";
+    } else {
+        std::cout << "[UIManager] toggleScenePanel: m_scenePanel is null!\n";
     }
 }
 

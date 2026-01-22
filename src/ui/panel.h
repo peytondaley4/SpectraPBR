@@ -1,6 +1,7 @@
 #pragma once
 
 #include "widget.h"
+#include <functional>
 
 namespace spectra {
 namespace ui {
@@ -45,11 +46,13 @@ public:
     using CloseCallback = std::function<void()>;
     void setOnClose(CloseCallback callback) { m_onClose = callback; }
 
-protected:
-    void generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout) override;
+    // Input handling (public overrides from Widget)
     bool onMouseDown(float2 pos, int button) override;
     bool onMouseUp(float2 pos, int button) override;
     bool onMouseMove(float2 pos) override;
+
+protected:
+    void generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout) override;
 
 private:
     float m_borderWidth = 1.0f;

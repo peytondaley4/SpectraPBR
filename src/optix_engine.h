@@ -1,5 +1,6 @@
 #pragma once
 
+#include "shared_types.h"
 #include <optix.h>
 #include <cuda_runtime.h>
 #include <filesystem>
@@ -7,14 +8,6 @@
 #include <vector>
 
 namespace spectra {
-
-// Launch parameters passed to OptiX programs
-struct LaunchParams {
-    float4* output_buffer;
-    uint32_t width;
-    uint32_t height;
-    uint32_t frame_index;
-};
 
 // OptiX error checking macro
 #define OPTIX_CHECK(call)                                                        \
@@ -58,7 +51,7 @@ public:
     bool init(CUcontext cudaContext);
 
     // Load PTX modules and create pipeline
-    // ptxDir: directory containing raygen.ptx and miss.ptx
+    // ptxDir: directory containing raygen.ptx, miss.ptx, closesthit.ptx
     bool createPipeline(const std::filesystem::path& ptxDir);
 
     // Shutdown and cleanup
@@ -66,6 +59,21 @@ public:
 
     // Set render dimensions (call before render if changed)
     void setDimensions(uint32_t width, uint32_t height);
+
+    // Set camera parameters
+    void setCamera(const CameraParams& camera);
+
+    // Set scene traversable handle
+    void setSceneHandle(OptixTraversableHandle handle);
+
+    // Set geometry buffers for shader access
+    void setGeometryBuffers(CUdeviceptr* vertexBuffers, CUdeviceptr* indexBuffers);
+
+    // Build/update SBT with materials
+    // materials: array of GpuMaterial for each hit group
+    // geometryIndices: geometry index per material for buffer lookup
+    bool buildSBT(const std::vector<GpuMaterial>& materials,
+                  const std::vector<uint32_t>& geometryIndices);
 
     // Render to output buffer
     // outputBuffer: CUDA device pointer to float4 array
@@ -75,10 +83,34 @@ public:
     // Get current frame index
     uint32_t getFrameIndex() const { return m_frameIndex; }
 
+    // Get OptiX context (for BVH building)
+    OptixDeviceContext getContext() const { return m_context; }
+
+    // Get pipeline compile options (for BVH building)
+    const OptixPipelineCompileOptions& getPipelineCompileOptions() const {
+        return m_pipelineCompileOptions;
+    }
+
+    // Set lighting data
+    void setPointLights(GpuPointLight* lights, uint32_t count);
+    void setDirectionalLights(GpuDirectionalLight* lights, uint32_t count);
+    void setAreaLights(GpuAreaLight* lights, uint32_t count);
+
+    // Set environment map
+    void setEnvironmentMap(cudaTextureObject_t envMap, float intensity);
+
+    // Set quality mode
+    void setQualityMode(QualityMode mode);
+
+    // Accumulation buffer for progressive AA
+    void setAccumulationBuffer(float4* buffer);
+    void resetAccumulation();
+    uint32_t getAccumulatedFrames() const;
+
 private:
     bool createModule(const std::filesystem::path& ptxPath, OptixModule* module);
     bool createProgramGroups();
-    bool createSBT();
+    bool createDefaultSBT();
 
     // OptiX context
     OptixDeviceContext m_context = nullptr;
@@ -86,17 +118,26 @@ private:
     // Pipeline
     OptixModule m_raygenModule = nullptr;
     OptixModule m_missModule = nullptr;
+    OptixModule m_closesthitModule = nullptr;
+    OptixModule m_anyhitModule = nullptr;           // For alpha testing
     OptixPipeline m_pipeline = nullptr;
     OptixPipelineCompileOptions m_pipelineCompileOptions = {};
 
     // Program groups
     OptixProgramGroup m_raygenPG = nullptr;
-    OptixProgramGroup m_missPG = nullptr;
+    OptixProgramGroup m_missPG = nullptr;           // Radiance miss (background)
+    OptixProgramGroup m_missShadowPG = nullptr;     // Shadow miss (visibility)
+    OptixProgramGroup m_hitgroupPG = nullptr;       // Radiance hit (opaque)
+    OptixProgramGroup m_hitgroupShadowPG = nullptr; // Shadow hit (opaque)
+    OptixProgramGroup m_hitgroupAlphaPG = nullptr;  // Radiance hit (alpha tested)
+    OptixProgramGroup m_hitgroupShadowAlphaPG = nullptr; // Shadow hit (alpha tested)
 
     // Shader Binding Table
     OptixShaderBindingTable m_sbt = {};
     CUdeviceptr m_raygenRecord = 0;
     CUdeviceptr m_missRecord = 0;
+    CUdeviceptr m_hitgroupRecords = 0;
+    size_t m_hitgroupRecordCount = 0;
 
     // Launch parameters
     LaunchParams m_launchParams = {};

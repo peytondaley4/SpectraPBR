@@ -82,6 +82,9 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.quality_mode = QUALITY_BALANCED;
     m_launchParams.random_seed = 0;
 
+    // Initialize selection (UINT32_MAX = no selection)
+    m_launchParams.selected_instance_id = UINT32_MAX;
+
     return true;
 }
 
@@ -690,6 +693,10 @@ void OptixEngine::setEnvironmentMap(cudaTextureObject_t envMap, float intensity)
 
 void OptixEngine::setQualityMode(QualityMode mode) {
     m_launchParams.quality_mode = mode;
+}
+
+void OptixEngine::setSelectedInstanceId(uint32_t instanceId) {
+    m_launchParams.selected_instance_id = instanceId;
 }
 
 void OptixEngine::setAccumulationBuffer(float4* buffer) {

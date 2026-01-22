@@ -123,6 +123,31 @@ FetchContent_MakeAvailable(tinygltf)
 message(STATUS "tinygltf fetched")
 
 #------------------------------------------------------------------------------
+# nlohmann/json - JSON library for scene serialization
+#------------------------------------------------------------------------------
+FetchContent_Declare(
+    json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+FetchContent_MakeAvailable(json)
+message(STATUS "nlohmann/json fetched")
+
+#------------------------------------------------------------------------------
+# stb - Single-file public domain libraries (stb_truetype for font rendering)
+#------------------------------------------------------------------------------
+FetchContent_Declare(
+    stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG        master
+)
+FetchContent_GetProperties(stb)
+if(NOT stb_POPULATED)
+    FetchContent_Populate(stb)
+endif()
+message(STATUS "stb fetched: ${stb_SOURCE_DIR}")
+
+#------------------------------------------------------------------------------
 # OptiX PTX Compilation
 #------------------------------------------------------------------------------
 # Function to compile CUDA files to PTX for OptiX
@@ -223,6 +248,20 @@ add_executable(SpectraPBR
     src/texture_manager.cpp
     src/material_manager.cpp
     src/scene_manager.cpp
+    # Phase 4: UI System
+    src/text/font_atlas.cpp
+    src/text/text_layout.cpp
+    src/ui/widget.cpp
+    src/ui/panel.cpp
+    src/ui/button.cpp
+    src/ui/label.cpp
+    src/ui/tree_node.cpp
+    src/ui/input_handler.cpp
+    src/ui/ui_manager.cpp
+    src/ui/ui_renderer.cu
+    # Phase 4: Scene Management
+    src/scene/selection_manager.cpp
+    src/scene/scene_serializer.cpp
 )
 
 # Include directories
@@ -231,6 +270,7 @@ target_include_directories(SpectraPBR PRIVATE
     ${OptiX_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${tinygltf_SOURCE_DIR}
+    ${stb_SOURCE_DIR}
 )
 
 # Link libraries
@@ -241,6 +281,7 @@ target_link_libraries(SpectraPBR PRIVATE
     glm::glm
     CUDA::cudart
     CUDA::cuda_driver
+    nlohmann_json::nlohmann_json
 )
 
 # Ensure PTX is built before the main target
@@ -277,6 +318,15 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
             "${CMAKE_BINARY_DIR}/optix_programs/anyhit.ptx"
             "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
     COMMENT "Copying PTX files to build directory"
+)
+
+# Copy fonts for UI
+add_custom_command(TARGET SpectraPBR POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
+            "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
+    COMMENT "Copying fonts to build directory"
 )
 
 #------------------------------------------------------------------------------

@@ -7,6 +7,14 @@
 #include "texture_manager.h"
 #include "material_manager.h"
 #include "scene_manager.h"
+// Phase 4: UI System
+#include "text/font_atlas.h"
+#include "text/text_layout.h"
+#include "ui/ui_manager.h"
+#include "ui/ui_renderer.h"
+#include "ui/input_handler.h"
+#include "scene/selection_manager.h"
+#include "scene/scene_serializer.h"
 #include <iostream>
 #include <chrono>
 #include <filesystem>
@@ -76,6 +84,13 @@ static QualityMode g_qualityMode = QUALITY_BALANCED;
 // Input state
 static bool g_keyW = false, g_keyS = false, g_keyA = false, g_keyD = false;
 static bool g_keyQ = false, g_keyE = false, g_keyShift = false;
+
+// Phase 4: UI globals
+static ui::UIManager* g_uiManager = nullptr;
+static ui::InputHandler* g_inputHandler = nullptr;
+static SelectionManager* g_selectionManager = nullptr;
+static SceneSerializer* g_sceneSerializer = nullptr;
+static SceneManager* g_sceneManager = nullptr;
 
 // Quality mode names for display
 static const char* getQualityModeName(QualityMode mode) {
@@ -218,6 +233,68 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             std::cout << "[Main] Quality mode: Accurate (Full PBR + conductor Fresnel)\n";
             break;
 
+        // Phase 4: UI shortcuts
+        case GLFW_KEY_H:
+            if (g_uiManager) {
+                g_uiManager->toggleScenePanel();
+                std::cout << "[Main] Scene panel: " << (g_uiManager->isScenePanelVisible() ? "visible" : "hidden") << "\n";
+            }
+            break;
+
+        case GLFW_KEY_L:
+            if (g_uiManager && !(mods & GLFW_MOD_CONTROL)) {
+                g_uiManager->toggleTheme();
+                std::cout << "[Main] Theme: " << (g_uiManager->isDarkTheme() ? "dark" : "light") << "\n";
+            }
+            break;
+
+        case GLFW_KEY_S:
+            if (mods & GLFW_MOD_CONTROL) {
+                // Ctrl+S: Save scene
+                if (g_sceneSerializer && g_camera && g_sceneManager) {
+                    std::string savePath = SceneSerializer::getAutoSavePath();
+                    bool darkTheme = g_uiManager ? g_uiManager->isDarkTheme() : true;
+                    if (g_sceneSerializer->saveScene(savePath, g_camera, g_sceneManager, g_qualityMode, darkTheme)) {
+                        std::cout << "[Main] Scene saved to: " << savePath << "\n";
+                    }
+                }
+            }
+            break;
+
+        case GLFW_KEY_O:
+            if (mods & GLFW_MOD_CONTROL) {
+                // Ctrl+O: Load scene (just load settings for now)
+                if (g_sceneSerializer) {
+                    std::string loadPath = SceneSerializer::getAutoSavePath();
+                    if (g_sceneSerializer->loadScene(loadPath)) {
+                        // Apply loaded camera settings
+                        if (g_sceneSerializer->hasLoadedCamera() && g_camera) {
+                            g_camera->setPosition(glm::vec3(
+                                g_sceneSerializer->getCameraPositionX(),
+                                g_sceneSerializer->getCameraPositionY(),
+                                g_sceneSerializer->getCameraPositionZ()));
+                            g_camera->setYaw(g_sceneSerializer->getCameraYaw());
+                            g_camera->setPitch(g_sceneSerializer->getCameraPitch());
+                            g_camera->setFOV(g_sceneSerializer->getCameraFov());
+                        }
+                        // Apply theme
+                        if (g_uiManager) {
+                            if (g_sceneSerializer->isDarkTheme()) {
+                                g_uiManager->setTheme(&ui::THEME_DARK);
+                            } else {
+                                g_uiManager->setTheme(&ui::THEME_LIGHT);
+                            }
+                        }
+                        // Apply quality mode
+                        g_qualityMode = static_cast<QualityMode>(g_sceneSerializer->getQualityMode());
+                        if (g_optixEngine) g_optixEngine->setQualityMode(g_qualityMode);
+
+                        std::cout << "[Main] Scene loaded from: " << loadPath << "\n";
+                    }
+                }
+            }
+            break;
+
         default:
             break;
     }
@@ -358,6 +435,67 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Register UI PBO with CUDA
+    if (!cudaInterop.registerUIPBO(glContext.getUIPBO(), glContext.getBufferSize())) {
+        std::cerr << "[Main] Failed to register UI PBO with CUDA\n";
+        return 1;
+    }
+
+    //--------------------------------------------------------------------------
+    // Phase 4: Initialize UI System
+    //--------------------------------------------------------------------------
+
+    // Get fonts directory
+    std::filesystem::path fontsDir = exePath / "assets" / "fonts";
+    if (!std::filesystem::exists(fontsDir)) {
+        fontsDir = std::filesystem::current_path() / "assets" / "fonts";
+    }
+
+    // Initialize Font Atlas
+    text::FontAtlas fontAtlas;
+    if (!fontAtlas.load((fontsDir / "DejaVuSans.ttf").string(), 32.0f, 512, 8)) {
+        std::cerr << "[Main] Warning: Failed to load font atlas, UI text will not render\n";
+    }
+
+    // Initialize UI Manager
+    ui::UIManager uiManager;
+    g_uiManager = &uiManager;
+    if (!uiManager.init(&fontAtlas, glContext.getWidth(), glContext.getHeight())) {
+        std::cerr << "[Main] Warning: Failed to initialize UI manager\n";
+    }
+
+    // Initialize UI Renderer
+    ui::UIRenderer uiRenderer;
+    if (!uiRenderer.init(4096)) {
+        std::cerr << "[Main] Warning: Failed to initialize UI renderer\n";
+    }
+
+    // Initialize Input Handler
+    ui::InputHandler inputHandler;
+    g_inputHandler = &inputHandler;
+    inputHandler.init(glContext.getWindow(), &uiManager);
+
+    // Initialize Selection Manager
+    SelectionManager selectionManager;
+    g_selectionManager = &selectionManager;
+
+    // Initialize Scene Serializer
+    SceneSerializer sceneSerializer;
+    g_sceneSerializer = &sceneSerializer;
+
+    // Wire selection manager to UI
+    uiManager.setSelectionCallback([&](uint32_t instanceId) {
+        selectionManager.setSelectedInstanceId(instanceId);
+        optixEngine.setSelectedInstanceId(instanceId);
+        optixEngine.resetAccumulation();
+        std::cout << "[Main] Selected instance: " << instanceId << "\n";
+    });
+
+    // Enable UI compositing
+    glContext.setUIEnabled(true);
+
+    std::cout << "[Main] UI system initialized\n";
+
     // Initialize managers
     GeometryManager geometryManager;
     TextureManager textureManager;
@@ -365,6 +503,7 @@ int main(int argc, char* argv[]) {
     materialManager.setTextureManager(&textureManager);
 
     SceneManager sceneManager;
+    g_sceneManager = &sceneManager;
     sceneManager.setOptixEngine(&optixEngine);
     sceneManager.setGeometryManager(&geometryManager);
     sceneManager.setMaterialManager(&materialManager);
@@ -405,6 +544,9 @@ int main(int argc, char* argv[]) {
                 optixEngine.setSceneHandle(sceneManager.getSceneHandle());
                 optixEngine.setGeometryBuffers(sceneManager.getVertexBuffers(),
                                                sceneManager.getIndexBuffers());
+
+                // Build UI scene tree
+                uiManager.buildSceneTree(&sceneManager);
             }
         } else {
             std::cerr << "[Main] Failed to load model: " << loader.getLastError() << "\n";
@@ -493,8 +635,9 @@ int main(int argc, char* argv[]) {
     glContext.setPreResizeCallback([&]() {
         // Ensure all CUDA work is complete before unregistering
         cudaDeviceSynchronize();
-        // Must unregister PBO before OpenGL recreates the buffer
+        // Must unregister PBOs before OpenGL recreates the buffers
         cudaInterop.unregisterPBO();
+        cudaInterop.unregisterUIPBO();
     });
 
     // Set up resize callback to re-register AFTER buffers are recreated
@@ -504,9 +647,12 @@ int main(int argc, char* argv[]) {
         // Ensure OpenGL has finished with the buffer before CUDA registers it
         glFinish();
 
-        // Re-register new PBO (old one was unregistered in pre-resize callback)
+        // Re-register new PBOs (old ones were unregistered in pre-resize callback)
         if (!cudaInterop.registerPBO(glContext.getPBO(), glContext.getBufferSize())) {
             std::cerr << "[Main] Failed to re-register PBO after resize\n";
+        }
+        if (!cudaInterop.registerUIPBO(glContext.getUIPBO(), glContext.getBufferSize())) {
+            std::cerr << "[Main] Failed to re-register UI PBO after resize\n";
         }
 
         // Reallocate accumulation buffer
@@ -523,6 +669,9 @@ int main(int argc, char* argv[]) {
 
         // Update camera aspect ratio
         camera.setAspectRatio(static_cast<float>(width) / static_cast<float>(height));
+
+        // Update UI dimensions
+        uiManager.setScreenSize(width, height);
     });
 
     std::cout << "\n[Main] Initialization complete!\n";
@@ -542,6 +691,12 @@ int main(int argc, char* argv[]) {
     std::cout << "  G     - Print GPU info\n";
     std::cout << "  C     - Print camera info\n";
     std::cout << "\n";
+    std::cout << "[Main] UI Controls:\n";
+    std::cout << "  H     - Toggle scene hierarchy panel\n";
+    std::cout << "  L     - Toggle light/dark theme\n";
+    std::cout << "  Ctrl+S- Save scene\n";
+    std::cout << "  Ctrl+O- Load scene\n";
+    std::cout << "\n";
     std::cout << "[Main] Current quality mode: " << getQualityModeName(g_qualityMode) << "\n\n";
 
     // Main render loop
@@ -551,8 +706,16 @@ int main(int argc, char* argv[]) {
         // Poll events
         glContext.pollEvents();
 
-        // Update camera
-        updateCamera(static_cast<float>(g_timer.deltaTime));
+        // Update UI
+        uiManager.update(static_cast<float>(g_timer.deltaTime));
+
+        // Update camera only if UI didn't consume input
+        if (!inputHandler.wasMouseConsumed() && g_mouseCaptured) {
+            updateCamera(static_cast<float>(g_timer.deltaTime));
+        } else if (!g_mouseCaptured) {
+            // Still allow keyboard movement when mouse not captured and UI not active
+            updateCamera(static_cast<float>(g_timer.deltaTime));
+        }
 
         // Get current camera params
         CameraParams currentCameraParams = camera.getCameraParams();
@@ -594,7 +757,34 @@ int main(int argc, char* argv[]) {
         // Update OpenGL texture from PBO
         glContext.updateTextureFromPBO();
 
-        // Render fullscreen quad
+        //----------------------------------------------------------------------
+        // Phase 4: Render UI
+        //----------------------------------------------------------------------
+
+        // Collect UI geometry
+        uiManager.collectGeometry();
+
+        // Map UI PBO for CUDA access
+        float4* uiDevicePtr = reinterpret_cast<float4*>(cudaInterop.mapUIPBO());
+        if (uiDevicePtr) {
+            // Render UI quads
+            uiRenderer.render(uiManager.getQuads(),
+                              fontAtlas.getTexture(),
+                              uiDevicePtr,
+                              glContext.getWidth(), glContext.getHeight(),
+                              cudaInterop.getStream());
+
+            // Synchronize
+            cudaInterop.synchronize();
+
+            // Unmap UI PBO
+            cudaInterop.unmapUIPBO();
+
+            // Update UI texture from PBO
+            glContext.updateUITextureFromPBO();
+        }
+
+        // Render fullscreen quad (composites scene + UI)
         glContext.renderFullscreenQuad();
 
         // Swap buffers
@@ -610,6 +800,17 @@ int main(int argc, char* argv[]) {
     g_cudaInterop = nullptr;
     g_camera = nullptr;
     g_optixEngine = nullptr;
+    g_uiManager = nullptr;
+    g_inputHandler = nullptr;
+    g_selectionManager = nullptr;
+    g_sceneSerializer = nullptr;
+    g_sceneManager = nullptr;
+
+    // Shutdown UI
+    inputHandler.shutdown();
+    uiRenderer.shutdown();
+    uiManager.shutdown();
+    fontAtlas.release();
 
     // Free lighting buffers
     if (d_dirLights) {

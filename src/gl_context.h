@@ -59,11 +59,23 @@ public:
     // Call after CUDA has written to the mapped PBO
     void updateTextureFromPBO();
 
+    // Update UI texture from UI PBO
+    // Call after CUDA has written to the mapped UI PBO
+    void updateUITextureFromPBO();
+
     // Render fullscreen quad with display texture
+    // If UI is enabled, composites UI on top of scene
     void renderFullscreenQuad();
+
+    // Enable/disable UI compositing
+    void setUIEnabled(bool enabled) { m_uiEnabled = enabled; }
+    bool isUIEnabled() const { return m_uiEnabled; }
 
     // Get PBO for CUDA interop registration
     GLuint getPBO() const { return m_pbo; }
+
+    // Get UI PBO for CUDA interop registration
+    GLuint getUIPBO() const { return m_uiPbo; }
 
     // Get current dimensions
     uint32_t getWidth() const { return m_width; }
@@ -107,6 +119,12 @@ private:
     GLuint m_pbo = 0;
     GLuint m_displayProgram = 0;
     GLuint m_emptyVAO = 0;  // For fullscreen triangle
+
+    // UI resources
+    GLuint m_uiTexture = 0;
+    GLuint m_uiPbo = 0;
+    bool m_uiEnabled = false;
+    GLint m_uiTextureLoc = -1;
 
     // State
     bool m_vsyncEnabled = true;

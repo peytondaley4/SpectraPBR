@@ -90,6 +90,14 @@ void GLContext::shutdown() {
         glDeleteTextures(1, &m_displayTexture);
         m_displayTexture = 0;
     }
+    if (m_uiPbo) {
+        glDeleteBuffers(1, &m_uiPbo);
+        m_uiPbo = 0;
+    }
+    if (m_uiTexture) {
+        glDeleteTextures(1, &m_uiTexture);
+        m_uiTexture = 0;
+    }
     if (m_window) {
         glfwDestroyWindow(m_window);
         m_window = nullptr;
@@ -122,9 +130,12 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
         return false;
     }
 
-    // Set texture sampler uniform
+    // Set texture sampler uniforms
     glUseProgram(m_displayProgram);
-    glUniform1i(glGetUniformLocation(m_displayProgram, "uTexture"), 0);
+    glUniform1i(glGetUniformLocation(m_displayProgram, "uSceneTexture"), 0);
+    m_uiTextureLoc = glGetUniformLocation(m_displayProgram, "uUITexture");
+    glUniform1i(m_uiTextureLoc, 1);
+    glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), 0);
     glUseProgram(0);
 
     // Create empty VAO for fullscreen triangle
@@ -147,8 +158,25 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
     glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
+    // Create UI texture (RGBA32F for alpha compositing)
+    glGenTextures(1, &m_uiTexture);
+    glBindTexture(GL_TEXTURE_2D, m_uiTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
+                 GL_RGBA, GL_FLOAT, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // Create UI PBO
+    glGenBuffers(1, &m_uiPbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_uiPbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
     std::cout << "[GL] Display resources created: " << m_width << "x" << m_height
-              << " (" << getBufferSize() / (1024 * 1024) << " MB)\n";
+              << " (" << getBufferSize() / (1024 * 1024) << " MB scene + UI)\n";
 
     return true;
 }
@@ -161,14 +189,37 @@ void GLContext::updateTextureFromPBO() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
+void GLContext::updateUITextureFromPBO() {
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_uiPbo);
+    glBindTexture(GL_TEXTURE_2D, m_uiTexture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height,
+                    GL_RGBA, GL_FLOAT, nullptr);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
 void GLContext::renderFullscreenQuad() {
     glClear(GL_COLOR_BUFFER_BIT);
+
     glUseProgram(m_displayProgram);
+
+    // Bind scene texture
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_displayTexture);
+
+    // Bind UI texture and set enabled flag
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_uiTexture);
+    glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), m_uiEnabled ? 1 : 0);
+
+    // Enable blending for UI compositing
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
     glBindVertexArray(m_emptyVAO);
     glDrawArrays(GL_TRIANGLES, 0, 3);  // Fullscreen triangle
     glBindVertexArray(0);
+
+    glDisable(GL_BLEND);
     glUseProgram(0);
 }
 
@@ -231,9 +282,17 @@ void GLContext::setResolution(uint32_t width, uint32_t height) {
 }
 
 void GLContext::recreateBuffers() {
-    // Recreate texture
+    // Recreate scene texture
     if (m_displayTexture) {
         glBindTexture(GL_TEXTURE_2D, m_displayTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
+                     GL_RGBA, GL_FLOAT, nullptr);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    // Recreate UI texture
+    if (m_uiTexture) {
+        glBindTexture(GL_TEXTURE_2D, m_uiTexture);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
                      GL_RGBA, GL_FLOAT, nullptr);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -245,14 +304,25 @@ void GLContext::recreateBuffers() {
         glDeleteBuffers(1, &m_pbo);
         m_pbo = 0;
     }
-    
+
     glGenBuffers(1, &m_pbo);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
     glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height 
-              << " (PBO " << m_pbo << ", " << getBufferSize() / (1024 * 1024) << " MB)\n";
+    // Recreate UI PBO
+    if (m_uiPbo) {
+        glDeleteBuffers(1, &m_uiPbo);
+        m_uiPbo = 0;
+    }
+
+    glGenBuffers(1, &m_uiPbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_uiPbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height
+              << " (PBO " << m_pbo << ", UI PBO " << m_uiPbo << ", " << getBufferSize() / (1024 * 1024) << " MB each)\n";
 }
 
 void GLContext::framebufferSizeCallback(GLFWwindow* window, int width, int height) {

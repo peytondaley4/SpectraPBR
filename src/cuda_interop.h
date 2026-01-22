@@ -49,15 +49,27 @@ public:
     // Returns false on failure
     bool registerPBO(uint32_t pbo, size_t size);
 
+    // Register UI PBO with CUDA
+    bool registerUIPBO(uint32_t pbo, size_t size);
+
     // Unregister PBO (call before resizing)
     void unregisterPBO();
+
+    // Unregister UI PBO
+    void unregisterUIPBO();
 
     // Map PBO for CUDA access
     // Returns device pointer, or nullptr on failure
     float* mapPBO();
 
+    // Map UI PBO for CUDA access
+    float* mapUIPBO();
+
     // Unmap PBO (must call after rendering, before OpenGL uses it)
     void unmapPBO();
+
+    // Unmap UI PBO
+    void unmapUIPBO();
 
     // Get CUDA stream for async operations
     cudaStream_t getStream() const { return m_stream; }
@@ -86,6 +98,11 @@ private:
     cudaGraphicsResource_t m_pboResource = nullptr;
     size_t m_pboSize = 0;
     bool m_pboMapped = false;
+
+    // UI PBO interop
+    cudaGraphicsResource_t m_uiPboResource = nullptr;
+    size_t m_uiPboSize = 0;
+    bool m_uiPboMapped = false;
 };
 
 } // namespace spectra

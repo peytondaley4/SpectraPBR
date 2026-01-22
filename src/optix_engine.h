@@ -102,6 +102,9 @@ public:
     // Set quality mode
     void setQualityMode(QualityMode mode);
 
+    // Set selected instance for UI highlighting
+    void setSelectedInstanceId(uint32_t instanceId);
+
     // Accumulation buffer for progressive AA
     void setAccumulationBuffer(float4* buffer);
     void resetAccumulation();

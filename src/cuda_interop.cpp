@@ -64,6 +64,12 @@ void CudaInterop::shutdown() {
     if (m_pboResource) {
         unregisterPBO();
     }
+    if (m_uiPboMapped) {
+        unmapUIPBO();
+    }
+    if (m_uiPboResource) {
+        unregisterUIPBO();
+    }
     if (m_stream) {
         cudaStreamDestroy(m_stream);
         m_stream = nullptr;
@@ -99,6 +105,35 @@ void CudaInterop::unregisterPBO() {
         m_pboResource = nullptr;
         m_pboSize = 0;
         std::cout << "[CUDA] Unregistered PBO\n";
+    }
+}
+
+bool CudaInterop::registerUIPBO(uint32_t pbo, size_t size) {
+    if (m_uiPboResource) {
+        unregisterUIPBO();
+    }
+
+    CUDA_CHECK(cudaGraphicsGLRegisterBuffer(
+        &m_uiPboResource,
+        pbo,
+        cudaGraphicsMapFlagsWriteDiscard
+    ));
+
+    m_uiPboSize = size;
+    std::cout << "[CUDA] Registered UI PBO " << pbo << " (" << size / (1024 * 1024) << " MB)\n";
+
+    return true;
+}
+
+void CudaInterop::unregisterUIPBO() {
+    if (m_uiPboMapped) {
+        unmapUIPBO();
+    }
+    if (m_uiPboResource) {
+        CUDA_CHECK_NORETURN(cudaGraphicsUnregisterResource(m_uiPboResource));
+        m_uiPboResource = nullptr;
+        m_uiPboSize = 0;
+        std::cout << "[CUDA] Unregistered UI PBO\n";
     }
 }
 
@@ -139,6 +174,45 @@ void CudaInterop::unmapPBO() {
 
     CUDA_CHECK_NORETURN(cudaGraphicsUnmapResources(1, &m_pboResource, m_stream));
     m_pboMapped = false;
+}
+
+float* CudaInterop::mapUIPBO() {
+    if (!m_uiPboResource) {
+        std::cerr << "[CUDA] Cannot map: UI PBO not registered\n";
+        return nullptr;
+    }
+
+    if (m_uiPboMapped) {
+        std::cerr << "[CUDA] Warning: UI PBO already mapped\n";
+        return nullptr;
+    }
+
+    cudaError_t err = cudaGraphicsMapResources(1, &m_uiPboResource, m_stream);
+    if (err != cudaSuccess) {
+        std::cerr << "[CUDA] Failed to map UI PBO: " << cudaGetErrorString(err) << "\n";
+        return nullptr;
+    }
+
+    void* devPtr = nullptr;
+    size_t mappedSize = 0;
+    err = cudaGraphicsResourceGetMappedPointer(&devPtr, &mappedSize, m_uiPboResource);
+    if (err != cudaSuccess) {
+        std::cerr << "[CUDA] Failed to get UI mapped pointer: " << cudaGetErrorString(err) << "\n";
+        cudaGraphicsUnmapResources(1, &m_uiPboResource, m_stream);
+        return nullptr;
+    }
+
+    m_uiPboMapped = true;
+    return static_cast<float*>(devPtr);
+}
+
+void CudaInterop::unmapUIPBO() {
+    if (!m_uiPboMapped) {
+        return;
+    }
+
+    CUDA_CHECK_NORETURN(cudaGraphicsUnmapResources(1, &m_uiPboResource, m_stream));
+    m_uiPboMapped = false;
 }
 
 void CudaInterop::synchronize() {

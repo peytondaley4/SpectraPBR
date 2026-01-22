@@ -1,0 +1,133 @@
+#pragma once
+
+#include <cuda_runtime.h>
+#include <vector>
+#include <memory>
+#include <functional>
+#include "ui_types.h"
+#include "theme.h"
+#include "widget.h"
+#include "panel.h"
+#include "button.h"
+#include "label.h"
+#include "tree_node.h"
+#include "text/font_atlas.h"
+#include "text/text_layout.h"
+
+namespace spectra {
+
+// Forward declarations
+class SceneManager;
+
+namespace ui {
+
+//------------------------------------------------------------------------------
+// UI Manager - Central coordinator for the UI system
+//------------------------------------------------------------------------------
+class UIManager {
+public:
+    UIManager();
+    ~UIManager();
+
+    // Initialize the UI system
+    bool init(text::FontAtlas* fontAtlas, uint32_t screenWidth, uint32_t screenHeight);
+
+    // Shutdown the UI system
+    void shutdown();
+
+    // Set the current theme
+    void setTheme(const Theme* theme);
+    const Theme* getTheme() const { return m_theme; }
+
+    // Toggle between light and dark themes
+    void toggleTheme();
+    bool isDarkTheme() const { return m_theme == &THEME_DARK; }
+
+    // Update screen dimensions
+    void setScreenSize(uint32_t width, uint32_t height);
+    uint32_t getScreenWidth() const { return m_screenWidth; }
+    uint32_t getScreenHeight() const { return m_screenHeight; }
+
+    // Update all widgets
+    void update(float deltaTime);
+
+    // Collect all UI geometry for rendering
+    void collectGeometry();
+    const std::vector<UIQuad>& getQuads() const { return m_quads; }
+
+    //--------------------------------------------------------------------------
+    // Input Handling (return true if event was consumed by UI)
+    //--------------------------------------------------------------------------
+    bool handleMouseMove(float2 pos);
+    bool handleMouseDown(float2 pos, int button);
+    bool handleMouseUp(float2 pos, int button);
+    bool handleMouseScroll(float2 pos, float delta);
+    bool handleKeyDown(int key, int mods);
+    bool handleKeyUp(int key, int mods);
+
+    //--------------------------------------------------------------------------
+    // Scene Hierarchy Panel
+    //--------------------------------------------------------------------------
+
+    // Build the scene tree from the scene manager
+    void buildSceneTree(const SceneManager* sceneManager);
+
+    // Clear the scene tree
+    void clearSceneTree();
+
+    // Set callback for when a scene object is selected
+    using SelectionCallback = std::function<void(uint32_t instanceId)>;
+    void setSelectionCallback(SelectionCallback callback) { m_selectionCallback = callback; }
+
+    // Get/set selected instance ID
+    uint32_t getSelectedInstanceId() const { return m_selectedInstanceId; }
+    void setSelectedInstanceId(uint32_t id);
+
+    //--------------------------------------------------------------------------
+    // Top Bar
+    //--------------------------------------------------------------------------
+
+    // Toggle scene hierarchy panel visibility
+    void toggleScenePanel();
+    bool isScenePanelVisible() const;
+
+    //--------------------------------------------------------------------------
+    // Widget Access
+    //--------------------------------------------------------------------------
+
+    // Get the root widgets
+    Panel* getTopBar() { return m_topBar.get(); }
+    Panel* getScenePanel() { return m_scenePanel.get(); }
+
+    // Add a custom widget to the root level
+    void addRootWidget(std::unique_ptr<Widget> widget);
+
+private:
+    void createDefaultUI();
+    void onSceneNodeSelected(TreeNode* node);
+    void clearTreeSelection(Widget* widget, TreeNode* except);
+
+    text::FontAtlas* m_fontAtlas = nullptr;
+    text::TextLayout m_textLayout;
+
+    const Theme* m_theme = &THEME_DARK;
+
+    uint32_t m_screenWidth = 1920;
+    uint32_t m_screenHeight = 1080;
+
+    // Collected geometry
+    std::vector<UIQuad> m_quads;
+
+    // Root widgets
+    std::unique_ptr<Panel> m_topBar;
+    std::unique_ptr<Panel> m_scenePanel;
+    std::vector<std::unique_ptr<Widget>> m_rootWidgets;
+
+    // Scene hierarchy
+    std::vector<TreeNode*> m_sceneNodes;  // Non-owning pointers to nodes in m_scenePanel
+    uint32_t m_selectedInstanceId = UINT32_MAX;
+    SelectionCallback m_selectionCallback;
+};
+
+} // namespace ui
+} // namespace spectra

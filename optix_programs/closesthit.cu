@@ -174,6 +174,10 @@ __constant__ struct {
 
     unsigned int quality_mode;
     unsigned int random_seed;
+
+    // UI selection (UINT32_MAX = no selection)
+    unsigned int selected_instance_id;
+    unsigned int _pad_selection;
 } params;
 }
 
@@ -559,6 +563,21 @@ extern "C" __global__ void __closesthit__radiance() {
     //--------------------------------------------------------------------------
 
     Lo = Lo + emissive;
+
+    //--------------------------------------------------------------------------
+    // Selection Highlighting
+    //--------------------------------------------------------------------------
+
+    if (params.selected_instance_id == instanceId) {
+        // Add blue tint to selected object
+        float3 selectionTint = make_float3(1.1f, 1.15f, 1.4f);  // Subtle blue tint
+        Lo = Lo * selectionTint;
+
+        // Add rim highlight effect
+        float rim = 1.0f - fmaxf(0.0f, dot(shadingNormal, V));
+        rim = powf(rim, 2.0f);
+        Lo = Lo + make_float3(0.2f, 0.4f, 1.0f) * rim * 0.5f;  // Blue rim light
+    }
 
     //--------------------------------------------------------------------------
     // Output

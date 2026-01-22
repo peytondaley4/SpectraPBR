@@ -193,6 +193,10 @@ struct LaunchParams {
     // Quality and rendering settings
     QualityMode quality_mode;
     uint32_t random_seed;           // Per-frame random seed for sampling
+
+    // UI selection (UINT32_MAX = no selection)
+    uint32_t selected_instance_id;
+    uint32_t _pad_selection;
 };
 
 //------------------------------------------------------------------------------

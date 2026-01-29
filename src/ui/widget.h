@@ -80,6 +80,9 @@ public:
     void removeChild(Widget* child);
     void clearChildren();
 
+    // Set parent without transferring ownership (for widgets managed elsewhere)
+    void setParent(Widget* parent) { m_parent = parent; }
+
     Widget* getParent() const { return m_parent; }
     const std::vector<std::unique_ptr<Widget>>& getChildren() const { return m_children; }
     size_t getChildCount() const { return m_children.size(); }

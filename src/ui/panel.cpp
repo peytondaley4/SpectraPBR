@@ -137,10 +137,8 @@ bool Panel::onMouseDown(float2 pos, int button) {
         }
     }
 
-    if (bounds.contains(pos)) {
-        return true;
-    }
-
+    // Do not consume clicks on content area - let parent (e.g. PropertyPanel)
+    // forward to child widgets (sliders, etc.)
     return false;
 }
 
@@ -198,9 +196,11 @@ bool Panel::onMouseMove(float2 pos) {
         }
     }
 
+    // Cache bounds to avoid multiple getAbsoluteBounds() calls
+    Rect bounds = getAbsoluteBounds();
+
     // Update close button hover state
     if (m_showHeader && m_closeable) {
-        Rect bounds = getAbsoluteBounds();
         float btnSize = m_headerHeight - 8.0f;
         Rect closeRect = {
             bounds.right() - btnSize - 4.0f,
@@ -216,7 +216,6 @@ bool Panel::onMouseMove(float2 pos) {
 
     // Update hover state for this widget
     bool wasHovered = m_hovered;
-    Rect bounds = getAbsoluteBounds();
     m_hovered = bounds.contains(pos);
 
     if (m_hovered != wasHovered) {

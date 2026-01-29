@@ -127,8 +127,8 @@ void Widget::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* te
 
 void Widget::markDirty() {
     m_dirty = true;
-    // Optionally mark parent dirty too for layout recalculation
-    // if (m_parent) m_parent->markDirty();
+    // Propagate dirty flag up to parents so geometry regeneration triggers
+    if (m_parent) m_parent->markDirty();
 }
 
 bool Widget::onMouseMove(float2 pos) {

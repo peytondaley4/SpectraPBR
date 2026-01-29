@@ -234,9 +234,41 @@ __forceinline__ __device__ bool traceShadowRay(
 }
 
 //------------------------------------------------------------------------------
-// Texture Sampling Helpers
+// Mipmap LOD Calculation
 //------------------------------------------------------------------------------
 
+// Calculate texture LOD based on ray distance and screen pixel size
+// This provides automatic mipmap selection for distant objects
+__forceinline__ __device__ float calculateTextureLOD(float rayDistance) {
+    // Calculate the size of a pixel in world space at distance 1
+    // pixelAngle ≈ 2 * tan(fovY/2) / screenHeight
+    float tanHalfFov = tanf(params.camera.fovY * 0.5f);
+    float pixelWorldSize = (2.0f * tanHalfFov) / static_cast<float>(params.height);
+    
+    // At the hit distance, a pixel covers this much world space
+    float footprint = rayDistance * pixelWorldSize;
+    
+    // LOD = log2(footprint * texelsPerUnit)
+    // We use a base scale factor assuming ~1 texel per world unit at LOD 0
+    // Adjust the 1.0f multiplier if textures are denser/sparser
+    float lod = log2f(fmaxf(1.0f, footprint * 1.0f));
+    
+    // Clamp to valid range (0 to ~12 for most textures)
+    return fminf(fmaxf(lod, 0.0f), 12.0f);
+}
+
+//------------------------------------------------------------------------------
+// Texture Sampling Helpers (with LOD support)
+//------------------------------------------------------------------------------
+
+__forceinline__ __device__ float4 sampleTexture(cudaTextureObject_t tex, float2 uv, float4 fallback, float lod) {
+    if (tex != 0) {
+        return tex2DLod<float4>(tex, uv.x, uv.y, lod);
+    }
+    return fallback;
+}
+
+// Legacy version without LOD (for compatibility)
 __forceinline__ __device__ float4 sampleTexture(cudaTextureObject_t tex, float2 uv, float4 fallback) {
     if (tex != 0) {
         return tex2D<float4>(tex, uv.x, uv.y);
@@ -244,6 +276,20 @@ __forceinline__ __device__ float4 sampleTexture(cudaTextureObject_t tex, float2 
     return fallback;
 }
 
+__forceinline__ __device__ float sampleTextureChannel(cudaTextureObject_t tex, float2 uv, int channel, float fallback, float lod) {
+    if (tex != 0) {
+        float4 sample = tex2DLod<float4>(tex, uv.x, uv.y, lod);
+        switch (channel) {
+            case 0: return sample.x;
+            case 1: return sample.y;
+            case 2: return sample.z;
+            case 3: return sample.w;
+        }
+    }
+    return fallback;
+}
+
+// Legacy version without LOD
 __forceinline__ __device__ float sampleTextureChannel(cudaTextureObject_t tex, float2 uv, int channel, float fallback) {
     if (tex != 0) {
         float4 sample = tex2D<float4>(tex, uv.x, uv.y);
@@ -310,11 +356,17 @@ extern "C" __global__ void __closesthit__radiance() {
     );
 
     //--------------------------------------------------------------------------
-    // Sample Material Textures
+    // Calculate Mipmap LOD based on ray distance
+    //--------------------------------------------------------------------------
+    float rayDistance = optixGetRayTmax();
+    float texLOD = calculateTextureLOD(rayDistance);
+
+    //--------------------------------------------------------------------------
+    // Sample Material Textures (with automatic mipmap selection)
     //--------------------------------------------------------------------------
 
     // Base color (sRGB texture, factor in linear)
-    float4 baseColorTex = sampleTexture(material.baseColorTex, texCoord, make_float4(1.0f, 1.0f, 1.0f, 1.0f));
+    float4 baseColorTex = sampleTexture(material.baseColorTex, texCoord, make_float4(1.0f, 1.0f, 1.0f, 1.0f), texLOD);
     float4 baseColor = make_float4(
         material.baseColor.x * baseColorTex.x,
         material.baseColor.y * baseColorTex.y,
@@ -326,7 +378,7 @@ extern "C" __global__ void __closesthit__radiance() {
     float metallic = material.metallic;
     float roughness = material.roughness;
     if (material.metallicRoughnessTex != 0) {
-        float4 mrSample = tex2D<float4>(material.metallicRoughnessTex, texCoord.x, texCoord.y);
+        float4 mrSample = tex2DLod<float4>(material.metallicRoughnessTex, texCoord.x, texCoord.y, texLOD);
         roughness = material.roughness * mrSample.y;  // G channel
         metallic = material.metallic * mrSample.z;    // B channel
     }
@@ -337,7 +389,7 @@ extern "C" __global__ void __closesthit__radiance() {
     // Emissive
     float3 emissive = material.emissive;
     if (material.emissiveTex != 0) {
-        float4 emissiveTex = tex2D<float4>(material.emissiveTex, texCoord.x, texCoord.y);
+        float4 emissiveTex = tex2DLod<float4>(material.emissiveTex, texCoord.x, texCoord.y, texLOD);
         emissive = make_float3(
             material.emissive.x * emissiveTex.x,
             material.emissive.y * emissiveTex.y,
@@ -351,7 +403,7 @@ extern "C" __global__ void __closesthit__radiance() {
 
     float3 shadingNormal = geomNormal;
     if (material.normalTex != 0) {
-        float4 normalSample = tex2D<float4>(material.normalTex, texCoord.x, texCoord.y);
+        float4 normalSample = tex2DLod<float4>(material.normalTex, texCoord.x, texCoord.y, texLOD);
         float3 tangentNormal = unpackNormal(normalSample);
         shadingNormal = applyNormalMap(tangentNormal, geomNormal, worldTangent, bitangentSign);
     }
@@ -377,10 +429,10 @@ extern "C" __global__ void __closesthit__radiance() {
     float clearcoat = material.clearcoat;
     float clearcoatRoughness = material.clearcoatRoughness;
     if (material.clearcoatTex != 0) {
-        clearcoat *= tex2D<float4>(material.clearcoatTex, texCoord.x, texCoord.y).x;
+        clearcoat *= tex2DLod<float4>(material.clearcoatTex, texCoord.x, texCoord.y, texLOD).x;
     }
     if (material.clearcoatRoughnessTex != 0) {
-        clearcoatRoughness *= tex2D<float4>(material.clearcoatRoughnessTex, texCoord.x, texCoord.y).y;
+        clearcoatRoughness *= tex2DLod<float4>(material.clearcoatRoughnessTex, texCoord.x, texCoord.y, texLOD).y;
     }
 
     //--------------------------------------------------------------------------
@@ -390,7 +442,7 @@ extern "C" __global__ void __closesthit__radiance() {
     float3 sheenColor = material.sheenColor;
     float sheenRoughness = material.sheenRoughness;
     if (material.sheenColorTex != 0) {
-        float4 sheenTex = tex2D<float4>(material.sheenColorTex, texCoord.x, texCoord.y);
+        float4 sheenTex = tex2DLod<float4>(material.sheenColorTex, texCoord.x, texCoord.y, texLOD);
         sheenColor = make_float3(
             sheenColor.x * sheenTex.x,
             sheenColor.y * sheenTex.y,
@@ -398,7 +450,7 @@ extern "C" __global__ void __closesthit__radiance() {
         );
     }
     if (material.sheenRoughnessTex != 0) {
-        sheenRoughness *= tex2D<float4>(material.sheenRoughnessTex, texCoord.x, texCoord.y).w;
+        sheenRoughness *= tex2DLod<float4>(material.sheenRoughnessTex, texCoord.x, texCoord.y, texLOD).w;
     }
 
     //--------------------------------------------------------------------------
@@ -407,7 +459,7 @@ extern "C" __global__ void __closesthit__radiance() {
 
     float transmission = material.transmission;
     if (material.transmissionTex != 0) {
-        transmission *= tex2D<float4>(material.transmissionTex, texCoord.x, texCoord.y).x;
+        transmission *= tex2DLod<float4>(material.transmissionTex, texCoord.x, texCoord.y, texLOD).x;
     }
 
     //--------------------------------------------------------------------------
@@ -417,10 +469,10 @@ extern "C" __global__ void __closesthit__radiance() {
     float specularFactor = material.specularFactor;
     float3 specularColorFactor = material.specularColorFactor;
     if (material.specularTex != 0) {
-        specularFactor *= tex2D<float4>(material.specularTex, texCoord.x, texCoord.y).w;  // A channel
+        specularFactor *= tex2DLod<float4>(material.specularTex, texCoord.x, texCoord.y, texLOD).w;  // A channel
     }
     if (material.specularColorTex != 0) {
-        float4 specColorTex = tex2D<float4>(material.specularColorTex, texCoord.x, texCoord.y);
+        float4 specColorTex = tex2DLod<float4>(material.specularColorTex, texCoord.x, texCoord.y, texLOD);
         specularColorFactor = make_float3(
             specularColorFactor.x * specColorTex.x,
             specularColorFactor.y * specColorTex.y,
@@ -434,7 +486,7 @@ extern "C" __global__ void __closesthit__radiance() {
 
     float ao = 1.0f;  // Default: no occlusion
     if (material.occlusionTex != 0) {
-        ao = tex2D<float4>(material.occlusionTex, texCoord.x, texCoord.y).x;  // R channel
+        ao = tex2DLod<float4>(material.occlusionTex, texCoord.x, texCoord.y, texLOD).x;  // R channel
         ao = 1.0f + material.occlusionStrength * (ao - 1.0f);  // Apply strength
     }
 

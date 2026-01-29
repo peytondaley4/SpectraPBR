@@ -133,7 +133,7 @@ extern "C" __global__ void __miss__background() {
     }
     else {
         // Default: Black background
-        color = make_float3(0.0f, 0.0f, 0.0f);
+        color = make_float3(0.05f, 0.05f, 0.05f);
     }
 
     // Set payload

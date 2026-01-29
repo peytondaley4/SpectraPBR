@@ -123,6 +123,22 @@ bool TreeNode::onMouseDown(float2 pos, int button) {
         }
     }
 
+    // Check for double-click
+    auto now = std::chrono::steady_clock::now();
+    if (m_lastClickTime.has_value()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - m_lastClickTime.value());
+        if (elapsed.count() < DOUBLE_CLICK_MS) {
+            // Double-click detected
+            if (m_onDoubleClick) {
+                m_onDoubleClick(this);
+            }
+            m_lastClickTime.reset();
+            return true;
+        }
+    }
+    m_lastClickTime = now;
+
     // Select this node
     setSelected(true);
     return true;

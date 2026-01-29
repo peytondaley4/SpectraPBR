@@ -13,13 +13,14 @@ constexpr TextureHandle INVALID_TEXTURE_HANDLE = UINT32_MAX;
 
 // GPU texture info
 struct GpuTexture {
-    cudaTextureObject_t texObj;     // Texture object for sampling
-    cudaArray_t array;               // CUDA array holding pixel data
+    cudaTextureObject_t texObj;          // Texture object for sampling
+    cudaMipmappedArray_t mipmappedArray; // Mipmapped CUDA array
     uint32_t width;
     uint32_t height;
     uint32_t channels;
+    uint32_t mipLevels;
     uint32_t refCount;
-    bool isSRGB;                     // Whether texture is in sRGB color space
+    bool isSRGB;                         // Whether texture is in sRGB color space
 };
 
 class TextureManager {

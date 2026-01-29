@@ -71,6 +71,14 @@ public:
     // Get instances (for UI scene tree)
     const std::vector<SceneInstance>& getInstances() const { return m_instances; }
 
+    // Get material handle for an instance
+    MaterialHandle getMaterialHandle(uint32_t instanceId) const {
+        if (instanceId >= m_instances.size()) return INVALID_MATERIAL_HANDLE;
+        uint32_t gasIndex = m_instances[instanceId].gasIndex;
+        if (gasIndex >= m_gasList.size()) return INVALID_MATERIAL_HANDLE;
+        return m_gasList[gasIndex].materialHandle;
+    }
+
     // Track loaded model paths for serialization
     void addLoadedModelPath(const std::string& path) { m_loadedModelPaths.push_back(path); }
     const std::vector<std::string>& getLoadedModelPaths() const { return m_loadedModelPaths; }

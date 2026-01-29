@@ -42,6 +42,19 @@ struct Theme {
 
     // Separator
     float4 separator;
+
+    // Slider colors
+    float4 sliderTrack;
+    float4 sliderTrackFilled;
+    float4 sliderThumb;
+    float4 sliderThumbHover;
+    float4 sliderThumbActive;
+
+    // Property panel colors
+    float4 propertyHeader;
+    float4 propertyValue;
+    float4 propertySeparator;
+    float4 propertyLabel;
 };
 
 //------------------------------------------------------------------------------
@@ -86,6 +99,19 @@ inline Theme createDarkTheme() {
     // Separator
     theme.separator = make_float4(0.30f, 0.30f, 0.30f, 1.0f);
 
+    // Slider colors
+    theme.sliderTrack       = make_float4(0.20f, 0.20f, 0.20f, 1.0f);
+    theme.sliderTrackFilled = make_float4(0.26f, 0.59f, 0.98f, 1.0f);  // Blue highlight
+    theme.sliderThumb       = make_float4(0.50f, 0.50f, 0.50f, 1.0f);
+    theme.sliderThumbHover  = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
+    theme.sliderThumbActive = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
+
+    // Property panel colors
+    theme.propertyHeader    = make_float4(0.18f, 0.18f, 0.18f, 1.0f);
+    theme.propertyValue     = make_float4(0.85f, 0.85f, 0.85f, 1.0f);
+    theme.propertySeparator = make_float4(0.25f, 0.25f, 0.25f, 1.0f);
+    theme.propertyLabel     = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
+
     return theme;
 }
 
@@ -126,6 +152,19 @@ inline Theme createLightTheme() {
 
     // Separator
     theme.separator = make_float4(0.70f, 0.70f, 0.70f, 1.0f);
+
+    // Slider colors
+    theme.sliderTrack       = make_float4(0.75f, 0.75f, 0.75f, 1.0f);
+    theme.sliderTrackFilled = make_float4(0.26f, 0.59f, 0.98f, 1.0f);  // Blue highlight
+    theme.sliderThumb       = make_float4(0.50f, 0.50f, 0.50f, 1.0f);
+    theme.sliderThumbHover  = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
+    theme.sliderThumbActive = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
+
+    // Property panel colors
+    theme.propertyHeader    = make_float4(0.85f, 0.85f, 0.85f, 1.0f);
+    theme.propertyValue     = make_float4(0.15f, 0.15f, 0.15f, 1.0f);
+    theme.propertySeparator = make_float4(0.75f, 0.75f, 0.75f, 1.0f);
+    theme.propertyLabel     = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
 
     return theme;
 }

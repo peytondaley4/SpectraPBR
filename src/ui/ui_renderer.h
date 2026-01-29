@@ -26,6 +26,9 @@ public:
     // Release resources
     void shutdown();
 
+    // Set textures for UI preview quads (call before render)
+    void setTextures(const cudaTextureObject_t* textures, uint32_t count);
+
     // Render UI quads to the output buffer
     // Clears the buffer first (to transparent), then renders quads
     void render(const std::vector<UIQuad>& quads,
@@ -43,6 +46,10 @@ private:
 
     float m_sdfThreshold = 0.5f;
     float m_sdfSmoothing = 0.1f;
+
+    // Texture array for QUAD_FLAG_TEXTURE
+    cudaTextureObject_t* m_deviceTextures = nullptr;
+    uint32_t m_textureCount = 0;
 };
 
 } // namespace ui

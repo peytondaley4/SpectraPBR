@@ -13,8 +13,11 @@
 #include "ui/ui_manager.h"
 #include "ui/ui_renderer.h"
 #include "ui/input_handler.h"
+#include "ui/property_panel.h"
+#include "ui/texture_preview_cache.h"
 #include "scene/selection_manager.h"
 #include "scene/scene_serializer.h"
+#include "scene/scene_hierarchy.h"
 #include <iostream>
 #include <chrono>
 #include <filesystem>
@@ -71,6 +74,139 @@ struct FrameTimer {
     }
 };
 
+//------------------------------------------------------------------------------
+// Light Manager - Manages CPU-side light data for editing
+//------------------------------------------------------------------------------
+struct LightManager {
+    // CPU-side light data
+    std::vector<GpuDirectionalLight> dirLights;
+    std::vector<GpuAreaLight> areaLights;
+    std::vector<GpuPointLight> pointLights;
+
+    // GPU buffers
+    CUdeviceptr d_dirLights = 0;
+    CUdeviceptr d_areaLights = 0;
+    CUdeviceptr d_pointLights = 0;
+
+    void addDirectionalLight(const GpuDirectionalLight& light) {
+        dirLights.push_back(light);
+    }
+
+    void addAreaLight(const GpuAreaLight& light) {
+        areaLights.push_back(light);
+    }
+
+    void addPointLight(const GpuPointLight& light) {
+        pointLights.push_back(light);
+    }
+
+    void updateDirectionalLight(uint32_t index, const ui::LightInfo& info) {
+        if (index >= dirLights.size()) return;
+        dirLights[index].direction = info.direction;
+        dirLights[index].angularDiameter = info.angularDiameter;
+        dirLights[index].irradiance = info.color;
+    }
+
+    void updateAreaLight(uint32_t index, const ui::LightInfo& info) {
+        if (index >= areaLights.size()) return;
+        areaLights[index].position = info.position;
+        areaLights[index].emission = info.color;
+        areaLights[index].size = info.size;
+        areaLights[index].area = info.size.x * info.size.y;
+    }
+
+    void updatePointLight(uint32_t index, const ui::LightInfo& info) {
+        if (index >= pointLights.size()) return;
+        pointLights[index].position = info.position;
+        pointLights[index].radius = info.radius;
+        pointLights[index].intensity = info.color;
+    }
+
+    void syncToGpu(OptixEngine* engine) {
+        // Directional lights
+        if (!dirLights.empty()) {
+            size_t size = dirLights.size() * sizeof(GpuDirectionalLight);
+            if (!d_dirLights) {
+                cudaMalloc(reinterpret_cast<void**>(&d_dirLights), size);
+            }
+            cudaMemcpy(reinterpret_cast<void*>(d_dirLights), dirLights.data(), size, cudaMemcpyHostToDevice);
+            engine->setDirectionalLights(reinterpret_cast<GpuDirectionalLight*>(d_dirLights),
+                                          static_cast<uint32_t>(dirLights.size()));
+        }
+
+        // Area lights
+        if (!areaLights.empty()) {
+            size_t size = areaLights.size() * sizeof(GpuAreaLight);
+            if (!d_areaLights) {
+                cudaMalloc(reinterpret_cast<void**>(&d_areaLights), size);
+            }
+            cudaMemcpy(reinterpret_cast<void*>(d_areaLights), areaLights.data(), size, cudaMemcpyHostToDevice);
+            engine->setAreaLights(reinterpret_cast<GpuAreaLight*>(d_areaLights),
+                                   static_cast<uint32_t>(areaLights.size()));
+        }
+
+        // Point lights
+        if (!pointLights.empty()) {
+            size_t size = pointLights.size() * sizeof(GpuPointLight);
+            if (!d_pointLights) {
+                cudaMalloc(reinterpret_cast<void**>(&d_pointLights), size);
+            }
+            cudaMemcpy(reinterpret_cast<void*>(d_pointLights), pointLights.data(), size, cudaMemcpyHostToDevice);
+            engine->setPointLights(reinterpret_cast<GpuPointLight*>(d_pointLights),
+                                    static_cast<uint32_t>(pointLights.size()));
+        }
+    }
+
+    void cleanup() {
+        if (d_dirLights) { cudaFree(reinterpret_cast<void*>(d_dirLights)); d_dirLights = 0; }
+        if (d_areaLights) { cudaFree(reinterpret_cast<void*>(d_areaLights)); d_areaLights = 0; }
+        if (d_pointLights) { cudaFree(reinterpret_cast<void*>(d_pointLights)); d_pointLights = 0; }
+    }
+
+    ui::LightInfo getDirectionalLightInfo(uint32_t index) const {
+        ui::LightInfo info = {};
+        if (index >= dirLights.size()) return info;
+        info.type = SceneNodeType::DirectionalLight;
+        info.index = index;
+        info.direction = dirLights[index].direction;
+        info.color = dirLights[index].irradiance;
+        info.angularDiameter = dirLights[index].angularDiameter;
+        // Calculate intensity from color magnitude
+        info.intensity = std::sqrt(info.color.x * info.color.x +
+                                    info.color.y * info.color.y +
+                                    info.color.z * info.color.z);
+        return info;
+    }
+
+    ui::LightInfo getAreaLightInfo(uint32_t index) const {
+        ui::LightInfo info = {};
+        if (index >= areaLights.size()) return info;
+        info.type = SceneNodeType::AreaLight;
+        info.index = index;
+        info.position = areaLights[index].position;
+        info.color = areaLights[index].emission;
+        info.size = areaLights[index].size;
+        info.intensity = std::sqrt(info.color.x * info.color.x +
+                                    info.color.y * info.color.y +
+                                    info.color.z * info.color.z);
+        return info;
+    }
+
+    ui::LightInfo getPointLightInfo(uint32_t index) const {
+        ui::LightInfo info = {};
+        if (index >= pointLights.size()) return info;
+        info.type = SceneNodeType::PointLight;
+        info.index = index;
+        info.position = pointLights[index].position;
+        info.radius = pointLights[index].radius;
+        info.color = pointLights[index].intensity;
+        info.intensity = std::sqrt(info.color.x * info.color.x +
+                                    info.color.y * info.color.y +
+                                    info.color.z * info.color.z);
+        return info;
+    }
+};
+
 // Global state for callbacks
 static FrameTimer g_timer;
 static CudaInterop* g_cudaInterop = nullptr;
@@ -91,6 +227,8 @@ static ui::InputHandler* g_inputHandler = nullptr;
 static SelectionManager* g_selectionManager = nullptr;
 static SceneSerializer* g_sceneSerializer = nullptr;
 static SceneManager* g_sceneManager = nullptr;
+static SceneHierarchy* g_sceneHierarchy = nullptr;
+static LightManager* g_lightManager = nullptr;
 
 // Quality mode names for display
 static const char* getQualityModeName(QualityMode mode) {
@@ -245,6 +383,13 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             if (g_uiManager && !(mods & GLFW_MOD_CONTROL)) {
                 g_uiManager->toggleTheme();
                 std::cout << "[Main] Theme: " << (g_uiManager->isDarkTheme() ? "dark" : "light") << "\n";
+            }
+            break;
+
+        case GLFW_KEY_P:
+            if (g_uiManager) {
+                g_uiManager->togglePropertyPanel();
+                std::cout << "[Main] Property panel: " << (g_uiManager->isPropertyPanelVisible() ? "visible" : "hidden") << "\n";
             }
             break;
 
@@ -549,6 +694,12 @@ int main(int argc, char* argv[]) {
         std::cerr << "[Main] Warning: Failed to initialize UI renderer\n";
     }
 
+    // Initialize Texture Preview Cache (for lazy texture preview rendering)
+    ui::TexturePreviewCache texturePreviewCache;
+    if (!texturePreviewCache.init()) {
+        std::cerr << "[Main] Warning: Failed to initialize texture preview cache\n";
+    }
+
     // Initialize Input Handler
     ui::InputHandler inputHandler;
     g_inputHandler = &inputHandler;
@@ -587,11 +738,24 @@ int main(int argc, char* argv[]) {
     sceneManager.setGeometryManager(&geometryManager);
     sceneManager.setMaterialManager(&materialManager);
 
+    // Initialize scene hierarchy for hierarchical tree view
+    SceneHierarchy sceneHierarchy;
+    g_sceneHierarchy = &sceneHierarchy;
+    uiManager.setSceneHierarchy(&sceneHierarchy);
+    uiManager.setMaterialManager(&materialManager);
+
+    // Initialize light manager
+    LightManager lightManager;
+    g_lightManager = &lightManager;
+
     // Initialize camera
     Camera camera;
     camera.setPosition(glm::vec3(0.0f, 1.0f, 5.0f));
     camera.setAspectRatio(static_cast<float>(glContext.getWidth()) / static_cast<float>(glContext.getHeight()));
     g_camera = &camera;
+
+    // Loaded model name for hierarchy
+    std::string loadedModelName = "Model";
 
     // Load model if provided
     if (!modelPath.empty() && std::filesystem::exists(modelPath)) {
@@ -600,19 +764,29 @@ int main(int argc, char* argv[]) {
 
         if (loadedModel) {
             std::cout << "[Main] Loading model: " << loadedModel->name << "\n";
+            loadedModelName = loadedModel->name;
 
             // Add materials
             for (const auto& matData : loadedModel->materials) {
                 materialManager.addMaterial(matData);
             }
 
+            // Add model to hierarchy
+            uint32_t modelNodeIdx = sceneHierarchy.addModel(loadedModel->name);
+
             // Add meshes and instances
+            uint32_t instanceId = 0;
             for (const auto& instance : loadedModel->instances) {
                 if (instance.meshIndex < loadedModel->meshes.size()) {
                     const MeshData& mesh = loadedModel->meshes[instance.meshIndex];
                     uint32_t gasIndex = sceneManager.addMesh(mesh);
                     if (gasIndex != UINT32_MAX) {
                         sceneManager.addInstance(gasIndex, instance.transform);
+
+                        // Add instance to hierarchy
+                        std::string instanceName = "Instance " + std::to_string(instanceId);
+                        sceneHierarchy.addInstance(modelNodeIdx, instance.meshIndex, instanceId, instanceName);
+                        instanceId++;
                     }
                 }
             }
@@ -623,9 +797,6 @@ int main(int argc, char* argv[]) {
                 optixEngine.setSceneHandle(sceneManager.getSceneHandle());
                 optixEngine.setGeometryBuffers(sceneManager.getVertexBuffers(),
                                                sceneManager.getIndexBuffers());
-
-                // Build UI scene tree
-                uiManager.buildSceneTree(&sceneManager);
             }
         } else {
             std::cerr << "[Main] Failed to load model: " << loader.getLastError() << "\n";
@@ -635,27 +806,11 @@ int main(int argc, char* argv[]) {
     }
 
     //--------------------------------------------------------------------------
-    // Set up default lighting
+    // Set up default lighting using LightManager
     // glTF models may have emissive materials but rarely include explicit lights,
     // so we provide a default sun-like directional light for visibility.
     //--------------------------------------------------------------------------
-    
-    // Default directional light (sun) - stored on GPU
-    static GpuDirectionalLight defaultDirLight;
-    defaultDirLight.direction = make_float3(0.5f, -0.8f, 0.3f);  // Sun angle
-    defaultDirLight.angularDiameter = 0.2f;  // Sharp shadows
-    defaultDirLight.irradiance = make_float3(3.0f, 2.9f, 2.7f);  // Warm sunlight
-    
-    CUdeviceptr d_dirLights = 0;
-    cudaMalloc(reinterpret_cast<void**>(&d_dirLights), sizeof(GpuDirectionalLight));
-    cudaMemcpy(reinterpret_cast<void*>(d_dirLights), &defaultDirLight, 
-               sizeof(GpuDirectionalLight), cudaMemcpyHostToDevice);
-    
-    optixEngine.setDirectionalLights(reinterpret_cast<GpuDirectionalLight*>(d_dirLights), 1);
-    
-    std::cout << "[Main] Default directional light (sun) enabled\n";
 
-    // Default area lights (studio-style lighting)
     // Helper lambda to normalize float3 on host
     auto normalizeFloat3 = [](float3 v) -> float3 {
         float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
@@ -664,33 +819,135 @@ int main(int argc, char* argv[]) {
         }
         return v;
     };
-    
-    static GpuAreaLight defaultAreaLights[2];
-    
+
+    // Default directional light (sun)
+    GpuDirectionalLight sunLight;
+    sunLight.direction = make_float3(0.5f, -0.8f, 0.3f);  // Sun angle
+    sunLight.angularDiameter = 0.2f;  // Sharp shadows
+    sunLight.irradiance = make_float3(3.0f, 2.9f, 2.7f);  // Warm sunlight
+    lightManager.addDirectionalLight(sunLight);
+    sceneHierarchy.addDirectionalLight(0, "Sun");
+
     // Key light - large soft light above and to the right
-    defaultAreaLights[0].position = make_float3(3.0f, 4.0f, 2.0f);
-    defaultAreaLights[0].normal = normalizeFloat3(make_float3(-0.3f, -0.8f, -0.2f));  // Pointing down and left
-    defaultAreaLights[0].tangent = make_float3(1.0f, 0.0f, 0.0f);  // Already normalized
-    defaultAreaLights[0].emission = make_float3(200.0f, 150.0f, 160.0f);  // Slightly warm white
-    defaultAreaLights[0].size = make_float2(2.0f, 2.0f);  // 2x2 meter panel
-    defaultAreaLights[0].area = 4.0f;  // 2 * 2
-    
+    GpuAreaLight keyLight;
+    keyLight.position = make_float3(3.0f, 4.0f, 2.0f);
+    keyLight.normal = normalizeFloat3(make_float3(-0.3f, -0.8f, -0.2f));
+    keyLight.tangent = make_float3(1.0f, 0.0f, 0.0f);
+    keyLight.emission = make_float3(200.0f, 150.0f, 160.0f);
+    keyLight.size = make_float2(2.0f, 2.0f);
+    keyLight.area = 4.0f;
+    lightManager.addAreaLight(keyLight);
+    sceneHierarchy.addAreaLight(0, "Key Light");
+
     // Fill light - smaller, dimmer light to the left
-    defaultAreaLights[1].position = make_float3(-2.5f, 2.0f, 3.0f);
-    defaultAreaLights[1].normal = normalizeFloat3(make_float3(0.4f, -0.5f, -0.6f));  // Pointing right and down
-    defaultAreaLights[1].tangent = make_float3(0.0f, 0.0f, 1.0f);  // Already normalized
-    defaultAreaLights[1].emission = make_float3(100.0f, 110.0f, 120.0f);  // Cool blue-ish fill
-    defaultAreaLights[1].size = make_float2(1.5f, 1.5f);  // 1.5x1.5 meter panel
-    defaultAreaLights[1].area = 2.25f;  // 1.5 * 1.5
-    
-    CUdeviceptr d_areaLights = 0;
-    cudaMalloc(reinterpret_cast<void**>(&d_areaLights), sizeof(GpuAreaLight) * 2);
-    cudaMemcpy(reinterpret_cast<void*>(d_areaLights), defaultAreaLights, 
-               sizeof(GpuAreaLight) * 2, cudaMemcpyHostToDevice);
-    
-    optixEngine.setAreaLights(reinterpret_cast<GpuAreaLight*>(d_areaLights), 2);
-    
-    std::cout << "[Main] Default area lights (key + fill) enabled\n";
+    GpuAreaLight fillLight;
+    fillLight.position = make_float3(-2.5f, 2.0f, 3.0f);
+    fillLight.normal = normalizeFloat3(make_float3(0.4f, -0.5f, -0.6f));
+    fillLight.tangent = make_float3(0.0f, 0.0f, 1.0f);
+    fillLight.emission = make_float3(100.0f, 110.0f, 120.0f);
+    fillLight.size = make_float2(1.5f, 1.5f);
+    fillLight.area = 2.25f;
+    lightManager.addAreaLight(fillLight);
+    sceneHierarchy.addAreaLight(1, "Fill Light");
+
+    // Sync lights to GPU
+    lightManager.syncToGpu(&optixEngine);
+
+    std::cout << "[Main] Default lights enabled (1 directional, 2 area)\n";
+
+    // Build hierarchical scene tree now that model and lights are loaded
+    uiManager.buildHierarchicalSceneTree();
+
+    // Wire up light edit callback
+    uiManager.setOnLightEdit([&](SceneNodeType type, uint32_t index, const ui::LightInfo& info) {
+        switch (type) {
+            case SceneNodeType::DirectionalLight:
+                lightManager.updateDirectionalLight(index, info);
+                break;
+            case SceneNodeType::AreaLight:
+                lightManager.updateAreaLight(index, info);
+                break;
+            case SceneNodeType::PointLight:
+                lightManager.updatePointLight(index, info);
+                break;
+            default:
+                break;
+        }
+        lightManager.syncToGpu(&optixEngine);
+        optixEngine.resetAccumulation();
+    });
+
+    // Wire up light info request callback (for double-click to show properties)
+    uiManager.setLightInfoRequestCallback([&](SceneNodeType type, uint32_t index) -> ui::LightInfo {
+        switch (type) {
+            case SceneNodeType::DirectionalLight:
+                return lightManager.getDirectionalLightInfo(index);
+            case SceneNodeType::AreaLight:
+                return lightManager.getAreaLightInfo(index);
+            case SceneNodeType::PointLight:
+                return lightManager.getPointLightInfo(index);
+            default:
+                return ui::LightInfo{};
+        }
+    });
+
+    // Wire up instance info request callback (for showing material/texture properties)
+    uiManager.setInstanceInfoRequestCallback([&](uint32_t instanceId) -> ui::InstanceInfo {
+        ui::InstanceInfo info = {};
+        info.instanceId = instanceId;
+        
+        // Collect preview textures for UI rendering
+        std::vector<cudaTextureObject_t> previewTextures;
+        uint32_t texIndex = 0;
+        
+        // Get material handle for this instance
+        MaterialHandle matHandle = sceneManager.getMaterialHandle(instanceId);
+        if (matHandle != INVALID_MATERIAL_HANDLE) {
+            info.materialIndex = matHandle;
+            
+            // Get material data
+            const GpuMaterial* mat = materialManager.get(matHandle);
+            if (mat) {
+                info.baseColor = mat->baseColor;
+                info.metallic = mat->metallic;
+                info.roughness = mat->roughness;
+                info.emissive = mat->emissive;
+                
+                // Gather textures and assign indices
+                if (mat->baseColorTex != 0) {
+                    info.hasBaseColorTex = true;
+                    info.baseColorTexIndex = texIndex++;
+                    previewTextures.push_back(mat->baseColorTex);
+                }
+                
+                if (mat->normalTex != 0) {
+                    info.hasNormalTex = true;
+                    info.normalTexIndex = texIndex++;
+                    previewTextures.push_back(mat->normalTex);
+                }
+                
+                if (mat->metallicRoughnessTex != 0) {
+                    info.hasMetallicRoughnessTex = true;
+                    info.metallicRoughnessTexIndex = texIndex++;
+                    previewTextures.push_back(mat->metallicRoughnessTex);
+                }
+                
+                if (mat->emissiveTex != 0) {
+                    info.hasEmissiveTex = true;
+                    info.emissiveTexIndex = texIndex++;
+                    previewTextures.push_back(mat->emissiveTex);
+                }
+            }
+        }
+        
+        // Store preview textures in UIManager for rendering
+        uiManager.setPreviewTextures(previewTextures);
+        
+        // Get model name from hierarchy
+        info.modelName = "Instance " + std::to_string(instanceId);
+        
+        return info;
+    });
 
     // Set initial dimensions
     optixEngine.setDimensions(glContext.getWidth(), glContext.getHeight());
@@ -773,9 +1030,11 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
     std::cout << "[Main] UI Controls:\n";
     std::cout << "  H     - Toggle scene hierarchy panel\n";
+    std::cout << "  P     - Toggle property panel\n";
     std::cout << "  L     - Toggle light/dark theme\n";
     std::cout << "  Ctrl+S- Save scene\n";
     std::cout << "  Ctrl+O- Load scene\n";
+    std::cout << "  Double-click on tree node to show properties\n";
     std::cout << "\n";
     std::cout << "[Main] Current quality mode: " << getQualityModeName(g_qualityMode) << "\n\n";
 
@@ -844,6 +1103,30 @@ int main(int argc, char* argv[]) {
         // Collect UI geometry
         uiManager.collectGeometry();
 
+        // Set preview textures for UI rendering (only when changed)
+        // Use the cache to avoid sampling full-res textures every frame
+        if (uiManager.texturesChanged()) {
+            const auto& previewTextures = uiManager.getPreviewTextures();
+            
+            // Generate cached previews (renders full textures to small cache once)
+            texturePreviewCache.generatePreviews(
+                previewTextures.data(),
+                static_cast<uint32_t>(previewTextures.size()),
+                cudaInterop.getStream()
+            );
+            
+            // Wait for cache generation to complete
+            cudaInterop.synchronize();
+            
+            // Use cached textures for UI rendering (fast path)
+            uiRenderer.setTextures(
+                texturePreviewCache.getCachedTextures(),
+                texturePreviewCache.getCachedTextureCount()
+            );
+            
+            uiManager.clearTexturesChanged();
+        }
+
         // Map UI PBO for CUDA access
         float4* uiDevicePtr = reinterpret_cast<float4*>(cudaInterop.mapUIPBO());
         if (uiDevicePtr) {
@@ -885,6 +1168,8 @@ int main(int argc, char* argv[]) {
     g_selectionManager = nullptr;
     g_sceneSerializer = nullptr;
     g_sceneManager = nullptr;
+    g_sceneHierarchy = nullptr;
+    g_lightManager = nullptr;
 
     // Shutdown UI
     inputHandler.shutdown();
@@ -893,12 +1178,7 @@ int main(int argc, char* argv[]) {
     fontAtlas.release();
 
     // Free lighting buffers
-    if (d_dirLights) {
-        cudaFree(reinterpret_cast<void*>(d_dirLights));
-    }
-    if (d_areaLights) {
-        cudaFree(reinterpret_cast<void*>(d_areaLights));
-    }
+    lightManager.cleanup();
 
     // Free accumulation buffer
     if (d_accumulationBuffer) {

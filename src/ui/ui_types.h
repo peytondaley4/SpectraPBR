@@ -9,8 +9,9 @@ namespace ui {
 //------------------------------------------------------------------------------
 // UI Quad Flags
 //------------------------------------------------------------------------------
-constexpr uint32_t QUAD_FLAG_SOLID = 0;      // Solid color quad
-constexpr uint32_t QUAD_FLAG_TEXT  = 1;      // SDF text quad (sample font atlas)
+constexpr uint32_t QUAD_FLAG_SOLID   = 0;    // Solid color quad
+constexpr uint32_t QUAD_FLAG_TEXT    = 1;    // SDF text quad (sample font atlas)
+constexpr uint32_t QUAD_FLAG_TEXTURE = 2;    // Textured quad (sample from texture array)
 
 //------------------------------------------------------------------------------
 // UI Vertex Structure (32 bytes)
@@ -30,7 +31,8 @@ static_assert(sizeof(UIVertex) == 32, "UIVertex must be 32 bytes");
 struct UIQuad {
     UIVertex vertices[4];   // TL, TR, BL, BR order
     float depth;            // Z-order (higher = on top)
-    uint32_t flags;         // QUAD_FLAG_SOLID or QUAD_FLAG_TEXT
+    uint32_t flags;         // QUAD_FLAG_SOLID, QUAD_FLAG_TEXT, or QUAD_FLAG_TEXTURE
+    uint32_t textureIndex;  // Index into texture array (for QUAD_FLAG_TEXTURE)
     float clipMinX;         // Clip rect (0,0,0,0 = no clipping)
     float clipMinY;
     float clipMaxX;
@@ -52,6 +54,8 @@ struct GlyphMetrics {
 //------------------------------------------------------------------------------
 // UI Render Parameters (passed to CUDA kernel)
 //------------------------------------------------------------------------------
+constexpr uint32_t MAX_UI_TEXTURES = 16;  // Maximum textures for UI preview
+
 struct UIRenderParams {
     float4* output_buffer;          // Output buffer to render into
     uint32_t buffer_width;          // Buffer width in pixels
@@ -61,6 +65,8 @@ struct UIRenderParams {
     cudaTextureObject_t font_atlas; // SDF font atlas texture
     float sdf_threshold;            // SDF threshold for text (typically 0.5)
     float sdf_smoothing;            // SDF smoothing amount for anti-aliasing
+    cudaTextureObject_t textures[MAX_UI_TEXTURES];  // Textures for QUAD_FLAG_TEXTURE
+    uint32_t texture_count;         // Number of active textures
 };
 
 //------------------------------------------------------------------------------
@@ -130,6 +136,7 @@ inline UIQuad makeSolidQuad(const Rect& rect, float4 color, float depth) {
 
     quad.depth = depth;
     quad.flags = QUAD_FLAG_SOLID;
+    quad.textureIndex = 0;
     quad.clipMinX = 0.0f;
     quad.clipMinY = 0.0f;
     quad.clipMaxX = 0.0f;
@@ -164,6 +171,42 @@ inline UIQuad makeTextQuad(float2 pos, float2 size, float2 uvMin, float2 uvMax,
 
     quad.depth = depth;
     quad.flags = QUAD_FLAG_TEXT;
+    quad.textureIndex = 0;
+    quad.clipMinX = 0.0f;
+    quad.clipMinY = 0.0f;
+    quad.clipMaxX = 0.0f;
+    quad.clipMaxY = 0.0f;
+
+    return quad;
+}
+
+inline UIQuad makeTexturedQuad(const Rect& rect, uint32_t textureIndex, float depth,
+                               float4 tint = make_float4(1.0f, 1.0f, 1.0f, 1.0f)) {
+    UIQuad quad;
+
+    // Top-left
+    quad.vertices[0].position = make_float2(rect.x, rect.y);
+    quad.vertices[0].uv = make_float2(0.0f, 0.0f);
+    quad.vertices[0].color = tint;
+
+    // Top-right
+    quad.vertices[1].position = make_float2(rect.x + rect.width, rect.y);
+    quad.vertices[1].uv = make_float2(1.0f, 0.0f);
+    quad.vertices[1].color = tint;
+
+    // Bottom-left
+    quad.vertices[2].position = make_float2(rect.x, rect.y + rect.height);
+    quad.vertices[2].uv = make_float2(0.0f, 1.0f);
+    quad.vertices[2].color = tint;
+
+    // Bottom-right
+    quad.vertices[3].position = make_float2(rect.x + rect.width, rect.y + rect.height);
+    quad.vertices[3].uv = make_float2(1.0f, 1.0f);
+    quad.vertices[3].color = tint;
+
+    quad.depth = depth;
+    quad.flags = QUAD_FLAG_TEXTURE;
+    quad.textureIndex = textureIndex;
     quad.clipMinX = 0.0f;
     quad.clipMinY = 0.0f;
     quad.clipMaxX = 0.0f;

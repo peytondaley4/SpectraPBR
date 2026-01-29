@@ -37,6 +37,7 @@ public:
     // Draggable panel by header
     void setDraggable(bool draggable) { m_draggable = draggable; }
     bool isDraggable() const { return m_draggable; }
+    bool isDragging() const { return m_dragging; }  // Check if currently being dragged
 
     // Closeable (X button in header)
     void setCloseable(bool closeable) { m_closeable = closeable; markDirty(); }

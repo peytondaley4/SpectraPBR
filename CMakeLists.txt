@@ -257,12 +257,17 @@ add_executable(SpectraPBR
     src/ui/label.cpp
     src/ui/tree_node.cpp
     src/ui/scroll_view.cpp
+    src/ui/slider.cpp
+    src/ui/color_picker.cpp
+    src/ui/property_panel.cpp
     src/ui/input_handler.cpp
     src/ui/ui_manager.cpp
     src/ui/ui_renderer.cu
+    src/ui/texture_preview_cache.cu
     # Phase 4: Scene Management
     src/scene/selection_manager.cpp
     src/scene/scene_serializer.cpp
+    src/scene/scene_hierarchy.cpp
 )
 
 # Include directories

@@ -1,7 +1,10 @@
 #pragma once
 
 #include "widget.h"
+#include "../scene/scene_hierarchy.h"
 #include <functional>
+#include <chrono>
+#include <optional>
 
 namespace spectra {
 namespace ui {
@@ -40,12 +43,22 @@ public:
     void setUserData(uint32_t data) { m_userData = data; }
     uint32_t getUserData() const { return m_userData; }
 
+    // Scene node type (for property panel dispatching)
+    void setNodeType(SceneNodeType type) { m_nodeType = type; }
+    SceneNodeType getNodeType() const { return m_nodeType; }
+
+    // Node index in hierarchy (for hierarchy lookups)
+    void setNodeIndex(uint32_t index) { m_nodeIndex = index; }
+    uint32_t getNodeIndex() const { return m_nodeIndex; }
+
     // Callbacks
     using SelectCallback = std::function<void(TreeNode*)>;
     using ExpandCallback = std::function<void(TreeNode*, bool)>;
+    using DoubleClickCallback = std::function<void(TreeNode*)>;
 
     void setOnSelect(SelectCallback callback) { m_onSelect = callback; }
     void setOnExpand(ExpandCallback callback) { m_onExpand = callback; }
+    void setOnDoubleClick(DoubleClickCallback callback) { m_onDoubleClick = callback; }
 
     // Row height
     static constexpr float ROW_HEIGHT = 22.0f;
@@ -68,8 +81,17 @@ private:
     uint32_t m_userData = 0;
     bool m_expanderHovered = false;
 
+    // Scene node type for property panel
+    SceneNodeType m_nodeType = SceneNodeType::Instance;
+    uint32_t m_nodeIndex = UINT32_MAX;
+
+    // Double-click tracking
+    std::optional<std::chrono::steady_clock::time_point> m_lastClickTime;
+    static constexpr int DOUBLE_CLICK_MS = 300;
+
     SelectCallback m_onSelect;
     ExpandCallback m_onExpand;
+    DoubleClickCallback m_onDoubleClick;
 };
 
 } // namespace ui

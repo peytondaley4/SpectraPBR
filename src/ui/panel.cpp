@@ -189,15 +189,18 @@ bool Panel::onMouseMove(float2 pos) {
         return true;
     }
 
-    // Check children first
-    for (auto it = m_children.rbegin(); it != m_children.rend(); ++it) {
-        if ((*it)->onMouseMove(pos)) {
-            return true;
-        }
-    }
-
     // Cache bounds to avoid multiple getAbsoluteBounds() calls
     Rect bounds = getAbsoluteBounds();
+    bool isOver = bounds.contains(pos);
+
+    // Update hover state for this widget
+    bool wasHovered = m_hovered;
+    m_hovered = isOver;
+
+    if (m_hovered != wasHovered) {
+        markDirty();
+        onHoverChanged();
+    }
 
     // Update close button hover state
     if (m_showHeader && m_closeable) {
@@ -207,23 +210,31 @@ bool Panel::onMouseMove(float2 pos) {
             bounds.y + 4.0f,
             btnSize, btnSize
         };
-        bool wasHovered = m_closeHovered;
-        m_closeHovered = closeRect.contains(pos);
-        if (m_closeHovered != wasHovered) {
+        bool closeWasHovered = m_closeHovered;
+        m_closeHovered = isOver && closeRect.contains(pos);
+        if (m_closeHovered != closeWasHovered) {
             markDirty();
         }
     }
 
-    // Update hover state for this widget
-    bool wasHovered = m_hovered;
-    m_hovered = bounds.contains(pos);
-
-    if (m_hovered != wasHovered) {
-        markDirty();
-        onHoverChanged();
+    // If mouse isn't over this panel, clear hover on children that were hovered
+    if (!isOver) {
+        for (auto& child : m_children) {
+            if (child->isHovered()) {
+                child->onMouseMove(pos);
+            }
+        }
+        return false;
     }
 
-    return m_hovered;
+    // Check children (front to back)
+    for (auto it = m_children.rbegin(); it != m_children.rend(); ++it) {
+        if ((*it)->onMouseMove(pos)) {
+            return true;
+        }
+    }
+
+    return true;
 }
 
 } // namespace ui

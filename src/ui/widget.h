@@ -39,6 +39,14 @@ public:
     void setPosition(float x, float y);
     void setPosition(float2 pos) { setPosition(pos.x, pos.y); }
     float2 getPosition() const { return m_position; }
+    
+    // Set position without marking dirty (for temporary transforms during rendering)
+    void setPositionDirect(float x, float y) { m_position = make_float2(x, y); }
+    void setPositionDirect(float2 pos) { m_position = pos; }
+    
+    // Set size without marking dirty (for layout during rendering)
+    void setSizeDirect(float w, float h) { m_size = make_float2(w, h); }
+    void setSizeDirect(float2 size) { m_size = size; }
 
     // Set size
     void setSize(float width, float height);

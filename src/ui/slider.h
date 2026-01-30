@@ -81,6 +81,10 @@ private:
     int m_dragButton = -1;   // Button that started the drag
     bool m_thumbHovered = false;
 
+    // Cached value string to avoid per-frame allocations
+    mutable char m_cachedValueStr[32] = {};
+    mutable float m_cachedValue = -999999.0f;  // Sentinel value
+
     ValueChangedCallback m_onValueChanged;
 };
 

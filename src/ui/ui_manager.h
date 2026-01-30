@@ -179,6 +179,13 @@ private:
     // Collected geometry
     std::vector<UIQuad> m_quads;
     bool m_geometryDirty = true;  // Start dirty to collect on first frame
+    uint64_t m_geometryGeneration = 0;  // Increments when geometry is regenerated
+    
+public:
+    // Get geometry generation counter (changes when quads are regenerated)
+    uint64_t getGeometryGeneration() const { return m_geometryGeneration; }
+    
+private:
 
     // Root widgets
     std::unique_ptr<Panel> m_topBar;

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cmake --build:*)"
+      "Bash(cmake --build:*)",
+      "Bash(taskkill:*)",
+      "Bash(del /f \"C:\\\\Users\\\\Peyton Daley\\\\dev\\\\SpectraPBR\\\\build\\\\Release\\\\SpectraPBR.exe\")"
     ]
   }
 }

@@ -9,18 +9,6 @@
 // Updated to support 2 ray types (radiance + shadow) in SBT.
 //------------------------------------------------------------------------------
 
-// Simple PCG hash for jitter
-__forceinline__ __device__ unsigned int pcgHash(unsigned int input) {
-    unsigned int state = input * 747796405u + 2891336453u;
-    unsigned int word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-__forceinline__ __device__ float randomFloat(unsigned int& seed) {
-    seed = pcgHash(seed);
-    return (float)(seed & 0x00FFFFFFu) / (float)0x01000000u;
-}
-
 extern "C" __global__ void __raygen__simple() {
     // Get the launch index (pixel coordinates)
     const uint3 idx = optixGetLaunchIndex();

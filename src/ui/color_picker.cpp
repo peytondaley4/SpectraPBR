@@ -91,31 +91,49 @@ void ColorPicker::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayou
     // First generate our own geometry
     generateGeometry(outQuads, textLayout);
 
-    // Update slider positions and themes
+    // Check if layout needs updating (bounds changed)
     Rect bounds = getAbsoluteBounds();
-    float previewOffset = m_showPreview ? PREVIEW_SIZE + 8.0f : 0.0f;
-    float sliderWidth = bounds.width - previewOffset - 8.0f;
+    bool boundsChanged = (bounds.x != m_lastBounds.x || bounds.y != m_lastBounds.y ||
+                          bounds.width != m_lastBounds.width || bounds.height != m_lastBounds.height);
 
+    // Only update slider positions/sizes when bounds change
+    if (boundsChanged || !m_layoutCached) {
+        float previewOffset = m_showPreview ? PREVIEW_SIZE + 8.0f : 0.0f;
+        float sliderWidth = bounds.width - previewOffset - 8.0f;
+
+        if (m_redSlider) {
+            m_redSlider->setPosition(bounds.x + previewOffset + 4.0f, bounds.y + 4.0f);
+            m_redSlider->setSize(sliderWidth, SLIDER_HEIGHT);
+        }
+
+        if (m_greenSlider) {
+            m_greenSlider->setPosition(bounds.x + previewOffset + 4.0f,
+                                       bounds.y + 4.0f + SLIDER_HEIGHT + SLIDER_SPACING);
+            m_greenSlider->setSize(sliderWidth, SLIDER_HEIGHT);
+        }
+
+        if (m_blueSlider) {
+            m_blueSlider->setPosition(bounds.x + previewOffset + 4.0f,
+                                      bounds.y + 4.0f + (SLIDER_HEIGHT + SLIDER_SPACING) * 2);
+            m_blueSlider->setSize(sliderWidth, SLIDER_HEIGHT);
+        }
+
+        m_lastBounds = bounds;
+        m_layoutCached = true;
+    }
+
+    // Set theme only if it changed (Widget::setTheme now has early exit)
+    const Theme* theme = getTheme();
     if (m_redSlider) {
-        m_redSlider->setTheme(getTheme());
-        m_redSlider->setPosition(bounds.x + previewOffset + 4.0f, bounds.y + 4.0f);
-        m_redSlider->setSize(sliderWidth, SLIDER_HEIGHT);
+        m_redSlider->setTheme(theme);
         m_redSlider->collectGeometry(outQuads, textLayout);
     }
-
     if (m_greenSlider) {
-        m_greenSlider->setTheme(getTheme());
-        m_greenSlider->setPosition(bounds.x + previewOffset + 4.0f,
-                                   bounds.y + 4.0f + SLIDER_HEIGHT + SLIDER_SPACING);
-        m_greenSlider->setSize(sliderWidth, SLIDER_HEIGHT);
+        m_greenSlider->setTheme(theme);
         m_greenSlider->collectGeometry(outQuads, textLayout);
     }
-
     if (m_blueSlider) {
-        m_blueSlider->setTheme(getTheme());
-        m_blueSlider->setPosition(bounds.x + previewOffset + 4.0f,
-                                  bounds.y + 4.0f + (SLIDER_HEIGHT + SLIDER_SPACING) * 2);
-        m_blueSlider->setSize(sliderWidth, SLIDER_HEIGHT);
+        m_blueSlider->setTheme(theme);
         m_blueSlider->collectGeometry(outQuads, textLayout);
     }
 }

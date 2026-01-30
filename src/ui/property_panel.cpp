@@ -307,10 +307,21 @@ void PropertyPanel::addWidget(Widget* widget, float height, std::vector<UIQuad>&
         return;  // Don't position or advance for hidden widgets
     }
 
+    // Skip if entirely off-screen (culling)
+    if (m_contentY + height < m_visibleMinY || m_contentY > m_visibleMaxY) {
+        m_contentY += height;
+        return;
+    }
+
     // Position widget relative to PropertyPanel
+    // Use setPositionDirect/setSizeDirect to avoid markDirty cascade during layout
     float widgetY = m_contentY - m_bounds.y;
-    widget->setPosition(PADDING, widgetY);
-    widget->setSize(m_contentWidth, height);
+    float2 newPos = make_float2(PADDING, widgetY);
+    float2 newSize = make_float2(m_contentWidth, height);
+
+    // Use direct setters to avoid dirty propagation during layout
+    widget->setPositionDirect(newPos);
+    widget->setSizeDirect(newSize);
 
     // Render widget
     widget->collectGeometry(outQuads, textLayout);
@@ -321,6 +332,12 @@ void PropertyPanel::addWidget(Widget* widget, float height, std::vector<UIQuad>&
 
 void PropertyPanel::drawHeader(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout,
                                const std::string& title, const Theme* theme, float depth) {
+    // Skip if entirely off-screen (culling)
+    if (m_contentY + HEADER_HEIGHT < m_visibleMinY || m_contentY > m_visibleMaxY) {
+        m_contentY += HEADER_HEIGHT;
+        return;
+    }
+
     Rect headerRect = { m_bounds.x, m_contentY, m_bounds.width, HEADER_HEIGHT };
     outQuads.push_back(makeSolidQuad(headerRect, theme->propertyHeader, depth + 0.001f));
 
@@ -335,6 +352,12 @@ void PropertyPanel::drawHeader(std::vector<UIQuad>& outQuads, text::TextLayout* 
 void PropertyPanel::drawPropertyRow(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout,
                                      const std::string& label, const std::string& value,
                                      const Theme* theme, float depth) {
+    // Skip if entirely off-screen (culling)
+    if (m_contentY + ROW_HEIGHT < m_visibleMinY || m_contentY > m_visibleMaxY) {
+        m_contentY += ROW_HEIGHT;
+        return;
+    }
+
     if (textLayout) {
         float textY = m_contentY + (ROW_HEIGHT - textLayout->getLineHeight(0.5f)) * 0.5f;
         textLayout->layout(label, make_float2(m_bounds.x + PADDING, textY), 0.5f,
@@ -353,6 +376,12 @@ void PropertyPanel::drawSeparator(std::vector<UIQuad>& outQuads, const Theme* th
 
 void PropertyPanel::drawLabel(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout,
                               const std::string& text, const Theme* theme, float depth) {
+    // Skip if entirely off-screen (culling)
+    if (m_contentY + ROW_HEIGHT < m_visibleMinY || m_contentY > m_visibleMaxY) {
+        m_contentY += ROW_HEIGHT;
+        return;
+    }
+
     if (textLayout) {
         float textY = m_contentY + (ROW_HEIGHT - textLayout->getLineHeight(0.5f)) * 0.5f;
         textLayout->layout(text, make_float2(m_bounds.x + PADDING, textY), 0.5f,
@@ -364,30 +393,36 @@ void PropertyPanel::drawLabel(std::vector<UIQuad>& outQuads, text::TextLayout* t
 void PropertyPanel::drawTexturePreview(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout,
                                        const std::string& label, uint32_t textureIndex, bool hasTexture,
                                        const Theme* theme, float depth) {
+    // Skip if entirely off-screen (culling)
+    if (m_contentY + TEXTURE_ROW_HEIGHT < m_visibleMinY || m_contentY > m_visibleMaxY) {
+        m_contentY += TEXTURE_ROW_HEIGHT;
+        return;
+    }
+
     // Draw label
     if (textLayout) {
         float textY = m_contentY + 4.0f;
         textLayout->layout(label, make_float2(m_bounds.x + PADDING, textY), 0.45f,
                           theme->propertyLabel, TextAlign::Left, depth + 0.001f, outQuads);
     }
-    
+
     // Calculate preview rect (centered below label)
     float previewX = m_bounds.x + PADDING;
     float previewY = m_contentY + 20.0f;
     Rect previewRect = { previewX, previewY, TEXTURE_PREVIEW_SIZE, TEXTURE_PREVIEW_SIZE };
-    
+
     // Draw border around preview
-    Rect borderRect = { previewX - 1.0f, previewY - 1.0f, 
+    Rect borderRect = { previewX - 1.0f, previewY - 1.0f,
                         TEXTURE_PREVIEW_SIZE + 2.0f, TEXTURE_PREVIEW_SIZE + 2.0f };
     outQuads.push_back(makeSolidQuad(borderRect, theme->panelBorder, depth + 0.001f));
-    
+
     if (hasTexture && textureIndex != UINT32_MAX) {
         // Draw actual texture preview
         outQuads.push_back(makeTexturedQuad(previewRect, textureIndex, depth + 0.002f));
     } else {
         // Draw placeholder (checkerboard pattern represented by gray)
         outQuads.push_back(makeSolidQuad(previewRect, make_float4(0.3f, 0.3f, 0.3f, 1.0f), depth + 0.002f));
-        
+
         // Draw "No Texture" text
         if (textLayout) {
             float noTexY = previewY + TEXTURE_PREVIEW_SIZE * 0.5f - textLayout->getLineHeight(0.35f) * 0.5f;
@@ -395,7 +430,7 @@ void PropertyPanel::drawTexturePreview(std::vector<UIQuad>& outQuads, text::Text
                               theme->textSecondary, TextAlign::Center, depth + 0.003f, outQuads);
         }
     }
-    
+
     m_contentY += TEXTURE_ROW_HEIGHT;
 }
 
@@ -492,10 +527,20 @@ void PropertyPanel::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLay
     size_t contentStartIdx = outQuads.size();
     Rect clipBounds = getContentClipBounds();
 
+    // Calculate visible Y range for culling
+    m_visibleMinY = m_bounds.y + HEADER_HEIGHT;
+    m_visibleMaxY = m_bounds.y + m_bounds.height;
+
     if (m_displayMode == DisplayMode::Instance) {
+        // Cache instance ID string to avoid per-frame allocation
+        if (m_instanceInfo.instanceId != m_cachedInstanceId) {
+            m_cachedIdStr = std::to_string(m_instanceInfo.instanceId);
+            m_cachedInstanceId = m_instanceInfo.instanceId;
+        }
+
         // Instance header
         drawHeader(outQuads, textLayout, "Instance", theme, depth);
-        drawPropertyRow(outQuads, textLayout, "ID", std::to_string(m_instanceInfo.instanceId), theme, depth);
+        drawPropertyRow(outQuads, textLayout, "ID", m_cachedIdStr, theme, depth);
         drawPropertyRow(outQuads, textLayout, "Model", m_instanceInfo.modelName, theme, depth);
         if (!m_instanceInfo.meshName.empty()) {
             drawPropertyRow(outQuads, textLayout, "Mesh", m_instanceInfo.meshName, theme, depth);

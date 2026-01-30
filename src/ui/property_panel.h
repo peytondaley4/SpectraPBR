@@ -7,7 +7,7 @@
 #include "color_picker.h"
 #include "scroll_view.h"
 #include "../scene/scene_hierarchy.h"
-#include "../shared_types.h"
+#include "../core/shared_types.h"
 #include <memory>
 #include <functional>
 #include <string>
@@ -143,6 +143,14 @@ private:
     // Cached values for optimization
     Rect m_lastBounds = {0.0f, 0.0f, 0.0f, 0.0f};
     const Theme* m_lastTheme = nullptr;
+
+    // Cached instance ID string to avoid per-frame std::to_string allocations
+    mutable std::string m_cachedIdStr;
+    mutable uint32_t m_cachedInstanceId = UINT32_MAX;
+
+    // Visible bounds for culling
+    float m_visibleMinY = 0.0f;
+    float m_visibleMaxY = 0.0f;
 
     // Add widget: positions, sizes, renders, and advances contentY automatically
     void addWidget(Widget* widget, float height, std::vector<UIQuad>& outQuads, text::TextLayout* textLayout);

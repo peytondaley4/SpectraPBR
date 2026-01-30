@@ -101,13 +101,16 @@ void Slider::generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* t
 
     // Draw value text
     if (m_showValue && textLayout) {
-        char valueStr[32];
-        snprintf(valueStr, sizeof(valueStr), m_valueFormat.c_str(), m_value);
+        // Use cached string if value hasn't changed
+        if (m_value != m_cachedValue) {
+            snprintf(m_cachedValueStr, sizeof(m_cachedValueStr), m_valueFormat.c_str(), m_value);
+            m_cachedValue = m_value;
+        }
 
         float4 valueColor = theme->propertyValue;
         float valueX = track.x + track.width + 8.0f;
         float valueY = bounds.y + bounds.height * 0.5f - textLayout->getLineHeight(0.5f) * 0.5f;
-        textLayout->layout(valueStr, make_float2(valueX, valueY), 0.5f, valueColor,
+        textLayout->layout(m_cachedValueStr, make_float2(valueX, valueY), 0.5f, valueColor,
                           TextAlign::Left, depth + 0.001f, outQuads);
     }
 }

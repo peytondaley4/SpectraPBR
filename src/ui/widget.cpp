@@ -86,6 +86,9 @@ void Widget::clearChildren() {
 }
 
 void Widget::setTheme(const Theme* theme) {
+    // Early exit if theme hasn't changed
+    if (m_theme == theme) return;
+
     m_theme = theme;
     // Propagate to children that don't have explicit themes
     for (auto& child : m_children) {
@@ -134,23 +137,39 @@ void Widget::markDirty() {
 bool Widget::onMouseMove(float2 pos) {
     if (!m_visible || !m_enabled) return false;
 
-    // Check children first (front to back, assuming children are rendered on top)
+    // Early bounds check - if mouse isn't over this widget, 
+    // just clear hover state and skip children
+    Rect bounds = getAbsoluteBounds();
+    bool isOver = bounds.contains(pos);
+    
+    // Update hover state
+    bool wasHovered = m_hovered;
+    m_hovered = isOver;
+    
+    if (m_hovered != wasHovered) {
+        markDirty();
+        onHoverChanged();
+    }
+    
+    // If mouse isn't over this widget, no need to check children
+    if (!isOver) {
+        // But we still need to clear hover on children that were previously hovered
+        for (auto& child : m_children) {
+            if (child->isHovered()) {
+                child->onMouseMove(pos);  // Let child clear its hover state
+            }
+        }
+        return false;
+    }
+
+    // Mouse is over this widget - check children (front to back)
     for (auto it = m_children.rbegin(); it != m_children.rend(); ++it) {
         if ((*it)->onMouseMove(pos)) {
             return true;
         }
     }
 
-    // Check if mouse is over this widget
-    bool wasHovered = m_hovered;
-    m_hovered = containsPoint(pos);
-
-    if (m_hovered != wasHovered) {
-        markDirty();
-        onHoverChanged();
-    }
-
-    return m_hovered;
+    return true;
 }
 
 bool Widget::onMouseDown(float2 pos, int button) {

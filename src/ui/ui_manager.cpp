@@ -26,6 +26,10 @@ bool UIManager::init(text::FontAtlas* fontAtlas, uint32_t screenWidth, uint32_t 
     m_screenWidth = screenWidth;
     m_screenHeight = screenHeight;
 
+    // Pre-allocate geometry vector to avoid per-frame reallocations
+    // Typical UI with property panel uses 200-400 quads
+    m_quads.reserve(512);
+
     createDefaultUI();
 
     std::cout << "[UIManager] Initialized with screen size " << screenWidth << "x" << screenHeight << "\n";
@@ -95,14 +99,15 @@ void UIManager::update(float deltaTime) {
 }
 
 void UIManager::collectGeometry() {
-    // Check if any widget is dirty
+    // Check if any VISIBLE widget is dirty
+    // Hidden widgets should not trigger regeneration (and their dirty state is irrelevant)
     bool anyDirty = m_geometryDirty;
-    if (!anyDirty && m_scenePanel && m_scenePanel->isDirty()) anyDirty = true;
-    if (!anyDirty && m_propertyPanel && m_propertyPanel->isDirty()) anyDirty = true;
-    if (!anyDirty && m_topBar && m_topBar->isDirty()) anyDirty = true;
+    if (!anyDirty && m_scenePanel && m_scenePanel->isVisible() && m_scenePanel->isDirty()) anyDirty = true;
+    if (!anyDirty && m_propertyPanel && m_propertyPanel->isVisible() && m_propertyPanel->isDirty()) anyDirty = true;
+    if (!anyDirty && m_topBar && m_topBar->isVisible() && m_topBar->isDirty()) anyDirty = true;
     if (!anyDirty) {
         for (auto& widget : m_rootWidgets) {
-            if (widget->isDirty()) {
+            if (widget->isVisible() && widget->isDirty()) {
                 anyDirty = true;
                 break;
             }
@@ -116,6 +121,7 @@ void UIManager::collectGeometry() {
     
     m_quads.clear();
     m_geometryDirty = false;
+    m_geometryGeneration++;  // Track that geometry was regenerated
 
     // Collect geometry from all visible widgets
     if (m_scenePanel && m_scenePanel->isVisible()) {
@@ -469,6 +475,7 @@ void UIManager::toggleScenePanel() {
     if (m_scenePanel) {
         bool wasVisible = m_scenePanel->isVisible();
         m_scenePanel->setVisible(!wasVisible);
+        m_geometryDirty = true;  // Ensure geometry regenerates on visibility change
         std::cout << "[UIManager] toggleScenePanel: " << wasVisible << " -> " << m_scenePanel->isVisible() << "\n";
     } else {
         std::cout << "[UIManager] toggleScenePanel: m_scenePanel is null!\n";
@@ -575,6 +582,7 @@ void UIManager::onSceneNodeExpanded(TreeNode* node, bool expanded) {
 void UIManager::showPropertyPanel(bool show) {
     if (m_propertyPanel) {
         m_propertyPanel->setVisible(show);
+        m_geometryDirty = true;  // Ensure geometry regenerates on visibility change
     }
 }
 
@@ -585,6 +593,7 @@ bool UIManager::isPropertyPanelVisible() const {
 void UIManager::togglePropertyPanel() {
     if (m_propertyPanel) {
         m_propertyPanel->setVisible(!m_propertyPanel->isVisible());
+        m_geometryDirty = true;  // Ensure geometry regenerates on visibility change
     }
 }
 

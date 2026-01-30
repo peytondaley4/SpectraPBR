@@ -1009,6 +1009,9 @@ int main(int argc, char* argv[]) {
 
         // Update UI dimensions
         uiManager.setScreenSize(width, height);
+        
+        // Force UI re-render after resize
+        uiRenderer.invalidate();
     });
 
     std::cout << "\n[Main] Initialization complete!\n";
@@ -1130,21 +1133,28 @@ int main(int argc, char* argv[]) {
         // Map UI PBO for CUDA access
         float4* uiDevicePtr = reinterpret_cast<float4*>(cudaInterop.mapUIPBO());
         if (uiDevicePtr) {
-            // Render UI quads
-            uiRenderer.render(uiManager.getQuads(),
-                              fontAtlas.getTexture(),
-                              uiDevicePtr,
-                              glContext.getWidth(), glContext.getHeight(),
-                              cudaInterop.getStream());
+            // Render UI only if geometry changed (major performance optimization)
+            // When UI hasn't changed, we skip render, sync, and texture update
+            bool rendered = uiRenderer.renderIfChanged(
+                uiManager.getQuads(),
+                uiManager.getGeometryGeneration(),
+                fontAtlas.getTexture(),
+                uiDevicePtr,
+                glContext.getWidth(), glContext.getHeight(),
+                cudaInterop.getStream());
 
-            // Synchronize
-            cudaInterop.synchronize();
+            // Sync before unmap if we rendered (ensures CUDA writes complete)
+            if (rendered) {
+                cudaInterop.synchronize();
+            }
 
             // Unmap UI PBO
             cudaInterop.unmapUIPBO();
 
-            // Update UI texture from PBO
-            glContext.updateUITextureFromPBO();
+            // Update texture from PBO if we rendered new content
+            if (rendered) {
+                glContext.updateUITextureFromPBO();
+            }
         }
 
         // Render fullscreen quad (composites scene + UI)

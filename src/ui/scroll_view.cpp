@@ -177,12 +177,22 @@ bool ScrollView::onMouseMove(float2 pos) {
     
     // Forward to children with scroll offset applied
     Rect visibleBounds = getVisibleBounds();
-    if (visibleBounds.contains(pos)) {
+    bool inBounds = visibleBounds.contains(pos);
+    
+    if (inBounds) {
         float2 adjustedPos = make_float2(pos.x, pos.y + m_scrollOffset);
         
         for (auto it = m_children.rbegin(); it != m_children.rend(); ++it) {
             if ((*it)->isVisible()) {
                 (*it)->onMouseMove(adjustedPos);
+            }
+        }
+    } else {
+        // Mouse left scroll view - clear hover on any previously hovered children
+        for (auto& child : m_children) {
+            if (child->isVisible() && child->isHovered()) {
+                // Pass position outside bounds to clear hover
+                child->onMouseMove(pos);
             }
         }
     }
@@ -215,14 +225,15 @@ void ScrollView::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayout
         }
         
         // Temporarily adjust child position for geometry generation
+        // Use setPositionDirect to avoid marking dirty (this is just a temporary transform)
         float2 originalPos = child->getPosition();
-        child->setPosition(originalPos.x, originalPos.y - m_scrollOffset);
+        child->setPositionDirect(originalPos.x, originalPos.y - m_scrollOffset);
         
         // Collect child geometry
         child->collectGeometry(outQuads, textLayout);
         
-        // Restore original position
-        child->setPosition(originalPos);
+        // Restore original position (without marking dirty)
+        child->setPositionDirect(originalPos);
     }
     
     // Apply clip bounds to all child quads that were just added

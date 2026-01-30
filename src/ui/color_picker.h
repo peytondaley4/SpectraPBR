@@ -29,7 +29,7 @@ public:
     float getBlue() const { return m_color.z; }
 
     // Show color preview swatch
-    void setShowPreview(bool show) { m_showPreview = show; markDirty(); }
+    void setShowPreview(bool show) { m_showPreview = show; m_layoutCached = false; markDirty(); }
     bool getShowPreview() const { return m_showPreview; }
 
     // Intensity multiplier for HDR colors (for emission/irradiance)
@@ -68,6 +68,10 @@ private:
     std::unique_ptr<Slider> m_redSlider;
     std::unique_ptr<Slider> m_greenSlider;
     std::unique_ptr<Slider> m_blueSlider;
+
+    // Cached layout state to avoid per-frame setPosition/setSize calls
+    mutable Rect m_lastBounds = {0, 0, 0, 0};
+    mutable bool m_layoutCached = false;
 
     ColorChangedCallback m_onColorChanged;
 };

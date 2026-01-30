@@ -1,4 +1,5 @@
 #include <optix.h>
+#include "gpu_types.h"
 #include "shared_device.h"
 #include "brdf.h"
 
@@ -12,180 +13,6 @@
 // - Shadow ray tracing
 // - Quality modes (Fast/Balanced/High/Accurate)
 //------------------------------------------------------------------------------
-
-// Quality mode constants
-constexpr unsigned int QUALITY_FAST     = 0;
-constexpr unsigned int QUALITY_BALANCED = 1;
-constexpr unsigned int QUALITY_HIGH     = 2;
-constexpr unsigned int QUALITY_ACCURATE = 3;
-
-// Ray type constants
-constexpr unsigned int RAY_TYPE_RADIANCE = 0;
-constexpr unsigned int RAY_TYPE_SHADOW   = 1;
-constexpr unsigned int RAY_TYPE_COUNT    = 2;
-
-// Vertex structure matching GpuVertex from shared_types.h
-struct GpuVertex {
-    float3 position;
-    float u;
-    float3 normal;
-    float v;
-    float4 tangent;
-};
-
-// Material structure matching GpuMaterial from shared_types.h
-struct GpuMaterial {
-    float4 baseColor;
-    float metallic;
-    float roughness;
-    float2 _pad0;
-    float3 emissive;
-    float _pad1;
-
-    cudaTextureObject_t baseColorTex;
-    cudaTextureObject_t normalTex;
-    cudaTextureObject_t metallicRoughnessTex;
-    cudaTextureObject_t emissiveTex;
-
-    // KHR_materials_transmission
-    float transmission;
-    float ior;
-    float2 _pad2;
-    cudaTextureObject_t transmissionTex;
-
-    // KHR_materials_volume
-    float3 attenuationColor;
-    float attenuationDistance;
-    float thickness;
-    float3 _pad3;
-
-    // KHR_materials_clearcoat
-    float clearcoat;
-    float clearcoatRoughness;
-    float2 _pad4;
-    cudaTextureObject_t clearcoatTex;
-    cudaTextureObject_t clearcoatRoughnessTex;
-    cudaTextureObject_t clearcoatNormalTex;
-
-    // KHR_materials_sheen
-    float3 sheenColor;
-    float sheenRoughness;
-    cudaTextureObject_t sheenColorTex;
-    cudaTextureObject_t sheenRoughnessTex;
-
-    // KHR_materials_specular
-    float specularFactor;
-    float3 _pad5;
-    float3 specularColorFactor;
-    float _pad6;
-    cudaTextureObject_t specularTex;
-    cudaTextureObject_t specularColorTex;
-
-    // Occlusion
-    cudaTextureObject_t occlusionTex;
-    float occlusionStrength;
-
-    // Alpha settings
-    unsigned int alphaMode;
-    float alphaCutoff;
-    unsigned int doubleSided;
-};
-
-// Light structures
-struct GpuPointLight {
-    float3 position;
-    float radius;
-    float3 intensity;
-    float _pad;
-};
-
-struct GpuDirectionalLight {
-    float3 direction;
-    float angularDiameter;
-    float3 irradiance;
-    float _pad;
-};
-
-struct GpuAreaLight {
-    float3 position;
-    float _pad0;
-    float3 normal;
-    float _pad1;
-    float3 tangent;
-    float _pad2;
-    float3 emission;
-    float area;
-    float2 size;
-    float2 _pad3;
-};
-
-// HitGroupRecord data
-struct HitGroupData {
-    GpuMaterial material;
-    unsigned int geometryIndex;
-};
-
-// Launch parameters
-extern "C" {
-__constant__ struct {
-    float4* output_buffer;
-    float4* accumulation_buffer;
-    unsigned int width;
-    unsigned int height;
-    unsigned int frame_index;
-    unsigned int accumulated_frames;
-
-    struct {
-        float3 position;
-        float _pad0;
-        float3 forward;
-        float _pad1;
-        float3 right;
-        float _pad2;
-        float3 up;
-        float _pad3;
-        float fovY;
-        float aspectRatio;
-        float nearPlane;
-        float farPlane;
-    } camera;
-
-    OptixTraversableHandle scene_handle;
-
-    CUdeviceptr* vertex_buffers;
-    CUdeviceptr* index_buffers;
-
-    unsigned int* instance_material_indices;
-
-    // Lighting
-    GpuPointLight* point_lights;
-    unsigned int point_light_count;
-    unsigned int _pad_lights0;
-    GpuDirectionalLight* directional_lights;
-    unsigned int directional_light_count;
-    unsigned int _pad_lights1;
-    GpuAreaLight* area_lights;
-    unsigned int area_light_count;
-    unsigned int _pad_lights2;
-
-    cudaTextureObject_t environment_map;
-    float environment_intensity;
-    float _pad_env;
-
-    unsigned int quality_mode;
-    unsigned int random_seed;
-
-    // UI selection (UINT32_MAX = no selection)
-    unsigned int selected_instance_id;
-    unsigned int _pad_selection;
-
-    // Picking mode
-    unsigned int* pick_result;
-    unsigned int pick_x;
-    unsigned int pick_y;
-    unsigned int pick_mode;
-} params;
-}
 
 //------------------------------------------------------------------------------
 // Shadow Ray Tracing
@@ -202,7 +29,7 @@ __forceinline__ __device__ bool traceShadowRay(
     // Use larger epsilon for better robustness
     const float normalEps = 0.0001f;
     const float rayEps = 0.001f;
-    
+
     // Offset in normal direction (ensure we're on the correct side of surface)
     float NdotD = dot(normal, direction);
     float3 offsetNormal = (NdotD > 0.0f) ? normal : -normal;
@@ -244,15 +71,15 @@ __forceinline__ __device__ float calculateTextureLOD(float rayDistance) {
     // pixelAngle ≈ 2 * tan(fovY/2) / screenHeight
     float tanHalfFov = tanf(params.camera.fovY * 0.5f);
     float pixelWorldSize = (2.0f * tanHalfFov) / static_cast<float>(params.height);
-    
+
     // At the hit distance, a pixel covers this much world space
     float footprint = rayDistance * pixelWorldSize;
-    
+
     // LOD = log2(footprint * texelsPerUnit)
     // We use a base scale factor assuming ~1 texel per world unit at LOD 0
     // Adjust the 1.0f multiplier if textures are denser/sparser
     float lod = log2f(fmaxf(1.0f, footprint * 1.0f));
-    
+
     // Clamp to valid range (0 to ~12 for most textures)
     return fminf(fmaxf(lod, 0.0f), 12.0f);
 }

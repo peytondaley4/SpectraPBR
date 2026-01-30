@@ -35,31 +35,6 @@ __forceinline__ __device__ float lerp(float a, float b, float t) {
 }
 
 //------------------------------------------------------------------------------
-// Random Number Generation (for importance sampling)
-//------------------------------------------------------------------------------
-
-// Simple PCG hash for generating random numbers
-__forceinline__ __device__ uint32_t pcgHash(uint32_t input) {
-    uint32_t state = input * 747796405u + 2891336453u;
-    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-// Convert hash to float in [0, 1)
-__forceinline__ __device__ float hashToFloat(uint32_t hash) {
-    return (float)(hash & 0x00FFFFFF) / (float)0x01000000;
-}
-
-// Generate two random numbers from a seed
-__forceinline__ __device__ float2 randomFloat2(uint32_t& seed) {
-    seed = pcgHash(seed);
-    float u1 = hashToFloat(seed);
-    seed = pcgHash(seed);
-    float u2 = hashToFloat(seed);
-    return make_float2(u1, u2);
-}
-
-//------------------------------------------------------------------------------
 // Fresnel Functions
 //------------------------------------------------------------------------------
 

@@ -1,4 +1,5 @@
 #include <optix.h>
+#include "gpu_types.h"
 #include "shared_device.h"
 
 //------------------------------------------------------------------------------
@@ -7,38 +8,6 @@
 // Generates primary camera rays and writes final color to output buffer.
 // Updated to support 2 ray types (radiance + shadow) in SBT.
 //------------------------------------------------------------------------------
-
-// Ray type constants
-constexpr unsigned int RAY_TYPE_RADIANCE = 0;
-constexpr unsigned int RAY_TYPE_COUNT    = 2;
-
-// Light structures (for launch params layout)
-struct GpuPointLight {
-    float3 position;
-    float radius;
-    float3 intensity;
-    float _pad;
-};
-
-struct GpuDirectionalLight {
-    float3 direction;
-    float angularDiameter;
-    float3 irradiance;
-    float _pad;
-};
-
-struct GpuAreaLight {
-    float3 position;
-    float _pad0;
-    float3 normal;
-    float _pad1;
-    float3 tangent;
-    float _pad2;
-    float3 emission;
-    float area;
-    float2 size;
-    float2 _pad3;
-};
 
 // Simple PCG hash for jitter
 __forceinline__ __device__ unsigned int pcgHash(unsigned int input) {
@@ -50,71 +19,6 @@ __forceinline__ __device__ unsigned int pcgHash(unsigned int input) {
 __forceinline__ __device__ float randomFloat(unsigned int& seed) {
     seed = pcgHash(seed);
     return (float)(seed & 0x00FFFFFFu) / (float)0x01000000u;
-}
-
-// Launch parameters - must match LaunchParams in shared_types.h
-extern "C" {
-__constant__ struct {
-    float4* output_buffer;
-    float4* accumulation_buffer;
-    unsigned int width;
-    unsigned int height;
-    unsigned int frame_index;
-    unsigned int accumulated_frames;
-
-    // Camera
-    struct {
-        float3 position;
-        float _pad0;
-        float3 forward;
-        float _pad1;
-        float3 right;
-        float _pad2;
-        float3 up;
-        float _pad3;
-        float fovY;
-        float aspectRatio;
-        float nearPlane;
-        float farPlane;
-    } camera;
-
-    // Scene traversable
-    OptixTraversableHandle scene_handle;
-
-    // Geometry buffers
-    CUdeviceptr* vertex_buffers;
-    CUdeviceptr* index_buffers;
-
-    unsigned int* instance_material_indices;
-
-    // Lighting
-    GpuPointLight* point_lights;
-    unsigned int point_light_count;
-    unsigned int _pad_lights0;
-    GpuDirectionalLight* directional_lights;
-    unsigned int directional_light_count;
-    unsigned int _pad_lights1;
-    GpuAreaLight* area_lights;
-    unsigned int area_light_count;
-    unsigned int _pad_lights2;
-
-    cudaTextureObject_t environment_map;
-    float environment_intensity;
-    float _pad_env;
-
-    unsigned int quality_mode;
-    unsigned int random_seed;
-
-    // UI selection (UINT32_MAX = no selection)
-    unsigned int selected_instance_id;
-    unsigned int _pad_selection;
-
-    // Picking mode
-    unsigned int* pick_result;
-    unsigned int pick_x;
-    unsigned int pick_y;
-    unsigned int pick_mode;
-} params;
 }
 
 extern "C" __global__ void __raygen__simple() {
@@ -203,13 +107,13 @@ extern "C" __global__ void __raygen__simple() {
         // Blend with previous accumulated samples
         float4 accumulated = params.accumulation_buffer[linear_idx];
         float weight = 1.0f / (params.accumulated_frames + 1.0f);
-        
+
         float3 blended = make_float3(
             accumulated.x + (newColor.x - accumulated.x) * weight,
             accumulated.y + (newColor.y - accumulated.y) * weight,
             accumulated.z + (newColor.z - accumulated.z) * weight
         );
-        
+
         // Store accumulated result
         params.accumulation_buffer[linear_idx] = make_float4(blended.x, blended.y, blended.z, 1.0f);
         params.output_buffer[linear_idx] = make_float4(blended.x, blended.y, blended.z, 1.0f);

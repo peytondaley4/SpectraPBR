@@ -162,6 +162,7 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
         -I${OptiX_INCLUDE_DIRS}
         -I${CUDAToolkit_INCLUDE_DIRS}
         -I${CMAKE_CURRENT_SOURCE_DIR}/src
+        -I${CMAKE_CURRENT_SOURCE_DIR}/src/core
         -I${CMAKE_CURRENT_SOURCE_DIR}/optix_programs
     )
 
@@ -237,17 +238,23 @@ add_custom_target(optix_ptx ALL DEPENDS ${RAYGEN_PTX} ${MISS_PTX} ${CLOSESTHIT_P
 # Main Executable
 #------------------------------------------------------------------------------
 add_executable(SpectraPBR
-    src/main.cpp
-    src/gl_context.cpp
-    src/cuda_interop.cpp
-    src/optix_engine.cpp
-    src/shader_utils.cpp
-    src/camera.cpp
-    src/model_loader.cpp
-    src/geometry_manager.cpp
-    src/texture_manager.cpp
-    src/material_manager.cpp
-    src/scene_manager.cpp
+    # Core
+    src/core/main.cpp
+    # Graphics
+    src/graphics/gl_context.cpp
+    src/graphics/shader_utils.cpp
+    # CUDA
+    src/cuda/cuda_interop.cpp
+    # OptiX
+    src/optix/optix_engine.cpp
+    # Rendering
+    src/rendering/camera.cpp
+    src/rendering/scene_manager.cpp
+    src/rendering/geometry_manager.cpp
+    # Loaders
+    src/loaders/model_loader.cpp
+    src/loaders/texture_manager.cpp
+    src/loaders/material_manager.cpp
     # Phase 4: UI System
     src/text/font_atlas.cpp
     src/text/text_layout.cpp
@@ -273,6 +280,12 @@ add_executable(SpectraPBR
 # Include directories
 target_include_directories(SpectraPBR PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/graphics
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/optix
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/loaders
     ${OptiX_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${tinygltf_SOURCE_DIR}

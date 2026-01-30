@@ -209,3 +209,34 @@ __forceinline__ __device__ float3 clamp(const float3& v, float lo, float hi) {
         clamp(v.z, lo, hi)
     );
 }
+
+//------------------------------------------------------------------------------
+// Random Number Generation (PCG Hash)
+//------------------------------------------------------------------------------
+
+// Simple PCG hash for generating random numbers
+__forceinline__ __device__ unsigned int pcgHash(unsigned int input) {
+    unsigned int state = input * 747796405u + 2891336453u;
+    unsigned int word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Convert hash to float in [0, 1)
+__forceinline__ __device__ float hashToFloat(unsigned int hash) {
+    return (float)(hash & 0x00FFFFFFu) / (float)0x01000000u;
+}
+
+// Generate random float in [0, 1) and advance seed
+__forceinline__ __device__ float randomFloat(unsigned int& seed) {
+    seed = pcgHash(seed);
+    return hashToFloat(seed);
+}
+
+// Generate two random numbers from a seed
+__forceinline__ __device__ float2 randomFloat2(unsigned int& seed) {
+    seed = pcgHash(seed);
+    float u1 = hashToFloat(seed);
+    seed = pcgHash(seed);
+    float u2 = hashToFloat(seed);
+    return make_float2(u1, u2);
+}

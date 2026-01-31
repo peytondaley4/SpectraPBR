@@ -187,6 +187,13 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
     list(GET OptiX_INCLUDE_DIRS 0 optix_include)
     list(GET CUDAToolkit_INCLUDE_DIRS 0 cuda_include)
 
+    # Header files that OptiX programs depend on
+    set(OPTIX_HEADER_DEPS
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/gpu_types.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/shared_device.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/brdf.h
+    )
+
     add_custom_command(
         OUTPUT ${ptx_file}
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs"
@@ -199,10 +206,11 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
                 --gpu-architecture=compute_${first_arch}
                 -I${optix_include}
                 -I${cuda_include}
+                -I${CMAKE_CURRENT_SOURCE_DIR}/optix_programs
                 -o
                 ${ptx_file}
                 ${cuda_file_abs}
-        DEPENDS ${cuda_file_abs}
+        DEPENDS ${cuda_file_abs} ${OPTIX_HEADER_DEPS} 
         COMMENT "Compiling OptiX PTX: ${cuda_file_name}.cu -> ${cuda_file_name}.ptx"
         VERBATIM
     )
@@ -255,6 +263,7 @@ add_executable(SpectraPBR
     src/loaders/model_loader.cpp
     src/loaders/texture_manager.cpp
     src/loaders/material_manager.cpp
+    src/loaders/environment_map.cpp
     # Phase 4: UI System
     src/text/font_atlas.cpp
     src/text/text_layout.cpp
@@ -346,6 +355,14 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
             "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
             "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
     COMMENT "Copying fonts to build directory"
+)
+
+add_custom_command(TARGET SpectraPBR POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/assets/hdri"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/hdri"
+            "$<TARGET_FILE_DIR:SpectraPBR>/assets/hdri"
+    COMMENT "Copying HDRI files to build directory"
 )
 
 #------------------------------------------------------------------------------

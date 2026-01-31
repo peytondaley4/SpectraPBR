@@ -190,9 +190,19 @@ struct LaunchParams {
     float environment_intensity;
     float _pad_env;
 
+    // Environment map importance sampling CDFs
+    cudaTextureObject_t env_conditional_cdf;  // P(u|v) - CDF per row (2D: width x height)
+    cudaTextureObject_t env_marginal_cdf;     // P(v) - CDF for rows (1D: height elements)
+    uint32_t env_width;
+    uint32_t env_height;
+    float env_total_luminance;              // For PDF normalization
+    float _pad_env_cdf;
+
     // Quality and rendering settings
     QualityMode quality_mode;
+    uint32_t samples_per_pixel;     // SPP per frame (higher = less noise, slower)
     uint32_t random_seed;           // Per-frame random seed for sampling
+    uint32_t _pad_quality;
 
     // UI selection (UINT32_MAX = no selection)
     uint32_t selected_instance_id;

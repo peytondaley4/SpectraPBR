@@ -19,75 +19,94 @@ extern "C" __global__ void __raygen__simple() {
     unsigned int pixelY = params.pick_mode ? params.pick_y : idx.y;
     const unsigned int linear_idx = pixelY * params.width + pixelX;
 
-    // Generate per-pixel random seed (unique per pixel and per frame)
-    unsigned int seed = (pixelX * 1973u + pixelY * 9277u + params.frame_index * 26699u) | 1u;
-
-    // Generate sub-pixel jitter for anti-aliasing (random offset within pixel)
-    // No jitter in pick mode for precise selection
-    float jitterX = params.pick_mode ? 0.0f : (randomFloat(seed) - 0.5f);
-    float jitterY = params.pick_mode ? 0.0f : (randomFloat(seed) - 0.5f);
-
-    // Calculate normalized device coordinates with jitter
-    const float u = (static_cast<float>(pixelX) + 0.5f + jitterX) / static_cast<float>(params.width);
-    const float v = (static_cast<float>(pixelY) + 0.5f + jitterY) / static_cast<float>(params.height);
-
-    // Convert to [-1, 1] range
-    // Note: Screen Y is flipped (0 at top), so we negate to get Y-up
-    const float ndcX = 2.0f * u - 1.0f;
-    const float ndcY = 1.0f - 2.0f * v;  // Flip Y: screen top -> +Y (up)
-
-    // Calculate ray direction using camera parameters
+    // Camera ray direction parameters (constant for all samples)
     const float tanHalfFovY = tanf(params.camera.fovY * 0.5f);
     const float tanHalfFovX = tanHalfFovY * params.camera.aspectRatio;
 
-    // Ray direction in camera space, then transform to world space
-    float3 rayDir = params.camera.forward
-                  + params.camera.right * (ndcX * tanHalfFovX)
-                  + params.camera.up * (ndcY * tanHalfFovY);
-    rayDir = normalize(rayDir);
+    // Number of samples per pixel (minimum 1)
+    const unsigned int spp = max(1u, params.samples_per_pixel);
 
-    // Initialize payload
-    unsigned int p0, p1, p2, p3, p4;
-    p0 = __float_as_uint(0.0f);  // color.x
-    p1 = __float_as_uint(0.0f);  // color.y
-    p2 = __float_as_uint(0.0f);  // color.z
-    p3 = __float_as_uint(-1.0f); // hitDistance (-1 = miss)
-    p4 = 0xFFFFFFFFu;            // instanceId (UINT32_MAX = no hit)
+    // Accumulate color across all samples
+    float3 accumulatedColor = make_float3(0.0f, 0.0f, 0.0f);
+    unsigned int lastInstanceId = 0xFFFFFFFFu;
 
-    // Trace ray if we have a valid scene
-    if (params.scene_handle != 0) {
-        optixTrace(
-            params.scene_handle,
-            params.camera.position,
-            rayDir,
-            params.camera.nearPlane,      // tmin
-            params.camera.farPlane,       // tmax
-            0.0f,                         // rayTime
-            0xFF,                         // visibilityMask
-            OPTIX_RAY_FLAG_NONE,
-            RAY_TYPE_RADIANCE,            // SBT offset (ray type 0 = radiance)
-            RAY_TYPE_COUNT,               // SBT stride (2 ray types: radiance + shadow)
-            RAY_TYPE_RADIANCE,            // missSBTIndex
-            p0, p1, p2, p3, p4            // payload (5 values)
-        );
-    } else {
-        // No scene - render gradient for debugging
-        p0 = __float_as_uint(u);
-        p1 = __float_as_uint(v);
-        p2 = __float_as_uint(0.2f);
+    for (unsigned int sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
+        // Generate per-sample random seed (unique per pixel, frame, and sample)
+        unsigned int seed = (pixelX * 1973u + pixelY * 9277u + params.frame_index * 26699u + sampleIdx * 12347u) | 1u;
+
+        // Generate sub-pixel jitter for anti-aliasing (random offset within pixel)
+        // No jitter in pick mode for precise selection
+        float jitterX = params.pick_mode ? 0.0f : (randomFloat(seed) - 0.5f);
+        float jitterY = params.pick_mode ? 0.0f : (randomFloat(seed) - 0.5f);
+
+        // Calculate normalized device coordinates with jitter
+        const float u = (static_cast<float>(pixelX) + 0.5f + jitterX) / static_cast<float>(params.width);
+        const float v = (static_cast<float>(pixelY) + 0.5f + jitterY) / static_cast<float>(params.height);
+
+        // Convert to [-1, 1] range
+        // Note: Screen Y is flipped (0 at top), so we negate to get Y-up
+        const float ndcX = 2.0f * u - 1.0f;
+        const float ndcY = 1.0f - 2.0f * v;  // Flip Y: screen top -> +Y (up)
+
+        // Ray direction in camera space, then transform to world space
+        float3 rayDir = params.camera.forward
+                      + params.camera.right * (ndcX * tanHalfFovX)
+                      + params.camera.up * (ndcY * tanHalfFovY);
+        rayDir = normalize(rayDir);
+
+        // Initialize payload
+        unsigned int p0, p1, p2, p3, p4;
+        p0 = __float_as_uint(0.0f);  // color.x
+        p1 = __float_as_uint(0.0f);  // color.y
+        p2 = __float_as_uint(0.0f);  // color.z
+        p3 = __float_as_uint(-1.0f); // hitDistance (-1 = miss)
+        p4 = 0xFFFFFFFFu;            // instanceId (UINT32_MAX = no hit)
+
+        // Trace ray if we have a valid scene
+        if (params.scene_handle != 0) {
+            optixTrace(
+                params.scene_handle,
+                params.camera.position,
+                rayDir,
+                params.camera.nearPlane,      // tmin
+                params.camera.farPlane,       // tmax
+                0.0f,                         // rayTime
+                0xFF,                         // visibilityMask
+                OPTIX_RAY_FLAG_NONE,
+                RAY_TYPE_RADIANCE,            // SBT offset (ray type 0 = radiance)
+                RAY_TYPE_COUNT,               // SBT stride (2 ray types: radiance + shadow)
+                RAY_TYPE_RADIANCE,            // missSBTIndex
+                p0, p1, p2, p3, p4            // payload (5 values)
+            );
+        } else {
+            // No scene - render gradient for debugging
+            p0 = __float_as_uint(u);
+            p1 = __float_as_uint(v);
+            p2 = __float_as_uint(0.2f);
+        }
+
+        // Accumulate sample color
+        accumulatedColor.x += __uint_as_float(p0);
+        accumulatedColor.y += __uint_as_float(p1);
+        accumulatedColor.z += __uint_as_float(p2);
+        lastInstanceId = p4;
+
+        // In pick mode, only need one sample
+        if (params.pick_mode) break;
     }
 
     // In pick mode, write instance ID to pick result buffer and return
     if (params.pick_mode && params.pick_result != nullptr) {
-        *params.pick_result = p4;
+        *params.pick_result = lastInstanceId;
         return;
     }
 
-    // Retrieve color from payload
+    // Average samples
+    float invSpp = 1.0f / static_cast<float>(spp);
     float3 newColor = make_float3(
-        __uint_as_float(p0),
-        __uint_as_float(p1),
-        __uint_as_float(p2)
+        accumulatedColor.x * invSpp,
+        accumulatedColor.y * invSpp,
+        accumulatedColor.z * invSpp
     );
 
     // Progressive accumulation for anti-aliasing

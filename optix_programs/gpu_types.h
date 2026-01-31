@@ -198,9 +198,19 @@ struct GpuLaunchParams {
     float environment_intensity;
     float _pad_env;
 
+    // Environment map importance sampling CDFs
+    cudaTextureObject_t env_conditional_cdf;  // P(u|v) - CDF per row (2D: width x height)
+    cudaTextureObject_t env_marginal_cdf;     // P(v) - CDF for rows (1D: height elements)
+    unsigned int env_width;
+    unsigned int env_height;
+    float env_total_luminance;              // For PDF normalization
+    float _pad_env_cdf;
+
     // Quality and rendering settings
     unsigned int quality_mode;
+    unsigned int samples_per_pixel;     // SPP per frame (higher = less noise, slower)
     unsigned int random_seed;           // Per-frame random seed for sampling
+    unsigned int _pad_quality;
 
     // UI selection (UINT32_MAX = no selection)
     unsigned int selected_instance_id;

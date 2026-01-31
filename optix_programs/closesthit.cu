@@ -429,10 +429,79 @@ extern "C" __global__ void __closesthit__radiance() {
     }
 
     //--------------------------------------------------------------------------
-    // Environment Lighting (if no lights defined, use simple ambient)
+    // Environment Map Direct Lighting (Importance Sampled)
     //--------------------------------------------------------------------------
 
-    if (params.point_light_count == 0 && params.directional_light_count == 0 && params.area_light_count == 0) {
+    if (params.environment_map != 0 && params.env_conditional_cdf != 0 && params.env_marginal_cdf != 0) {
+        // Generate random numbers for environment sampling
+        // Use pixel position, frame index, AND ray direction to ensure unique samples per SPP
+        unsigned int pixelIdx = optixGetLaunchIndex().y * params.width + optixGetLaunchIndex().x;
+        float3 rayDir = optixGetWorldRayDirection();
+        unsigned int dirHash = __float_as_uint(rayDir.x) ^ __float_as_uint(rayDir.y) ^ __float_as_uint(rayDir.z);
+        unsigned int seed = pixelIdx ^ (params.frame_index * 0x9E3779B9u) ^ dirHash;
+        
+        // Generate two random numbers
+        float xi1 = randomFloat(seed);
+        float xi2 = randomFloat(seed);
+        
+        // Sample direction from environment map using importance sampling
+        float envPdf;
+        float3 L = sampleEnvironmentDirection(
+            xi1, xi2,
+            params.env_marginal_cdf,
+            params.env_conditional_cdf,
+            params.env_width,
+            params.env_height,
+            params.env_total_luminance,
+            envPdf
+        );
+        
+        float NdotL = dot(shadingNormal, L);
+        
+        // Only contribute if light direction is on correct hemisphere
+        if (NdotL > 0.0f && envPdf > 0.0f) {
+            // Check visibility (shadow ray toward environment)
+            bool visible = traceShadowRay(hitPos, geomNormal, L, 10000.0f);
+            
+            if (visible) {
+                // Get environment radiance
+                float3 envRadiance = sampleEnvironmentRadiance(L, params.environment_map, params.environment_intensity);
+                
+                // Evaluate BRDF
+                float3 brdf;
+                if (params.quality_mode == QUALITY_FAST) {
+                    brdf = evaluateLambertian(baseColorRGB);
+                } else if (clearcoat > 0.0f && params.quality_mode >= QUALITY_HIGH) {
+                    brdf = evaluateBRDF_Clearcoat(V, L, shadingNormal, baseColorRGB, metallic, roughness, clearcoat, clearcoatRoughness);
+                } else {
+                    brdf = evaluateGGX_BRDF(V, L, shadingNormal, baseColorRGB, metallic, roughness);
+                }
+                
+                // Add sheen
+                if (sheenColor.x > 0.0f || sheenColor.y > 0.0f || sheenColor.z > 0.0f) {
+                    brdf = brdf + evaluateSheen(V, L, shadingNormal, sheenColor, sheenRoughness);
+                }
+                
+                // Monte Carlo estimator: (brdf * Li * cos_theta) / pdf
+                // Apply MIS weight (balance heuristic) - for single-strategy sampling, weight = 1
+                float3 envContrib = brdf * envRadiance * NdotL / envPdf;
+                
+                // Soft clamp to reduce fireflies while preserving energy
+                // Using a higher threshold to avoid biasing the accumulated result
+                float maxVal = fmaxf(fmaxf(envContrib.x, envContrib.y), envContrib.z);
+                if (maxVal > 100.0f) {
+                    envContrib = envContrib * (100.0f / maxVal);
+                }
+                
+                Lo = Lo + envContrib;
+            }
+        }
+    }
+    // Fallback ambient if no environment map and no lights
+    else if (params.environment_map == 0 && 
+             params.point_light_count == 0 && 
+             params.directional_light_count == 0 && 
+             params.area_light_count == 0) {
         // Fallback: Simple ambient lighting (modulated by AO)
         float ambient = 0.1f * ao;  // Apply ambient occlusion
         Lo = Lo + baseColorRGB * ambient;

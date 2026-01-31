@@ -99,8 +99,18 @@ public:
     // Set environment map
     void setEnvironmentMap(cudaTextureObject_t envMap, float intensity);
 
+    // Set environment map importance sampling CDFs
+    void setEnvironmentCDF(cudaTextureObject_t conditionalCDF, 
+                          cudaTextureObject_t marginalCDF,
+                          uint32_t width, uint32_t height,
+                          float totalLuminance);
+
     // Set quality mode
     void setQualityMode(QualityMode mode);
+
+    // Set samples per pixel (higher = less noise, slower render)
+    void setSamplesPerPixel(uint32_t spp);
+    uint32_t getSamplesPerPixel() const;
 
     // Set selected instance for UI highlighting
     void setSelectedInstanceId(uint32_t instanceId);

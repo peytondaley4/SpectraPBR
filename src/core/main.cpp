@@ -7,6 +7,7 @@
 #include "texture_manager.h"
 #include "material_manager.h"
 #include "scene_manager.h"
+#include "environment_map.h"
 // Phase 4: UI System
 #include "text/font_atlas.h"
 #include "text/text_layout.h"
@@ -215,6 +216,7 @@ static OptixEngine* g_optixEngine = nullptr;
 static bool g_mouseCaptured = false;
 static double g_lastMouseX = 0.0, g_lastMouseY = 0.0;
 static bool g_firstMouse = true;
+static bool g_remoteMode = false;  // Disable cursor capture for remote desktop compatibility
 static QualityMode g_qualityMode = QUALITY_BALANCED;
 
 // Input state
@@ -271,7 +273,9 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             if (g_mouseCaptured) {
                 // Release mouse first
                 g_mouseCaptured = false;
-                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                if (!g_remoteMode) {
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                }
                 std::cout << "[Main] Mouse released\n";
             } else {
                 glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -281,11 +285,15 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         case GLFW_KEY_TAB:
             g_mouseCaptured = !g_mouseCaptured;
             if (g_mouseCaptured) {
-                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                if (!g_remoteMode) {
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                }
                 g_firstMouse = true;
                 std::cout << "[Main] Mouse captured\n";
             } else {
-                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                if (!g_remoteMode) {
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                }
                 std::cout << "[Main] Mouse released\n";
             }
             break;
@@ -307,6 +315,12 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
                 g_cudaInterop->printDeviceInfo();
                 g_cudaInterop->printMemoryUsage();
             }
+            break;
+
+        case GLFW_KEY_R:
+            g_remoteMode = !g_remoteMode;
+            std::cout << "[Main] Remote mode: " << (g_remoteMode ? "ON" : "OFF") 
+                      << " (cursor capture " << (g_remoteMode ? "disabled" : "enabled") << ")\n";
             break;
 
         case GLFW_KEY_C:
@@ -369,6 +383,25 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
             g_qualityMode = QUALITY_ACCURATE;
             if (g_optixEngine) g_optixEngine->setQualityMode(g_qualityMode);
             std::cout << "[Main] Quality mode: Accurate (Full PBR + conductor Fresnel)\n";
+            break;
+
+        // SPP adjustment
+        case GLFW_KEY_LEFT_BRACKET:
+            if (g_optixEngine) {
+                uint32_t spp = g_optixEngine->getSamplesPerPixel();
+                spp = spp > 1 ? spp / 2 : 1;
+                g_optixEngine->setSamplesPerPixel(spp);
+                std::cout << "[Main] Samples per pixel: " << spp << "\n";
+            }
+            break;
+
+        case GLFW_KEY_RIGHT_BRACKET:
+            if (g_optixEngine) {
+                uint32_t spp = g_optixEngine->getSamplesPerPixel();
+                spp = spp < 64 ? spp * 2 : 64;
+                g_optixEngine->setSamplesPerPixel(spp);
+                std::cout << "[Main] Samples per pixel: " << spp << "\n";
+            }
             break;
 
         // Phase 4: UI shortcuts
@@ -524,11 +557,16 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {
         if (action == GLFW_PRESS) {
             g_mouseCaptured = true;
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            // In remote mode, don't capture/hide cursor - just track deltas
+            if (!g_remoteMode) {
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            }
             g_firstMouse = true;
         } else if (action == GLFW_RELEASE) {
             g_mouseCaptured = false;
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            if (!g_remoteMode) {
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            }
         }
     }
 }
@@ -570,10 +608,20 @@ void updateCamera(float deltaTime) {
 int main(int argc, char* argv[]) {
     std::cout << "=== SpectraPBR - Phase 2 ===\n\n";
 
-    // Parse command line for model path
+    // Parse command line arguments
+    // Usage: SpectraPBR.exe [model.gltf] [environment.hdr] [--remote]
     std::filesystem::path modelPath;
-    if (argc > 1) {
-        modelPath = argv[1];
+    std::filesystem::path hdrPath;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--remote" || arg == "-r") {
+            g_remoteMode = true;
+            std::cout << "[Main] Remote mode enabled (cursor capture disabled)\n";
+        } else if (modelPath.empty()) {
+            modelPath = arg;
+        } else if (hdrPath.empty()) {
+            hdrPath = arg;
+        }
     }
 
     // Get executable directory for finding shaders and PTX files
@@ -854,6 +902,56 @@ int main(int argc, char* argv[]) {
     lightManager.syncToGpu(&optixEngine);
 
     std::cout << "[Main] Default lights enabled (1 directional, 2 area)\n";
+
+    //--------------------------------------------------------------------------
+    // Load HDR Environment Map
+    //--------------------------------------------------------------------------
+
+    EnvironmentMap environmentMap;
+
+    // Search for HDR file
+    if (hdrPath.empty()) {
+        // Search for default HDR in assets/hdri/
+        std::vector<std::filesystem::path> hdrSearchPaths = {
+            exePath / "assets" / "hdri" / "default.hdr",
+            exePath.parent_path() / "assets" / "hdri" / "default.hdr",
+            std::filesystem::current_path() / "assets" / "hdri" / "default.hdr",
+            // Also check for any .hdr file in the hdri directory
+        };
+
+        for (const auto& path : hdrSearchPaths) {
+            if (std::filesystem::exists(path)) {
+                hdrPath = path;
+                std::cout << "[Main] Found default HDR: " << hdrPath << "\n";
+                break;
+            }
+        }
+    }
+
+    // Load environment map if path is specified
+    if (!hdrPath.empty() && std::filesystem::exists(hdrPath)) {
+        if (environmentMap.loadFromFile(hdrPath.string())) {
+            // Set environment map texture
+            optixEngine.setEnvironmentMap(environmentMap.getTexture(), 1.0f);
+            
+            // Set importance sampling CDFs
+            optixEngine.setEnvironmentCDF(
+                environmentMap.getConditionalCDF(),
+                environmentMap.getMarginalCDF(),
+                environmentMap.getWidth(),
+                environmentMap.getHeight(),
+                environmentMap.getTotalLuminance()
+            );
+            
+            std::cout << "[Main] Environment map loaded successfully\n";
+        } else {
+            std::cerr << "[Main] Failed to load environment map: " << hdrPath << "\n";
+        }
+    } else if (!hdrPath.empty()) {
+        std::cerr << "[Main] HDR file not found: " << hdrPath << "\n";
+    } else {
+        std::cout << "[Main] No environment map specified, using default lighting\n";
+    }
 
     // Build hierarchical scene tree now that model and lights are loaded
     uiManager.buildHierarchicalSceneTree();

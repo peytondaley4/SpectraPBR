@@ -78,8 +78,16 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.environment_map = 0;
     m_launchParams.environment_intensity = 1.0f;
 
+    // Initialize environment CDF (for importance sampling)
+    m_launchParams.env_conditional_cdf = 0;
+    m_launchParams.env_marginal_cdf = 0;
+    m_launchParams.env_width = 0;
+    m_launchParams.env_height = 0;
+    m_launchParams.env_total_luminance = 0.0f;
+
     // Initialize quality settings
     m_launchParams.quality_mode = QUALITY_BALANCED;
+    m_launchParams.samples_per_pixel = 4;  // Default 4 SPP for reasonable first-frame quality
     m_launchParams.random_seed = 0;
 
     // Initialize selection (UINT32_MAX = no selection)
@@ -708,8 +716,27 @@ void OptixEngine::setEnvironmentMap(cudaTextureObject_t envMap, float intensity)
     m_launchParams.environment_intensity = intensity;
 }
 
+void OptixEngine::setEnvironmentCDF(cudaTextureObject_t conditionalCDF,
+                                    cudaTextureObject_t marginalCDF,
+                                    uint32_t width, uint32_t height,
+                                    float totalLuminance) {
+    m_launchParams.env_conditional_cdf = conditionalCDF;
+    m_launchParams.env_marginal_cdf = marginalCDF;
+    m_launchParams.env_width = width;
+    m_launchParams.env_height = height;
+    m_launchParams.env_total_luminance = totalLuminance;
+}
+
 void OptixEngine::setQualityMode(QualityMode mode) {
     m_launchParams.quality_mode = mode;
+}
+
+void OptixEngine::setSamplesPerPixel(uint32_t spp) {
+    m_launchParams.samples_per_pixel = spp > 0 ? spp : 1;
+}
+
+uint32_t OptixEngine::getSamplesPerPixel() const {
+    return m_launchParams.samples_per_pixel;
 }
 
 void OptixEngine::setSelectedInstanceId(uint32_t instanceId) {

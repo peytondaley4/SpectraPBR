@@ -408,18 +408,182 @@ __forceinline__ __device__ float3 reflect(const float3& I, const float3& N) {
 //------------------------------------------------------------------------------
 
 // Convert direction to equirectangular UV coordinates
+// Standard HDR format: U wraps horizontally (0-1), V goes from top (0) to bottom (1)
 __forceinline__ __device__ float2 directionToEquirectangular(const float3& dir) {
-    float u = atan2f(dir.z, dir.x) / (2.0f * M_PI) + 0.5f;
-    float v = asinf(clamp(dir.y, -1.0f, 1.0f)) / M_PI + 0.5f;
+    // Normalize direction to be safe
+    float3 d = normalize(dir);
+    
+    // Azimuthal angle (horizontal) - atan2 gives -PI to PI, map to 0-1
+    float phi = atan2f(d.z, d.x);
+    float u = phi / (2.0f * M_PI) + 0.5f;
+    
+    // Polar angle from +Y axis using acos - gives 0 (up) to PI (down)
+    float theta = acosf(clamp(d.y, -1.0f, 1.0f));
+    float v = theta / M_PI;
+    
     return make_float2(u, v);
 }
 
 // Convert equirectangular UV to direction
+// Inverse of directionToEquirectangular
 __forceinline__ __device__ float3 equirectangularToDirection(float u, float v) {
+    // phi: azimuthal angle around Y axis
     float phi = (u - 0.5f) * 2.0f * M_PI;
-    float theta = (v - 0.5f) * M_PI;
+    
+    // theta: polar angle from +Y axis (0 = up, PI = down)
+    float theta = v * M_PI;
+    
+    float sinTheta = sinf(theta);
     float cosTheta = cosf(theta);
-    return make_float3(cosTheta * cosf(phi), sinf(theta), cosTheta * sinf(phi));
+    
+    return make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
+}
+
+//------------------------------------------------------------------------------
+// Environment Map Importance Sampling
+// Uses precomputed CDFs for efficient sampling proportional to luminance
+//------------------------------------------------------------------------------
+
+// Binary search to find index in CDF where value <= cdf[index]
+__forceinline__ __device__ int binarySearchCDF(cudaTextureObject_t cdf, int size, float value) {
+    int low = 0;
+    int high = size - 1;
+    
+    while (low < high) {
+        int mid = (low + high) / 2;
+        float cdfVal = tex1D<float>(cdf, mid);
+        if (cdfVal < value) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+// Binary search in a row of the 2D conditional CDF
+__forceinline__ __device__ int binarySearchCDF2D(cudaTextureObject_t cdf, int width, int row, float value) {
+    int low = 0;
+    int high = width - 1;
+    
+    while (low < high) {
+        int mid = (low + high) / 2;
+        float cdfVal = tex2D<float>(cdf, mid, row);
+        if (cdfVal < value) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+// Sample direction from environment map using importance sampling
+// Returns sampled direction and outputs PDF value
+__forceinline__ __device__ float3 sampleEnvironmentDirection(
+    float xi1, float xi2,                       // Two random numbers in [0,1)
+    cudaTextureObject_t marginalCDF,            // P(v) - marginal CDF for rows
+    cudaTextureObject_t conditionalCDF,         // P(u|v) - conditional CDF per row
+    unsigned int envWidth,
+    unsigned int envHeight,
+    float totalLuminance,
+    float& outPdf)
+{
+    // Sample row (v) using marginal CDF
+    int row = binarySearchCDF(marginalCDF, envHeight, xi1);
+    
+    // Get the marginal PDF for this row
+    float marginalPdf;
+    if (row == 0) {
+        marginalPdf = tex1D<float>(marginalCDF, 0);
+    } else {
+        marginalPdf = tex1D<float>(marginalCDF, row) - tex1D<float>(marginalCDF, row - 1);
+    }
+    
+    // Sample column (u) using conditional CDF for this row
+    int col = binarySearchCDF2D(conditionalCDF, envWidth, row, xi2);
+    
+    // Get the conditional PDF for this column
+    float conditionalPdf;
+    if (col == 0) {
+        conditionalPdf = tex2D<float>(conditionalCDF, 0, row);
+    } else {
+        conditionalPdf = tex2D<float>(conditionalCDF, col, row) - tex2D<float>(conditionalCDF, col - 1, row);
+    }
+    
+    // Convert discrete indices to continuous UV coordinates (center of pixel)
+    float u = (col + 0.5f) / envWidth;
+    float v = (row + 0.5f) / envHeight;
+    
+    // Convert UV to direction
+    float3 dir = equirectangularToDirection(u, v);
+    
+    // Compute PDF
+    // PDF = (marginalPdf * conditionalPdf) * (width * height) / (2 * PI * PI * sin(theta))
+    // The (width * height) factor converts from discrete to continuous PDF
+    // The (2 * PI * PI * sin(theta)) is the Jacobian for equirectangular mapping
+    float theta = v * M_PI;
+    float sinTheta = fmaxf(sinf(theta), 1e-6f);
+    
+    // Joint PDF: P(u,v) = P(u|v) * P(v)
+    float jointPdf = marginalPdf * conditionalPdf * envWidth * envHeight;
+    
+    // Convert to solid angle PDF
+    outPdf = jointPdf / (2.0f * M_PI * M_PI * sinTheta);
+    
+    return dir;
+}
+
+// Compute PDF for a given direction when sampling the environment map
+__forceinline__ __device__ float environmentPdf(
+    const float3& dir,
+    cudaTextureObject_t envMap,
+    cudaTextureObject_t marginalCDF,
+    cudaTextureObject_t conditionalCDF,
+    unsigned int envWidth,
+    unsigned int envHeight,
+    float totalLuminance)
+{
+    // Convert direction to UV
+    float2 uv = directionToEquirectangular(dir);
+    
+    // Get pixel coordinates
+    int col = clamp((int)(uv.x * envWidth), 0, (int)envWidth - 1);
+    int row = clamp((int)(uv.y * envHeight), 0, (int)envHeight - 1);
+    
+    // Get marginal PDF for this row
+    float marginalPdf;
+    if (row == 0) {
+        marginalPdf = tex1D<float>(marginalCDF, 0);
+    } else {
+        marginalPdf = tex1D<float>(marginalCDF, row) - tex1D<float>(marginalCDF, row - 1);
+    }
+    
+    // Get conditional PDF for this column
+    float conditionalPdf;
+    if (col == 0) {
+        conditionalPdf = tex2D<float>(conditionalCDF, 0, row);
+    } else {
+        conditionalPdf = tex2D<float>(conditionalCDF, col, row) - tex2D<float>(conditionalCDF, col - 1, row);
+    }
+    
+    // Convert to solid angle PDF
+    float theta = uv.y * M_PI;
+    float sinTheta = fmaxf(sinf(theta), 1e-6f);
+    
+    float jointPdf = marginalPdf * conditionalPdf * envWidth * envHeight;
+    return jointPdf / (2.0f * M_PI * M_PI * sinTheta);
+}
+
+// Sample environment map radiance for a given direction
+__forceinline__ __device__ float3 sampleEnvironmentRadiance(
+    const float3& dir,
+    cudaTextureObject_t envMap,
+    float intensity)
+{
+    float2 uv = directionToEquirectangular(dir);
+    float4 envSample = tex2D<float4>(envMap, uv.x, uv.y);
+    return make_float3(envSample.x, envSample.y, envSample.z) * intensity;
 }
 
 //------------------------------------------------------------------------------

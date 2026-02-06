@@ -82,13 +82,19 @@ void GLContext::shutdown() {
         glDeleteProgram(m_displayProgram);
         m_displayProgram = 0;
     }
-    if (m_pbo) {
-        glDeleteBuffers(1, &m_pbo);
-        m_pbo = 0;
+    // Clean up triple-buffered PBOs
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        if (m_pbos[i]) {
+            glDeleteBuffers(1, &m_pbos[i]);
+            m_pbos[i] = 0;
+        }
     }
-    if (m_displayTexture) {
-        glDeleteTextures(1, &m_displayTexture);
-        m_displayTexture = 0;
+    // Clean up triple-buffered textures
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        if (m_displayTextures[i]) {
+            glDeleteTextures(1, &m_displayTextures[i]);
+            m_displayTextures[i] = 0;
+        }
     }
     if (m_uiPbo) {
         glDeleteBuffers(1, &m_uiPbo);
@@ -141,24 +147,32 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
     // Create empty VAO for fullscreen triangle
     glGenVertexArrays(1, &m_emptyVAO);
 
-    // Create display texture (RGBA32F for HDR)
-    glGenTextures(1, &m_displayTexture);
-    glBindTexture(GL_TEXTURE_2D, m_displayTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
-                 GL_RGBA, GL_FLOAT, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // Create triple-buffered display textures (RGBA32F for HDR)
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        glGenTextures(1, &m_displayTextures[i]);
+        glBindTexture(GL_TEXTURE_2D, m_displayTextures[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
+                     GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    // Create PBO for efficient CUDA -> texture transfer
-    glGenBuffers(1, &m_pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+    // Create triple-buffered PBOs for efficient CUDA -> texture transfer
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        glGenBuffers(1, &m_pbos[i]);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbos[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+    }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    // Create UI texture (RGBA32F for alpha compositing)
+    // Initialize buffer indices
+    m_writeBuffer = 0;
+    m_displayBuffer = 0;
+
+    // Create UI texture (RGBA32F for alpha compositing) - single buffered
     glGenTextures(1, &m_uiTexture);
     glBindTexture(GL_TEXTURE_2D, m_uiTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
@@ -176,14 +190,21 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
     std::cout << "[GL] Display resources created: " << m_width << "x" << m_height
-              << " (" << getBufferSize() / (1024 * 1024) << " MB scene + UI)\n";
+              << " (" << (getBufferSize() * NUM_SCENE_BUFFERS) / (1024 * 1024) << " MB scene ["
+              << NUM_SCENE_BUFFERS << " buffers] + " << getBufferSize() / (1024 * 1024) << " MB UI)\n";
 
     return true;
 }
 
 void GLContext::updateTextureFromPBO() {
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
-    glBindTexture(GL_TEXTURE_2D, m_displayTexture);
+    // Legacy single-buffer path: update from first buffer
+    updateTextureFromPBO(0);
+}
+
+void GLContext::updateTextureFromPBO(int bufferIndex) {
+    if (bufferIndex < 0 || bufferIndex >= NUM_SCENE_BUFFERS) return;
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbos[bufferIndex]);
+    glBindTexture(GL_TEXTURE_2D, m_displayTextures[bufferIndex]);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height,
                     GL_RGBA, GL_FLOAT, nullptr);  // nullptr = read from bound PBO
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -198,13 +219,22 @@ void GLContext::updateUITextureFromPBO() {
 }
 
 void GLContext::renderFullscreenQuad() {
+    // Legacy single-buffer path: render from first buffer
+    renderFullscreenQuad(0);
+}
+
+void GLContext::renderFullscreenQuad(int displayBufferIndex) {
+    if (displayBufferIndex < 0 || displayBufferIndex >= NUM_SCENE_BUFFERS) {
+        displayBufferIndex = 0;
+    }
+
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(m_displayProgram);
 
-    // Bind scene texture
+    // Bind scene texture from specified buffer
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, m_displayTexture);
+    glBindTexture(GL_TEXTURE_2D, m_displayTextures[displayBufferIndex]);
 
     // Bind UI texture and set enabled flag
     glActiveTexture(GL_TEXTURE1);
@@ -282,13 +312,15 @@ void GLContext::setResolution(uint32_t width, uint32_t height) {
 }
 
 void GLContext::recreateBuffers() {
-    // Recreate scene texture
-    if (m_displayTexture) {
-        glBindTexture(GL_TEXTURE_2D, m_displayTexture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
-                     GL_RGBA, GL_FLOAT, nullptr);
-        glBindTexture(GL_TEXTURE_2D, 0);
+    // Recreate triple-buffered scene textures
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        if (m_displayTextures[i]) {
+            glBindTexture(GL_TEXTURE_2D, m_displayTextures[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_width, m_height, 0,
+                         GL_RGBA, GL_FLOAT, nullptr);
+        }
     }
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     // Recreate UI texture
     if (m_uiTexture) {
@@ -298,17 +330,23 @@ void GLContext::recreateBuffers() {
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
-    // Completely delete and recreate PBO (not just reallocate)
-    // This ensures CUDA gets a fresh GL object after re-registration
-    if (m_pbo) {
-        glDeleteBuffers(1, &m_pbo);
-        m_pbo = 0;
-    }
+    // Completely delete and recreate triple-buffered PBOs (not just reallocate)
+    // This ensures CUDA gets fresh GL objects after re-registration
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        if (m_pbos[i]) {
+            glDeleteBuffers(1, &m_pbos[i]);
+            m_pbos[i] = 0;
+        }
 
-    glGenBuffers(1, &m_pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+        glGenBuffers(1, &m_pbos[i]);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, m_pbos[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
+    }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    // Reset buffer indices
+    m_writeBuffer = 0;
+    m_displayBuffer = 0;
 
     // Recreate UI PBO
     if (m_uiPbo) {
@@ -322,7 +360,8 @@ void GLContext::recreateBuffers() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
     std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height
-              << " (PBO " << m_pbo << ", UI PBO " << m_uiPbo << ", " << getBufferSize() / (1024 * 1024) << " MB each)\n";
+              << " (PBOs " << m_pbos[0] << "/" << m_pbos[1] << "/" << m_pbos[2]
+              << ", UI PBO " << m_uiPbo << ", " << getBufferSize() / (1024 * 1024) << " MB each)\n";
 }
 
 void GLContext::framebufferSizeCallback(GLFWwindow* window, int width, int height) {

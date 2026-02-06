@@ -95,6 +95,7 @@ public:
     void setPointLights(GpuPointLight* lights, uint32_t count);
     void setDirectionalLights(GpuDirectionalLight* lights, uint32_t count);
     void setAreaLights(GpuAreaLight* lights, uint32_t count);
+    void setTotalLightLuminance(float luminance);
 
     // Set environment map
     void setEnvironmentMap(cudaTextureObject_t envMap, float intensity);

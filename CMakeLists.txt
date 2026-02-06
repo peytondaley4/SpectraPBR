@@ -248,6 +248,7 @@ add_custom_target(optix_ptx ALL DEPENDS ${RAYGEN_PTX} ${MISS_PTX} ${CLOSESTHIT_P
 add_executable(SpectraPBR
     # Core
     src/core/main.cpp
+    src/core/application.cpp
     # Graphics
     src/graphics/gl_context.cpp
     src/graphics/shader_utils.cpp
@@ -259,6 +260,7 @@ add_executable(SpectraPBR
     src/rendering/camera.cpp
     src/rendering/scene_manager.cpp
     src/rendering/geometry_manager.cpp
+    src/rendering/light_manager.cpp
     # Loaders
     src/loaders/model_loader.cpp
     src/loaders/texture_manager.cpp

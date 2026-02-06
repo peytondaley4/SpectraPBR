@@ -191,7 +191,7 @@ struct GpuLaunchParams {
     unsigned int _pad_lights1;
     GpuAreaLight* area_lights;
     unsigned int area_light_count;
-    unsigned int _pad_lights2;
+    float total_light_luminance;  // Precomputed sum of all light luminances for importance sampling
 
     // Environment map (equirectangular HDR)
     cudaTextureObject_t environment_map;  // 0 = none

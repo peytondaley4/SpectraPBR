@@ -27,6 +27,8 @@ using PreResizeCallback = std::function<void()>;
 
 class GLContext {
 public:
+    static constexpr int NUM_SCENE_BUFFERS = 3;  // Triple buffering for scene
+
     GLContext() = default;
     ~GLContext();
 
@@ -55,9 +57,12 @@ public:
     // shaderDir: directory containing display.vert and display.frag
     bool createDisplayResources(const std::filesystem::path& shaderDir);
 
-    // Update display texture from PBO
+    // Update display texture from PBO (legacy single-buffer)
     // Call after CUDA has written to the mapped PBO
     void updateTextureFromPBO();
+
+    // Update display texture from specific PBO index (triple buffering)
+    void updateTextureFromPBO(int bufferIndex);
 
     // Update UI texture from UI PBO
     // Call after CUDA has written to the mapped UI PBO
@@ -67,15 +72,29 @@ public:
     // If UI is enabled, composites UI on top of scene
     void renderFullscreenQuad();
 
+    // Render fullscreen quad using specific display buffer index (triple buffering)
+    void renderFullscreenQuad(int displayBufferIndex);
+
     // Enable/disable UI compositing
     void setUIEnabled(bool enabled) { m_uiEnabled = enabled; }
     bool isUIEnabled() const { return m_uiEnabled; }
 
-    // Get PBO for CUDA interop registration
-    GLuint getPBO() const { return m_pbo; }
+    // Get PBO for CUDA interop registration (legacy single-buffer)
+    GLuint getPBO() const { return m_pbos[0]; }
+
+    // Get specific PBO by index (triple buffering)
+    GLuint getPBO(int index) const { return m_pbos[index]; }
 
     // Get UI PBO for CUDA interop registration
     GLuint getUIPBO() const { return m_uiPbo; }
+
+    // Triple buffering buffer index management
+    int getWriteBufferIndex() const { return m_writeBuffer; }
+    int getDisplayBufferIndex() const { return m_displayBuffer; }
+    void advanceBuffers() {
+        m_writeBuffer = (m_writeBuffer + 1) % NUM_SCENE_BUFFERS;
+        m_displayBuffer = (m_displayBuffer + 1) % NUM_SCENE_BUFFERS;
+    }
 
     // Get current dimensions
     uint32_t getWidth() const { return m_width; }
@@ -114,13 +133,15 @@ private:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
 
-    // Display resources
-    GLuint m_displayTexture = 0;
-    GLuint m_pbo = 0;
+    // Display resources (triple-buffered for scene)
+    GLuint m_displayTextures[NUM_SCENE_BUFFERS] = {};  // Triple-buffered textures
+    GLuint m_pbos[NUM_SCENE_BUFFERS] = {};             // Triple-buffered PBOs
+    int m_writeBuffer = 0;                              // Buffer GPU is writing to
+    int m_displayBuffer = 0;                            // Buffer being displayed
     GLuint m_displayProgram = 0;
     GLuint m_emptyVAO = 0;  // For fullscreen triangle
 
-    // UI resources
+    // UI resources (single-buffered, rendered less frequently)
     GLuint m_uiTexture = 0;
     GLuint m_uiPbo = 0;
     bool m_uiEnabled = false;

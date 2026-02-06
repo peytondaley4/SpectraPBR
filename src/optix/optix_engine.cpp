@@ -73,6 +73,7 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.directional_light_count = 0;
     m_launchParams.area_lights = nullptr;
     m_launchParams.area_light_count = 0;
+    m_launchParams.total_light_luminance = 0.0f;
 
     // Initialize environment map
     m_launchParams.environment_map = 0;
@@ -87,7 +88,7 @@ bool OptixEngine::init(CUcontext cudaContext) {
 
     // Initialize quality settings
     m_launchParams.quality_mode = QUALITY_BALANCED;
-    m_launchParams.samples_per_pixel = 4;  // Default 4 SPP for reasonable first-frame quality
+    m_launchParams.samples_per_pixel = 1;  // 1 SPP for real-time; use ] to increase
     m_launchParams.random_seed = 0;
 
     // Initialize selection (UINT32_MAX = no selection)
@@ -709,6 +710,10 @@ void OptixEngine::setDirectionalLights(GpuDirectionalLight* lights, uint32_t cou
 void OptixEngine::setAreaLights(GpuAreaLight* lights, uint32_t count) {
     m_launchParams.area_lights = lights;
     m_launchParams.area_light_count = count;
+}
+
+void OptixEngine::setTotalLightLuminance(float luminance) {
+    m_launchParams.total_light_luminance = luminance;
 }
 
 void OptixEngine::setEnvironmentMap(cudaTextureObject_t envMap, float intensity) {

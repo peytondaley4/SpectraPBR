@@ -183,7 +183,7 @@ struct LaunchParams {
     uint32_t _pad_lights1;
     GpuAreaLight* area_lights;
     uint32_t area_light_count;
-    uint32_t _pad_lights2;
+    float total_light_luminance;  // Precomputed sum of all light luminances for importance sampling
 
     // Environment map (equirectangular HDR)
     cudaTextureObject_t environment_map;  // 0 = none
@@ -211,7 +211,7 @@ struct LaunchParams {
     // Picking mode
     uint32_t* pick_result;      // Device buffer to store picked instance ID (1 element)
     uint32_t pick_x;            // Pick pixel X coordinate
-    uint32_t pick_y;            // Pick pixel Y coordinate  
+    uint32_t pick_y;            // Pick pixel Y coordinate
     uint32_t pick_mode;         // 0 = normal render, 1 = pick mode (single ray)
 };
 

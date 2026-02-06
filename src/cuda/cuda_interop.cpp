@@ -48,8 +48,11 @@ bool CudaInterop::init() {
         return false;
     }
 
-    // Create stream for async operations
+    // Create stream for async scene rendering operations
     CUDA_CHECK(cudaStreamCreate(&m_stream));
+
+    // Create separate stream for UI rendering (avoids blocking scene pipeline)
+    CUDA_CHECK(cudaStreamCreate(&m_uiStream));
 
     printDeviceInfo();
     printMemoryUsage();
@@ -58,11 +61,16 @@ bool CudaInterop::init() {
 }
 
 void CudaInterop::shutdown() {
-    if (m_pboMapped) {
-        unmapPBO();
-    }
-    if (m_pboResource) {
-        unregisterPBO();
+    // Unmap and unregister all triple-buffered PBOs
+    if (m_tripleBuffered) {
+        unregisterPBOs();
+    } else {
+        if (m_pboMapped[0]) {
+            unmapPBO();
+        }
+        if (m_pboResources[0]) {
+            unregisterPBO();
+        }
     }
     if (m_uiPboMapped) {
         unmapUIPBO();
@@ -70,9 +78,20 @@ void CudaInterop::shutdown() {
     if (m_uiPboResource) {
         unregisterUIPBO();
     }
+    // Destroy events
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        if (m_renderComplete[i]) {
+            cudaEventDestroy(m_renderComplete[i]);
+            m_renderComplete[i] = nullptr;
+        }
+    }
     if (m_stream) {
         cudaStreamDestroy(m_stream);
         m_stream = nullptr;
+    }
+    if (m_uiStream) {
+        cudaStreamDestroy(m_uiStream);
+        m_uiStream = nullptr;
     }
     // Don't destroy the CUDA context - it's managed by the runtime
     m_cudaContext = nullptr;
@@ -80,32 +99,92 @@ void CudaInterop::shutdown() {
 }
 
 bool CudaInterop::registerPBO(uint32_t pbo, size_t size) {
-    if (m_pboResource) {
+    // Legacy single-buffer registration - uses slot 0
+    if (m_pboResources[0]) {
         unregisterPBO();
     }
 
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(
-        &m_pboResource,
+        &m_pboResources[0],
         pbo,
         cudaGraphicsMapFlagsWriteDiscard  // We only write, never read
     ));
 
+    // Create event for this buffer
+    if (!m_renderComplete[0]) {
+        CUDA_CHECK(cudaEventCreate(&m_renderComplete[0]));
+    }
+
     m_pboSize = size;
+    m_tripleBuffered = false;
     std::cout << "[CUDA] Registered PBO " << pbo << " (" << size / (1024 * 1024) << " MB)\n";
 
     return true;
 }
 
+bool CudaInterop::registerPBOs(uint32_t pbo0, uint32_t pbo1, uint32_t pbo2, size_t size) {
+    // Unregister any existing PBOs
+    unregisterPBOs();
+
+    uint32_t pbos[NUM_SCENE_BUFFERS] = {pbo0, pbo1, pbo2};
+
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        CUDA_CHECK(cudaGraphicsGLRegisterBuffer(
+            &m_pboResources[i],
+            pbos[i],
+            cudaGraphicsMapFlagsWriteDiscard
+        ));
+
+        // Use cudaEventDisableTiming for lower overhead synchronization
+        // We don't need timing on these events, just completion notification
+        CUDA_CHECK(cudaEventCreateWithFlags(&m_renderComplete[i], cudaEventDisableTiming));
+        m_pboMapped[i] = false;
+    }
+
+    m_pboSize = size;
+    m_tripleBuffered = true;
+    std::cout << "[CUDA] Registered triple-buffered PBOs " << pbo0 << "/" << pbo1 << "/" << pbo2
+              << " (" << size / (1024 * 1024) << " MB each)\n";
+
+    return true;
+}
+
 void CudaInterop::unregisterPBO() {
-    if (m_pboMapped) {
+    // Legacy single-buffer unregistration
+    if (m_pboMapped[0]) {
         unmapPBO();
     }
-    if (m_pboResource) {
-        CUDA_CHECK_NORETURN(cudaGraphicsUnregisterResource(m_pboResource));
-        m_pboResource = nullptr;
-        m_pboSize = 0;
+    if (m_pboResources[0]) {
+        CUDA_CHECK_NORETURN(cudaGraphicsUnregisterResource(m_pboResources[0]));
+        m_pboResources[0] = nullptr;
         std::cout << "[CUDA] Unregistered PBO\n";
     }
+    if (m_renderComplete[0]) {
+        cudaEventDestroy(m_renderComplete[0]);
+        m_renderComplete[0] = nullptr;
+    }
+    m_pboSize = 0;
+    m_tripleBuffered = false;
+}
+
+void CudaInterop::unregisterPBOs() {
+    for (int i = 0; i < NUM_SCENE_BUFFERS; ++i) {
+        if (m_pboMapped[i]) {
+            unmapBuffer(i);
+        }
+        if (m_pboResources[i]) {
+            CUDA_CHECK_NORETURN(cudaGraphicsUnregisterResource(m_pboResources[i]));
+            m_pboResources[i] = nullptr;
+        }
+        if (m_renderComplete[i]) {
+            cudaEventDestroy(m_renderComplete[i]);
+            m_renderComplete[i] = nullptr;
+        }
+        m_pboMapped[i] = false;
+    }
+    m_pboSize = 0;
+    m_tripleBuffered = false;
+    std::cout << "[CUDA] Unregistered all PBOs\n";
 }
 
 bool CudaInterop::registerUIPBO(uint32_t pbo, size_t size) {
@@ -138,42 +217,79 @@ void CudaInterop::unregisterUIPBO() {
 }
 
 float* CudaInterop::mapPBO() {
-    if (!m_pboResource) {
-        std::cerr << "[CUDA] Cannot map: PBO not registered\n";
+    // Legacy single-buffer map - uses slot 0
+    return mapBuffer(0);
+}
+
+float* CudaInterop::mapBuffer(int index) {
+    if (index < 0 || index >= NUM_SCENE_BUFFERS) {
+        std::cerr << "[CUDA] Invalid buffer index: " << index << "\n";
         return nullptr;
     }
 
-    if (m_pboMapped) {
-        std::cerr << "[CUDA] Warning: PBO already mapped\n";
+    if (!m_pboResources[index]) {
+        std::cerr << "[CUDA] Cannot map: PBO " << index << " not registered\n";
         return nullptr;
     }
 
-    cudaError_t err = cudaGraphicsMapResources(1, &m_pboResource, m_stream);
+    if (m_pboMapped[index]) {
+        std::cerr << "[CUDA] Warning: PBO " << index << " already mapped\n";
+        return nullptr;
+    }
+
+    cudaError_t err = cudaGraphicsMapResources(1, &m_pboResources[index], m_stream);
     if (err != cudaSuccess) {
-        std::cerr << "[CUDA] Failed to map PBO: " << cudaGetErrorString(err) << "\n";
+        std::cerr << "[CUDA] Failed to map PBO " << index << ": " << cudaGetErrorString(err) << "\n";
         return nullptr;
     }
 
     void* devPtr = nullptr;
     size_t mappedSize = 0;
-    err = cudaGraphicsResourceGetMappedPointer(&devPtr, &mappedSize, m_pboResource);
+    err = cudaGraphicsResourceGetMappedPointer(&devPtr, &mappedSize, m_pboResources[index]);
     if (err != cudaSuccess) {
-        std::cerr << "[CUDA] Failed to get mapped pointer: " << cudaGetErrorString(err) << "\n";
-        cudaGraphicsUnmapResources(1, &m_pboResource, m_stream);
+        std::cerr << "[CUDA] Failed to get mapped pointer for PBO " << index << ": " << cudaGetErrorString(err) << "\n";
+        cudaGraphicsUnmapResources(1, &m_pboResources[index], m_stream);
         return nullptr;
     }
 
-    m_pboMapped = true;
+    m_pboMapped[index] = true;
     return static_cast<float*>(devPtr);
 }
 
 void CudaInterop::unmapPBO() {
-    if (!m_pboMapped) {
+    // Legacy single-buffer unmap - uses slot 0
+    unmapBuffer(0);
+}
+
+void CudaInterop::unmapBuffer(int index) {
+    if (index < 0 || index >= NUM_SCENE_BUFFERS) return;
+
+    if (!m_pboMapped[index]) {
         return;
     }
 
-    CUDA_CHECK_NORETURN(cudaGraphicsUnmapResources(1, &m_pboResource, m_stream));
-    m_pboMapped = false;
+    CUDA_CHECK_NORETURN(cudaGraphicsUnmapResources(1, &m_pboResources[index], m_stream));
+    m_pboMapped[index] = false;
+}
+
+void CudaInterop::recordRenderComplete(int index) {
+    if (index < 0 || index >= NUM_SCENE_BUFFERS) return;
+    if (m_renderComplete[index]) {
+        cudaEventRecord(m_renderComplete[index], m_stream);
+    }
+}
+
+bool CudaInterop::isRenderComplete(int index) {
+    if (index < 0 || index >= NUM_SCENE_BUFFERS) return true;
+    if (!m_renderComplete[index]) return true;
+    return cudaEventQuery(m_renderComplete[index]) == cudaSuccess;
+}
+
+void CudaInterop::waitForRender(int index) {
+    if (index < 0 || index >= NUM_SCENE_BUFFERS) return;
+    if (m_renderComplete[index]) {
+        cudaEventSynchronize(m_renderComplete[index]);
+    }
 }
 
 float* CudaInterop::mapUIPBO() {
@@ -218,6 +334,12 @@ void CudaInterop::unmapUIPBO() {
 void CudaInterop::synchronize() {
     if (m_stream) {
         CUDA_CHECK_NORETURN(cudaStreamSynchronize(m_stream));
+    }
+}
+
+void CudaInterop::synchronizeUI() {
+    if (m_uiStream) {
+        CUDA_CHECK_NORETURN(cudaStreamSynchronize(m_uiStream));
     }
 }
 

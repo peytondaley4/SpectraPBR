@@ -9,6 +9,10 @@
 
 namespace spectra {
 
+struct SparsePathGuideDescriptor;
+struct PathGuideStagingDescriptor;
+struct PathGuideTrainingStagingDescriptor;
+
 // OptiX error checking macro
 #define OPTIX_CHECK(call)                                                        \
     do {                                                                         \
@@ -119,10 +123,37 @@ public:
     // Pick instance at screen coordinates (returns UINT32_MAX if no hit)
     uint32_t pickInstance(uint32_t screenX, uint32_t screenY, cudaStream_t stream = 0);
 
+    // Pick instance and world-space hit position at screen coordinates
+    PickResultBuffer pickInstanceAndPosition(uint32_t screenX, uint32_t screenY, cudaStream_t stream = 0);
+
     // Accumulation buffer for progressive AA
     void setAccumulationBuffer(float4* buffer);
     void resetAccumulation();
     uint32_t getAccumulatedFrames() const;
+
+    // Path guide grid (sparse + staging)
+    void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
+        const PathGuideStagingDescriptor* staging,
+        const PathGuideTrainingStagingDescriptor* training = nullptr);
+    void setPathGuideGridDebug(bool visualize, uint32_t level);
+    void setPathGuideNoJitter(bool noJitter);
+    void setPathGuideEnabled(bool enabled);
+    void setPathGuideMISWeight(float weight);
+    void setPathGuideTrainingProbability(float prob);
+    void setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel);
+
+    // Path guide debugging
+    struct PathGuideStats {
+        uint32_t attempts = 0;      // Total indirect lighting attempts
+        uint32_t cellFound = 0;     // Times a cell was found for position
+        uint32_t validLobe = 0;     // Times cell had valid vMF lobes
+        uint32_t belowHorizon = 0;  // Times sample was below horizon
+        uint32_t contributed = 0;   // Times contribution was added
+        uint32_t bsdfSampled = 0;   // Times BSDF sampling was used (vs guide)
+    };
+    void setPathGuideDebugEnabled(bool enabled);
+    void resetPathGuideStats(cudaStream_t stream = nullptr);
+    PathGuideStats readPathGuideStats();
 
 private:
     bool createModule(const std::filesystem::path& ptxPath, OptixModule* module);
@@ -167,6 +198,9 @@ private:
 
     // Pick buffer (single uint32_t on device)
     CUdeviceptr m_pickBuffer = 0;
+
+    // Path guide debug stats buffer (6 uint32_t counters on device)
+    uint32_t* m_pathGuideDebugStats = nullptr;
 };
 
 } // namespace spectra

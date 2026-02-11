@@ -32,6 +32,8 @@ public:
 
     // Set near/far planes
     void setClipPlanes(float nearPlane, float farPlane);
+    float getNearPlane() const { return m_nearPlane; }
+    float getFarPlane() const { return m_farPlane; }
 
     // Movement (FPS-style controls)
     // Call per-frame with deltaTime in seconds

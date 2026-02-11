@@ -79,6 +79,10 @@ public:
     void setUIEnabled(bool enabled) { m_uiEnabled = enabled; }
     bool isUIEnabled() const { return m_uiEnabled; }
 
+    // Exposure control for tone mapping
+    void setExposure(float exposure) { m_exposure = exposure; }
+    float getExposure() const { return m_exposure; }
+
     // Get PBO for CUDA interop registration (legacy single-buffer)
     GLuint getPBO() const { return m_pbos[0]; }
 
@@ -146,6 +150,8 @@ private:
     GLuint m_uiPbo = 0;
     bool m_uiEnabled = false;
     GLint m_uiTextureLoc = -1;
+    GLint m_exposureLoc = -1;
+    float m_exposure = 1.0f;
 
     // State
     bool m_vsyncEnabled = true;

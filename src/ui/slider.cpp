@@ -119,8 +119,10 @@ bool Slider::onMouseDown(float2 pos, int button) {
     if (!m_visible || !m_enabled) return false;
     if (button != 0) return false;
 
-    Rect thumb = getThumbBounds();
-    if (thumb.contains(pos)) {
+    Rect track = getTrackBounds();
+    // Accept clicks anywhere on the track, not just the thumb
+    Rect hitArea = { track.x, track.y - 4.0f, track.width, track.height + 8.0f };
+    if (hitArea.contains(pos)) {
         m_dragging = true;
         m_dragButton = button;
         m_active = true;

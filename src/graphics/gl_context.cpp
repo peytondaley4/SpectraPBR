@@ -142,6 +142,8 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
     m_uiTextureLoc = glGetUniformLocation(m_displayProgram, "uUITexture");
     glUniform1i(m_uiTextureLoc, 1);
     glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), 0);
+    m_exposureLoc = glGetUniformLocation(m_displayProgram, "uExposure");
+    glUniform1f(m_exposureLoc, m_exposure);
     glUseProgram(0);
 
     // Create empty VAO for fullscreen triangle
@@ -240,6 +242,7 @@ void GLContext::renderFullscreenQuad(int displayBufferIndex) {
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, m_uiTexture);
     glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), m_uiEnabled ? 1 : 0);
+    glUniform1f(m_exposureLoc, m_exposure);
 
     // Enable blending for UI compositing
     glEnable(GL_BLEND);

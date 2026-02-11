@@ -8,7 +8,13 @@
       "WebFetch(domain:research.nvidia.com)",
       "WebFetch(domain:agraphicsguynotes.com)",
       "WebFetch(domain:gamehacker1999.github.io)",
-      "Bash(ls -la \"C:\\\\Users\\\\Peyton Daley\\\\dev\\\\SpectraPBR\\\\optix_programs\"\" 2>/dev/null || dir \"C:UsersPeyton DaleydevSpectraPBRoptix_programs\"\")"
+      "Bash(ls -la \"C:\\\\Users\\\\Peyton Daley\\\\dev\\\\SpectraPBR\\\\optix_programs\"\" 2>/dev/null || dir \"C:UsersPeyton DaleydevSpectraPBRoptix_programs\"\")",
+      "WebFetch(domain:studios.disneyresearch.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:jannovak.info)",
+      "WebFetch(domain:tom94.net)",
+      "WebFetch(domain:www.lalber.org)",
+      "WebFetch(domain:weschang.com)"
     ]
   }
 }

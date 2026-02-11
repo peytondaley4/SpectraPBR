@@ -123,6 +123,17 @@ FetchContent_MakeAvailable(tinygltf)
 message(STATUS "tinygltf fetched")
 
 #------------------------------------------------------------------------------
+# tinyobjloader - OBJ/MTL file loader
+#------------------------------------------------------------------------------
+FetchContent_Declare(
+    tinyobjloader
+    GIT_REPOSITORY https://github.com/tinyobjloader/tinyobjloader.git
+    GIT_TAG        v2.0.0rc13
+)
+FetchContent_MakeAvailable(tinyobjloader)
+message(STATUS "tinyobjloader fetched")
+
+#------------------------------------------------------------------------------
 # nlohmann/json - JSON library for scene serialization
 #------------------------------------------------------------------------------
 FetchContent_Declare(
@@ -192,6 +203,8 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
         ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/gpu_types.h
         ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/shared_device.h
         ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/brdf.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/vmf_device.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_grid_device.h
     )
 
     add_custom_command(
@@ -252,6 +265,7 @@ add_executable(SpectraPBR
     # Graphics
     src/graphics/gl_context.cpp
     src/graphics/shader_utils.cpp
+    src/graphics/wireframe_renderer.cpp
     # CUDA
     src/cuda/cuda_interop.cpp
     # OptiX
@@ -261,6 +275,9 @@ add_executable(SpectraPBR
     src/rendering/scene_manager.cpp
     src/rendering/geometry_manager.cpp
     src/rendering/light_manager.cpp
+    src/rendering/path_guide_grid.cpp
+    src/rendering/vmf_fitting.cpp
+    src/rendering/hemisphere_vis.cpp
     # Loaders
     src/loaders/model_loader.cpp
     src/loaders/texture_manager.cpp
@@ -300,6 +317,7 @@ target_include_directories(SpectraPBR PRIVATE
     ${OptiX_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${tinygltf_SOURCE_DIR}
+    ${tinyobjloader_SOURCE_DIR}
     ${stb_SOURCE_DIR}
 )
 
@@ -328,6 +346,18 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
             "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/display.frag"
+            "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/wireframe.vert"
+            "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/wireframe.frag"
+            "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hemisphere.vert"
+            "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hemisphere.frag"
             "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
     COMMENT "Copying shaders to build directory"
 )

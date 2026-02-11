@@ -22,6 +22,7 @@ namespace spectra {
 // Forward declarations
 class SceneManager;
 class MaterialManager;
+struct InspectedCellInfo;
 
 namespace ui {
 
@@ -108,7 +109,7 @@ public:
     void togglePropertyPanel();
 
     // Get property panel
-    PropertyPanel* getPropertyPanel() { return m_propertyPanel.get(); }
+    PropertyPanel* getPropertyPanel() { return m_propertyPanel; }
 
     // Set material manager for property lookups
     void setMaterialManager(MaterialManager* matMgr) { m_materialManager = matMgr; }
@@ -154,11 +155,44 @@ public:
     //--------------------------------------------------------------------------
 
     // Get the root widgets
-    Panel* getTopBar() { return m_topBar.get(); }
-    Panel* getScenePanel() { return m_scenePanel.get(); }
+    Panel* getTopBar() { return m_topBar; }
+    Panel* getScenePanel() { return m_scenePanel; }
 
     // Add a custom widget to the root level
     void addRootWidget(std::unique_ptr<Widget> widget);
+
+    //--------------------------------------------------------------------------
+    // Path Guide Grid Debug Panel
+    //--------------------------------------------------------------------------
+
+    // Add debug panel for path guide grid (bounds, sparse cells, show in viewport, level, automation)
+    void addPathGuideGridDebugPanel(
+        uint32_t numLevels, uint32_t totalCells, uint32_t entryStride,
+        uint32_t baseResolution, float perLevelScale,
+        const float boundsMin[3], const float boundsMax[3],
+        bool initialVisualize,
+        std::function<void(bool)> onVisualize,
+        std::function<void(uint32_t)> onLevel,
+        std::function<void()> onBuild,
+        std::function<void(bool)> onEnableGuiding = nullptr,
+        std::function<void()> onPause = nullptr,
+        std::function<void()> onBuildAndStep = nullptr);
+
+    void toggleGridDebugPanel();
+    bool isGridDebugPanelVisible() const;
+
+    // Update the "Sparse cells" (and related) label after a build; call with current grid stats
+    void updatePathGuideGridStats(uint32_t numLevels, uint32_t totalCells, uint32_t entryStride);
+
+    // Update automation status label
+    void updatePathGuideAutomationStatus(const char* modeStr, uint32_t framesSinceBuild, uint32_t totalBuilds);
+
+    //--------------------------------------------------------------------------
+    // Cell Inspector Panel
+    //--------------------------------------------------------------------------
+    void addCellInspectorPanel();
+    void updateCellInspectorData(const InspectedCellInfo& info);
+    void showCellInspectorPanel(bool show);
 
 private:
     void createDefaultUI();
@@ -187,11 +221,25 @@ public:
     
 private:
 
-    // Root widgets
-    std::unique_ptr<Panel> m_topBar;
-    std::unique_ptr<Panel> m_scenePanel;
-    std::unique_ptr<PropertyPanel> m_propertyPanel;
+    // All root-level widgets in draw/input order. Last element is top bar (on top).
+    // Order: scene panel, property panel, (grid debug panel), custom widgets..., top bar.
     std::vector<std::unique_ptr<Widget>> m_rootWidgets;
+    Panel* m_topBar = nullptr;
+    Panel* m_scenePanel = nullptr;
+    PropertyPanel* m_propertyPanel = nullptr;
+    Panel* m_gridDebugPanel = nullptr;
+    Label* m_pathGuideMetaLabel = nullptr;  // "Levels: N  Sparse cells: M  Stride: S" (owned by panel)
+    Label* m_pathGuideStatusLabel = nullptr;  // "Running | 45/60 frames | 3 builds"
+
+    // Cell inspector panel
+    Panel* m_cellInspectorPanel = nullptr;
+    Label* m_cellPosLabel = nullptr;
+    Label* m_cellLevelLabel = nullptr;
+    Label* m_cellAABBLabel = nullptr;
+    Label* m_cellLobe0Label = nullptr;
+    Label* m_cellLobe1Label = nullptr;
+    Label* m_cellStatsLabel = nullptr;
+    Label* m_cellStatusLabel = nullptr;
 
     // Scene hierarchy data
     SceneHierarchy* m_hierarchy = nullptr;  // Non-owning

@@ -157,6 +157,16 @@ struct GpuCameraParams {
 };
 
 //------------------------------------------------------------------------------
+// Pick Result Buffer (returned from pick mode: instance ID + world hit position)
+//------------------------------------------------------------------------------
+struct PickResultBuffer {
+    unsigned int instanceId;
+    float hitX;
+    float hitY;
+    float hitZ;
+};
+
+//------------------------------------------------------------------------------
 // Launch Parameters (passed to all OptiX programs)
 //------------------------------------------------------------------------------
 struct GpuLaunchParams {
@@ -217,10 +227,41 @@ struct GpuLaunchParams {
     unsigned int _pad_selection;
 
     // Picking mode
-    unsigned int* pick_result;      // Device buffer to store picked instance ID (1 element)
+    PickResultBuffer* pick_result;  // Device buffer for pick result (instance ID + world hit position)
     unsigned int pick_x;            // Pick pixel X coordinate
     unsigned int pick_y;            // Pick pixel Y coordinate
     unsigned int pick_mode;         // 0 = normal render, 1 = pick mode (single ray)
+
+    // Path guide grid (sparse)
+    const unsigned long long* path_guide_morton_codes;
+    float* path_guide_data;
+    const unsigned int* path_guide_level_offsets;
+    unsigned int path_guide_num_levels;
+    unsigned int path_guide_entry_stride;
+    unsigned int path_guide_base_resolution;
+    float path_guide_per_level_scale;
+    float path_guide_bounds_min[3];
+    float path_guide_bounds_max[3];
+    unsigned int* path_guide_staging_buffer;
+    unsigned int* path_guide_staging_count;
+    unsigned int path_guide_staging_capacity;
+    float* path_guide_training_buffer;
+    unsigned int* path_guide_training_count;
+    unsigned int path_guide_training_capacity;
+    unsigned int debug_grid_visualize;
+    unsigned int debug_grid_level;
+    unsigned int path_guide_no_jitter;  // When set, use center-pixel rays for deterministic staging
+    unsigned int path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
+    float path_guide_mis_weight;        // Blend factor for MIS (0.5 = balanced)
+    float path_guide_training_probability; // Stochastic subsampling rate for training (0-1)
+    // Adaptive level parameters (from config)
+    unsigned int path_guide_start_level; // Initial level for new regions
+    unsigned int path_guide_min_level;   // Coarsest allowed level
+    unsigned int path_guide_max_level;   // Finest allowed level
+
+    // Debug statistics (atomic counters, reset each frame)
+    unsigned int* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed
+    unsigned int path_guide_debug_enabled; // 1 = collect debug stats
 };
 
 //------------------------------------------------------------------------------

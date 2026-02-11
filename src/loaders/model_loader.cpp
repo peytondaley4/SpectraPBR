@@ -3,6 +3,9 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <tiny_gltf.h>
 
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+
 #include "model_loader.h"
 #include <iostream>
 #include <unordered_map>
@@ -42,12 +45,19 @@ static size_t getAccessorCount(const tinygltf::Model& model, int accessorIndex) 
 }
 
 std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+
+    // Dispatch to OBJ loader for .obj files
+    if (ext == ".obj" || ext == ".OBJ") {
+        return loadOBJ(path);
+    }
+
+    // glTF/GLB loading
     tinygltf::Model model;
     tinygltf::TinyGLTF loader;
     std::string err, warn;
 
     bool success = false;
-    std::string ext = path.extension().string();
 
     if (ext == ".glb") {
         success = loader.LoadBinaryFromFile(&model, &err, &warn, path.string());
@@ -593,6 +603,235 @@ std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) 
     }
 
     std::cout << "[ModelLoader] Loaded: " << result.name
+              << " (" << result.meshes.size() << " meshes, "
+              << result.materials.size() << " materials, "
+              << result.instances.size() << " instances)\n";
+
+    return result;
+}
+
+std::optional<LoadedModel> ModelLoader::loadOBJ(const std::filesystem::path& path) {
+    tinyobj::ObjReader reader;
+    tinyobj::ObjReaderConfig readerConfig;
+    readerConfig.mtl_search_path = path.parent_path().string();
+    readerConfig.triangulate = true;
+
+    if (!reader.ParseFromFile(path.string(), readerConfig)) {
+        if (!reader.Error().empty()) {
+            m_lastError = "tinyobjloader error: " + reader.Error();
+            std::cerr << "[ModelLoader] " << m_lastError << "\n";
+        }
+        return std::nullopt;
+    }
+
+    if (!reader.Warning().empty()) {
+        std::cout << "[ModelLoader] OBJ warning: " << reader.Warning() << "\n";
+    }
+
+    const auto& attrib = reader.GetAttrib();
+    const auto& shapes = reader.GetShapes();
+    const auto& materials = reader.GetMaterials();
+
+    LoadedModel result;
+    result.name = path.stem().string();
+
+    std::filesystem::path basePath = path.parent_path();
+
+    // Load materials from MTL
+    for (const auto& mat : materials) {
+        MaterialData matData;
+
+        // Diffuse color -> baseColor
+        matData.baseColor = make_float4(
+            mat.diffuse[0], mat.diffuse[1], mat.diffuse[2],
+            (mat.dissolve > 0.0f) ? mat.dissolve : 1.0f
+        );
+
+        // Shininess (Ns) -> roughness: roughness = sqrt(2 / (Ns + 2))
+        if (mat.shininess > 0.0f) {
+            matData.roughness = std::sqrt(2.0f / (mat.shininess + 2.0f));
+        } else {
+            matData.roughness = 1.0f;
+        }
+
+        // MTL doesn't have metallic concept
+        matData.metallic = 0.0f;
+
+        // Emissive (Ke)
+        matData.emissive = make_float3(
+            mat.emission[0], mat.emission[1], mat.emission[2]
+        );
+
+        // Diffuse texture (map_Kd)
+        // OBJ convention: when map_Kd is present, Kd is often (0,0,0) meaning
+        // "use texture as color." Set baseColor to white so the texture isn't
+        // multiplied to zero in the shader.
+        if (!mat.diffuse_texname.empty()) {
+            matData.baseColorTexPath = (basePath / mat.diffuse_texname).string();
+            matData.baseColor = make_float4(1.0f, 1.0f, 1.0f, matData.baseColor.w);
+        }
+
+        // Normal/bump map (map_Bump / bump)
+        if (!mat.bump_texname.empty()) {
+            matData.normalTexPath = (basePath / mat.bump_texname).string();
+        }
+
+        // Specular texture (map_Ks) - store as metallicRoughness for now
+        if (!mat.specular_texname.empty()) {
+            matData.metallicRoughnessTexPath = (basePath / mat.specular_texname).string();
+        }
+
+        // Alpha
+        if (mat.dissolve < 1.0f) {
+            matData.alphaMode = ALPHA_MODE_BLEND;
+        }
+
+        // IOR
+        if (mat.ior > 0.0f) {
+            matData.ior = mat.ior;
+        }
+
+        // Transmission (Tf / Tr)
+        float avgTransmittance = (mat.transmittance[0] + mat.transmittance[1] + mat.transmittance[2]) / 3.0f;
+        if (avgTransmittance > 0.0f) {
+            matData.transmission = avgTransmittance;
+        }
+
+        // OBJ format has no double-sided concept; default to double-sided
+        // so backface normals are flipped correctly in the shader
+        matData.doubleSided = true;
+
+        result.materials.push_back(matData);
+    }
+
+    // Add default material if none exist
+    if (result.materials.empty()) {
+        MaterialData defaultMat;
+        defaultMat.doubleSided = true;
+        result.materials.push_back(defaultMat);
+    }
+
+    // Process shapes - group faces by material ID to create one MeshData per material group
+    for (size_t shapeIdx = 0; shapeIdx < shapes.size(); ++shapeIdx) {
+        const auto& shape = shapes[shapeIdx];
+
+        // Pre-compute face index offsets (avoids O(n^2) recalculation)
+        std::vector<size_t> faceIndexOffsets(shape.mesh.num_face_vertices.size());
+        {
+            size_t offset = 0;
+            for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f) {
+                faceIndexOffsets[f] = offset;
+                offset += shape.mesh.num_face_vertices[f];
+            }
+        }
+
+        // Group faces by material
+        std::unordered_map<int, std::vector<size_t>> matFaces;
+        for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f) {
+            int matId = shape.mesh.material_ids[f];
+            if (matId < 0) matId = 0; // Use default material
+            matFaces[matId].push_back(f);
+        }
+
+        bool hasTexcoords = !attrib.texcoords.empty();
+
+        for (auto& [matId, faceIndices] : matFaces) {
+            MeshData meshData;
+            meshData.materialIndex = static_cast<uint32_t>(matId);
+
+            // Use a map to deduplicate vertices
+            std::unordered_map<uint64_t, uint32_t> vertexMap;
+
+            auto hashVertex = [](int vi, int ni, int ti) -> uint64_t {
+                // Pack three indices into a single 64-bit key
+                return (static_cast<uint64_t>(static_cast<unsigned int>(vi)) << 40) |
+                       (static_cast<uint64_t>(static_cast<unsigned int>(ni) & 0xFFFFF) << 20) |
+                       static_cast<uint64_t>(static_cast<unsigned int>(ti) & 0xFFFFF);
+            };
+
+            // Track whether any vertex in this mesh actually had normals
+            bool meshHasNormals = false;
+
+            for (size_t f : faceIndices) {
+                size_t indexOffset = faceIndexOffsets[f];
+
+                int fv = shape.mesh.num_face_vertices[f];
+                for (int vi = 0; vi < fv; ++vi) {
+                    tinyobj::index_t idx = shape.mesh.indices[indexOffset + vi];
+
+                    uint64_t key = hashVertex(idx.vertex_index, idx.normal_index, idx.texcoord_index);
+
+                    auto it = vertexMap.find(key);
+                    if (it != vertexMap.end()) {
+                        meshData.indices.push_back(it->second);
+                    } else {
+                        GpuVertex vertex;
+
+                        // Position
+                        vertex.position = make_float3(
+                            attrib.vertices[3 * idx.vertex_index + 0],
+                            attrib.vertices[3 * idx.vertex_index + 1],
+                            attrib.vertices[3 * idx.vertex_index + 2]
+                        );
+
+                        // Normal - only use if this specific vertex has a normal index
+                        if (idx.normal_index >= 0 && !attrib.normals.empty()) {
+                            vertex.normal = make_float3(
+                                attrib.normals[3 * idx.normal_index + 0],
+                                attrib.normals[3 * idx.normal_index + 1],
+                                attrib.normals[3 * idx.normal_index + 2]
+                            );
+                            meshHasNormals = true;
+                        } else {
+                            vertex.normal = make_float3(0.0f, 0.0f, 0.0f);
+                        }
+
+                        // Texcoord
+                        if (hasTexcoords && idx.texcoord_index >= 0) {
+                            vertex.u = attrib.texcoords[2 * idx.texcoord_index + 0];
+                            vertex.v = attrib.texcoords[2 * idx.texcoord_index + 1];
+                        } else {
+                            vertex.u = 0.0f;
+                            vertex.v = 0.0f;
+                        }
+
+                        // Tangent (will be generated later)
+                        vertex.tangent = make_float4(1.0f, 0.0f, 0.0f, 1.0f);
+
+                        uint32_t newIdx = static_cast<uint32_t>(meshData.vertices.size());
+                        meshData.vertices.push_back(vertex);
+                        meshData.indices.push_back(newIdx);
+                        vertexMap[key] = newIdx;
+                    }
+                }
+            }
+
+            if (meshData.vertices.empty()) continue;
+
+            // Generate flat normals if no vertex in this mesh group had normals
+            if (!meshHasNormals) {
+                generateFlatNormals(meshData);
+            }
+
+            // Generate tangents
+            generateTangents(meshData);
+
+            result.meshes.push_back(std::move(meshData));
+        }
+    }
+
+    // Create one instance per mesh with identity transform
+    for (size_t i = 0; i < result.meshes.size(); ++i) {
+        ModelInstance instance;
+        instance.meshIndex = static_cast<uint32_t>(i);
+        // Identity 3x4 row-major transform
+        instance.transform[0]  = 1.0f; instance.transform[1]  = 0.0f; instance.transform[2]  = 0.0f; instance.transform[3]  = 0.0f;
+        instance.transform[4]  = 0.0f; instance.transform[5]  = 1.0f; instance.transform[6]  = 0.0f; instance.transform[7]  = 0.0f;
+        instance.transform[8]  = 0.0f; instance.transform[9]  = 0.0f; instance.transform[10] = 1.0f; instance.transform[11] = 0.0f;
+        result.instances.push_back(instance);
+    }
+
+    std::cout << "[ModelLoader] Loaded OBJ: " << result.name
               << " (" << result.meshes.size() << " meshes, "
               << result.materials.size() << " materials, "
               << result.instances.size() << " instances)\n";

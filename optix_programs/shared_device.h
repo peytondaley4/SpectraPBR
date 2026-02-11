@@ -253,3 +253,15 @@ __forceinline__ __device__ float2 randomFloat2(unsigned int& seed) {
     float u2 = hashToFloat(seed);
     return make_float2(u1, u2);
 }
+
+// R2 low-discrepancy sequence (Generalized Golden Ratio, Roberts 2018).
+// Returns 2D point in [0,1)^2 with excellent coverage over N frames.
+// Much faster AA convergence than white noise for progressive rendering.
+__forceinline__ __device__ float2 r2Sequence(unsigned int n) {
+    const float g  = 1.32471795724f;  // plastic constant: real root of x^3 = x + 1
+    const float a1 = 1.0f / g;        // ~0.7549
+    const float a2 = 1.0f / (g * g);  // ~0.5699
+    float u = fmodf(0.5f + a1 * (float)n, 1.0f);
+    float v = fmodf(0.5f + a2 * (float)n, 1.0f);
+    return make_float2(u, v);
+}

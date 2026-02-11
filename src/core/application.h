@@ -11,6 +11,8 @@
 #include "texture_manager.h"
 #include "material_manager.h"
 #include "light_manager.h"
+#include "path_guide_grid.h"
+#include "wireframe_renderer.h"
 #include "environment_map.h"
 #include "text/font_atlas.h"
 #include "ui/ui_manager.h"
@@ -27,6 +29,27 @@
 
 namespace spectra {
 
+// Forward declaration (defined in hemisphere_vis.h — destructor in application.cpp)
+class HemisphereVis;
+
+//------------------------------------------------------------------------------
+// Inspected Cell Info (populated on click-to-inspect)
+//------------------------------------------------------------------------------
+struct InspectedCellInfo {
+    bool valid = false;
+    float worldPos[3] = {};
+    uint32_t level = 0;
+    uint32_t ix = 0, iy = 0, iz = 0;
+    float cellAABBMin[3] = {}, cellAABBMax[3] = {};
+    // vMF lobes
+    float theta0 = 0, phi0 = 0, kappa0 = 0;
+    float theta1 = 0, phi1 = 0, kappa1 = 0;
+    // Stats
+    float sumW = 0, variance = 0, lastFrame = 0;
+    float pi0 = 0;  // mixture weight for lobe 0
+    bool wouldSubdivide = false, wouldCoarsen = false;
+};
+
 struct AppConfig {
     std::filesystem::path modelPath;
     std::filesystem::path hdrPath;
@@ -37,7 +60,7 @@ struct AppConfig {
 
 class Application {
 public:
-    Application() = default;
+    Application();
     ~Application();
 
     // Parse command line and configure
@@ -66,6 +89,9 @@ private:
 
     // Utility
     static bool cameraChanged(const CameraParams& a, const CameraParams& b);
+
+    // Reset path guide training (call on scene changes: lights, env map, materials)
+    void resetPathGuideTraining();
 
     // Input handling
     void processInput();
@@ -99,6 +125,7 @@ private:
     std::unique_ptr<MaterialManager> m_materialManager;
     std::unique_ptr<SceneManager> m_sceneManager;
     std::unique_ptr<LightManager> m_lightManager;
+    std::unique_ptr<PathGuideGrid> m_pathGuideGrid;
     std::unique_ptr<EnvironmentMap> m_environmentMap;
     std::unique_ptr<SceneHierarchy> m_sceneHierarchy;
 
@@ -135,6 +162,31 @@ private:
     int m_writeIdx = 0;
     int m_displayIdx = 0;
     int m_framesPipelined = 0;
+
+    // Path guide grid debug & automation
+    bool m_debugGridVisualize = false;
+    uint32_t m_debugGridLevel = 0;
+    std::unique_ptr<WireframeRenderer> m_wireframeRenderer;
+
+    // Path guide automation state machine
+    enum class PathGuideMode : uint32_t {
+        Disabled,   // No training, no guiding
+        Running,    // Training accumulates, auto-build every N frames
+        Paused,     // Render continues, training frozen, grid frozen
+        StepOnce    // One build then -> Paused
+    };
+    PathGuideMode m_pathGuideMode = PathGuideMode::Disabled;
+    uint32_t m_pathGuideTrainingFrameCount = 0;
+    uint32_t m_pathGuideAutoBuildInterval = 8;  // Rebuild every N frames (Müller et al. recommend frequent rebuilds)
+    uint32_t m_pathGuideTotalBuilds = 0;
+    bool m_buildThisFrame = false;
+    uint32_t m_pathGuideStatsFrame = 0;      // Frame counter for stats printing
+
+    // Cell inspector state (populated on click)
+    InspectedCellInfo m_inspectedCell;
+
+    // Hemisphere visualization
+    std::unique_ptr<HemisphereVis> m_hemisphereVis;
 
     // Static instance for callbacks
     static Application* s_instance;

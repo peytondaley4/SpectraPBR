@@ -95,6 +95,23 @@ void PropertyPanel::createWidgets() {
     m_sizeYSlider->setParent(this);
     m_sizeYSlider->setOnValueChanged([this](Slider*, float) { updateLightFromSliders(); });
 
+    // Direction sliders (directional lights - azimuth/elevation of sun position)
+    m_dirAzimuthSlider = std::make_unique<Slider>();
+    m_dirAzimuthSlider->setLabel("Azimuth");
+    m_dirAzimuthSlider->setLabelWidth(70.0f);
+    m_dirAzimuthSlider->setRange(0.0f, 360.0f);
+    m_dirAzimuthSlider->setValueFormat("%.0f");
+    m_dirAzimuthSlider->setParent(this);
+    m_dirAzimuthSlider->setOnValueChanged([this](Slider*, float) { updateLightFromSliders(); });
+
+    m_dirElevationSlider = std::make_unique<Slider>();
+    m_dirElevationSlider->setLabel("Elevation");
+    m_dirElevationSlider->setLabelWidth(70.0f);
+    m_dirElevationSlider->setRange(5.0f, 90.0f);
+    m_dirElevationSlider->setValueFormat("%.0f");
+    m_dirElevationSlider->setParent(this);
+    m_dirElevationSlider->setOnValueChanged([this](Slider*, float) { updateLightFromSliders(); });
+
     // Material editing widgets
     m_baseColorPicker = std::make_unique<ColorPicker>();
     m_baseColorPicker->setShowPreview(true);
@@ -203,6 +220,24 @@ void PropertyPanel::showLightProperties(const LightInfo& info) {
     if (m_sizeXSlider) { m_sizeXSlider->setValue(info.size.x); m_sizeXSlider->setVisible(info.type == SceneNodeType::AreaLight); }
     if (m_sizeYSlider) { m_sizeYSlider->setValue(info.size.y); m_sizeYSlider->setVisible(info.type == SceneNodeType::AreaLight); }
 
+    // Direction sliders (directional lights) - convert direction to azimuth/elevation
+    bool isDirectional = (info.type == SceneNodeType::DirectionalLight);
+    if (m_dirAzimuthSlider && m_dirElevationSlider) {
+        if (isDirectional) {
+            // Sun position = -direction (direction points FROM sun TO scene)
+            float sx = -info.direction.x;
+            float sy = -info.direction.y;
+            float sz = -info.direction.z;
+            float elevation = std::asin(std::clamp(sy, -1.0f, 1.0f)) * (180.0f / 3.14159265f);
+            float azimuth = std::atan2(sz, sx) * (180.0f / 3.14159265f);
+            if (azimuth < 0.0f) azimuth += 360.0f;
+            m_dirAzimuthSlider->setValue(azimuth);
+            m_dirElevationSlider->setValue(elevation);
+        }
+        m_dirAzimuthSlider->setVisible(isDirectional);
+        m_dirElevationSlider->setVisible(isDirectional);
+    }
+
     // Hide material widgets
     if (m_baseColorPicker) m_baseColorPicker->setVisible(false);
     if (m_metallicSlider) m_metallicSlider->setVisible(false);
@@ -226,9 +261,22 @@ void PropertyPanel::updateLightFromSliders() {
     m_lightInfo.intensity = m_intensitySlider->getValue();
     m_lightInfo.color = make_float3(normalizedColor.x * m_lightInfo.intensity, normalizedColor.y * m_lightInfo.intensity, normalizedColor.z * m_lightInfo.intensity);
 
-    if (m_lightInfo.type == SceneNodeType::PointLight) m_lightInfo.radius = m_radiusSlider->getValue();
-    else if (m_lightInfo.type == SceneNodeType::DirectionalLight) m_lightInfo.angularDiameter = m_angularDiameterSlider->getValue();
-    else if (m_lightInfo.type == SceneNodeType::AreaLight) m_lightInfo.size = make_float2(m_sizeXSlider->getValue(), m_sizeYSlider->getValue());
+    if (m_lightInfo.type == SceneNodeType::PointLight) {
+        m_lightInfo.radius = m_radiusSlider->getValue();
+    } else if (m_lightInfo.type == SceneNodeType::DirectionalLight) {
+        m_lightInfo.angularDiameter = m_angularDiameterSlider->getValue();
+        // Convert azimuth/elevation (sun position) back to direction (toward scene)
+        float azimRad = m_dirAzimuthSlider->getValue() * (3.14159265f / 180.0f);
+        float elevRad = m_dirElevationSlider->getValue() * (3.14159265f / 180.0f);
+        float cosElev = std::cos(elevRad);
+        m_lightInfo.direction = make_float3(
+            -cosElev * std::cos(azimRad),
+            -std::sin(elevRad),
+            -cosElev * std::sin(azimRad)
+        );
+    } else if (m_lightInfo.type == SceneNodeType::AreaLight) {
+        m_lightInfo.size = make_float2(m_sizeXSlider->getValue(), m_sizeYSlider->getValue());
+    }
 
     if (m_onLightEdit) m_onLightEdit(m_lightInfo.type, m_lightInfo.index, m_lightInfo);
     markDirty();
@@ -282,6 +330,7 @@ void PropertyPanel::updatePanelAndTheme() {
             m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
             m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
             m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
+            m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
             m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
             m_emissivePicker.get(), m_emissiveIntensitySlider.get()
         };
@@ -637,6 +686,11 @@ void PropertyPanel::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLay
         if (m_lightInfo.type == SceneNodeType::PointLight) {
             addWidget(m_radiusSlider.get(), ROW_HEIGHT, outQuads, textLayout);
         } else if (m_lightInfo.type == SceneNodeType::DirectionalLight) {
+            drawLabel(outQuads, textLayout, "Direction", theme, depth);
+            addWidget(m_dirAzimuthSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+            addSpacing(2.0f);
+            addWidget(m_dirElevationSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+            addSpacing(SECTION_SPACING);
             addWidget(m_angularDiameterSlider.get(), ROW_HEIGHT, outQuads, textLayout);
         } else if (m_lightInfo.type == SceneNodeType::AreaLight) {
             drawLabel(outQuads, textLayout, "Size", theme, depth);
@@ -716,6 +770,7 @@ bool PropertyPanel::onMouseDown(float2 pos, int button) {
         m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
         m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
         m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
+        m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
         m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
         m_emissivePicker.get(), m_emissiveIntensitySlider.get()
     };
@@ -754,6 +809,7 @@ bool PropertyPanel::onMouseUp(float2 pos, int button) {
         m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
         m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
         m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
+        m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
         m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
         m_emissivePicker.get(), m_emissiveIntensitySlider.get()
     };
@@ -799,6 +855,7 @@ bool PropertyPanel::onMouseMove(float2 pos) {
         m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
         m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
         m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
+        m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
         m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
         m_emissivePicker.get(), m_emissiveIntensitySlider.get()
     };

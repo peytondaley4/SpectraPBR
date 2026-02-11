@@ -25,6 +25,7 @@ extern "C" __global__ void __raygen__simple() {
 
         float jitterX, jitterY;
         if (params.pick_mode) {
+            // No jitter: use pixel center for picking
             jitterX = 0.0f;
             jitterY = 0.0f;
         } else if (spp > 1) {
@@ -34,8 +35,15 @@ extern "C" __global__ void __raygen__simple() {
             jitterX = (stratumX + randomFloat(seed)) * cellSize - 0.5f;
             jitterY = (stratumY + randomFloat(seed)) * cellSize - 0.5f;
         } else {
-            jitterX = randomFloat(seed) - 0.5f;
-            jitterY = randomFloat(seed) - 0.5f;
+            // R2 low-discrepancy jitter for fast progressive AA convergence.
+            // Cranley-Patterson rotation: R2 base + per-pixel random offset
+            // so neighbouring pixels don't share the same sequence phase.
+            unsigned int pixelHash = wangHash(pixelX * 0x9e3779b9u + pixelY);
+            float offsetX = hashToFloat(pixelHash);
+            float offsetY = hashToFloat(wangHash(pixelHash));
+            float2 r2 = r2Sequence(params.frame_index);
+            jitterX = fmodf(r2.x + offsetX, 1.0f) - 0.5f;
+            jitterY = fmodf(r2.y + offsetY, 1.0f) - 0.5f;
         }
 
         const float u = (static_cast<float>(pixelX) + 0.5f + jitterX) / static_cast<float>(params.width);
@@ -86,7 +94,12 @@ extern "C" __global__ void __raygen__simple() {
     }
 
     if (params.pick_mode && params.pick_result != nullptr) {
-        *params.pick_result = lastInstanceId;
+        params.pick_result->instanceId = lastInstanceId;
+        // accumulatedColor already holds the hit position from closesthit's
+        // setPayloadColor(hitPos) — only 1 sample was traced before break
+        params.pick_result->hitX = accumulatedColor.x;
+        params.pick_result->hitY = accumulatedColor.y;
+        params.pick_result->hitZ = accumulatedColor.z;
         return;
     }
 

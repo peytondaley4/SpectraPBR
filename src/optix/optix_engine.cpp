@@ -1,4 +1,5 @@
 #include "optix_engine.h"
+#include "path_guide_grid.h"
 #include <optix_stubs.h>
 #include <optix_function_table_definition.h>
 #include <fstream>
@@ -99,13 +100,49 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.pick_x = 0;
     m_launchParams.pick_y = 0;
 
-    // Allocate pick result buffer (single uint32_t)
-    err = cudaMalloc(reinterpret_cast<void**>(&m_pickBuffer), sizeof(uint32_t));
+    // Path guide grid (sparse + staging, cleared until set)
+    m_launchParams.path_guide_morton_codes = nullptr;
+    m_launchParams.path_guide_data = nullptr;
+    m_launchParams.path_guide_level_offsets = nullptr;
+    m_launchParams.path_guide_num_levels = 0;
+    m_launchParams.path_guide_entry_stride = 0;
+    m_launchParams.path_guide_base_resolution = 0;
+    m_launchParams.path_guide_per_level_scale = 1.0f;
+    m_launchParams.path_guide_bounds_min[0] = m_launchParams.path_guide_bounds_min[1] = m_launchParams.path_guide_bounds_min[2] = 0.0f;
+    m_launchParams.path_guide_bounds_max[0] = m_launchParams.path_guide_bounds_max[1] = m_launchParams.path_guide_bounds_max[2] = 0.0f;
+    m_launchParams.path_guide_staging_buffer = nullptr;
+    m_launchParams.path_guide_staging_count = nullptr;
+    m_launchParams.path_guide_staging_capacity = 0;
+    m_launchParams.path_guide_training_buffer = nullptr;
+    m_launchParams.path_guide_training_count = nullptr;
+    m_launchParams.path_guide_training_capacity = 0;
+    m_launchParams.debug_grid_visualize = 0;
+    m_launchParams.debug_grid_level = 0;
+    m_launchParams.path_guide_no_jitter = 0;
+    m_launchParams.path_guide_enabled = 0;     // Disabled by default
+    m_launchParams.path_guide_mis_weight = 0.5f;  // Balanced MIS
+    // Adaptive level parameters (defaults, updated when grid is set)
+    m_launchParams.path_guide_start_level = 2;
+    m_launchParams.path_guide_min_level = 1;
+    m_launchParams.path_guide_max_level = 6;
+
+    // Allocate pick result buffer (PickResultBuffer: instanceId + hitX/Y/Z)
+    err = cudaMalloc(reinterpret_cast<void**>(&m_pickBuffer), sizeof(PickResultBuffer));
     if (err != cudaSuccess) {
         std::cerr << "[OptiX] Failed to allocate pick buffer: " << cudaGetErrorString(err) << "\n";
         return false;
     }
-    m_launchParams.pick_result = reinterpret_cast<uint32_t*>(m_pickBuffer);
+    m_launchParams.pick_result = reinterpret_cast<PickResultBuffer*>(m_pickBuffer);
+
+    // Allocate path guide debug stats buffer (6 counters)
+    err = cudaMalloc(reinterpret_cast<void**>(&m_pathGuideDebugStats), 6 * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to allocate path guide debug stats: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    cudaMemset(m_pathGuideDebugStats, 0, 6 * sizeof(uint32_t));
+    m_launchParams.path_guide_debug_stats = m_pathGuideDebugStats;
+    m_launchParams.path_guide_debug_enabled = 0;  // Disabled by default
 
     return true;
 }
@@ -151,7 +188,7 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
 
     // Link pipeline
     OptixPipelineLinkOptions linkOptions = {};
-    linkOptions.maxTraceDepth = 2;  // Primary ray + shadow ray
+    linkOptions.maxTraceDepth = 3;  // Primary ray + indirect bounce + shadow ray
 
     OptixProgramGroup programGroups[] = { 
         m_raygenPG, m_missPG, m_missShadowPG, 
@@ -569,6 +606,10 @@ void OptixEngine::shutdown() {
         cudaFree(reinterpret_cast<void*>(m_pickBuffer));
         m_pickBuffer = 0;
     }
+    if (m_pathGuideDebugStats) {
+        cudaFree(m_pathGuideDebugStats);
+        m_pathGuideDebugStats = nullptr;
+    }
     if (m_launchParamsBuffer) {
         cudaFree(reinterpret_cast<void*>(m_launchParamsBuffer));
         m_launchParamsBuffer = 0;
@@ -760,14 +801,131 @@ uint32_t OptixEngine::getAccumulatedFrames() const {
     return m_launchParams.accumulated_frames;
 }
 
+void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
+    const PathGuideStagingDescriptor* staging,
+    const PathGuideTrainingStagingDescriptor* training) {
+    auto zeroBounds = [this]() {
+        m_launchParams.path_guide_bounds_min[0] = m_launchParams.path_guide_bounds_min[1] = m_launchParams.path_guide_bounds_min[2] = 0.0f;
+        m_launchParams.path_guide_bounds_max[0] = m_launchParams.path_guide_bounds_max[1] = m_launchParams.path_guide_bounds_max[2] = 0.0f;
+    };
+    if (!sparse) {
+        m_launchParams.path_guide_morton_codes = nullptr;
+        m_launchParams.path_guide_data = nullptr;
+        m_launchParams.path_guide_level_offsets = nullptr;
+        m_launchParams.path_guide_num_levels = 0;
+        m_launchParams.path_guide_entry_stride = 0;
+        m_launchParams.path_guide_base_resolution = 0;
+        m_launchParams.path_guide_per_level_scale = 1.0f;
+        zeroBounds();
+    } else {
+        m_launchParams.path_guide_morton_codes = sparse->morton_codes;
+        m_launchParams.path_guide_data = sparse->data;
+        m_launchParams.path_guide_level_offsets = sparse->level_offsets;
+        m_launchParams.path_guide_num_levels = sparse->num_levels;
+        m_launchParams.path_guide_entry_stride = sparse->entry_stride;
+        m_launchParams.path_guide_base_resolution = sparse->base_resolution;
+        m_launchParams.path_guide_per_level_scale = sparse->per_level_scale;
+        m_launchParams.path_guide_bounds_min[0] = sparse->bounds_min[0];
+        m_launchParams.path_guide_bounds_min[1] = sparse->bounds_min[1];
+        m_launchParams.path_guide_bounds_min[2] = sparse->bounds_min[2];
+        m_launchParams.path_guide_bounds_max[0] = sparse->bounds_max[0];
+        m_launchParams.path_guide_bounds_max[1] = sparse->bounds_max[1];
+        m_launchParams.path_guide_bounds_max[2] = sparse->bounds_max[2];
+    }
+    if (!staging) {
+        m_launchParams.path_guide_staging_buffer = nullptr;
+        m_launchParams.path_guide_staging_count = nullptr;
+        m_launchParams.path_guide_staging_capacity = 0;
+    } else {
+        m_launchParams.path_guide_staging_buffer = staging->buffer;
+        m_launchParams.path_guide_staging_count = staging->count;
+        m_launchParams.path_guide_staging_capacity = staging->capacity;
+    }
+    if (!training) {
+        m_launchParams.path_guide_training_buffer = nullptr;
+        m_launchParams.path_guide_training_count = nullptr;
+        m_launchParams.path_guide_training_capacity = 0;
+    } else {
+        m_launchParams.path_guide_training_buffer = training->buffer;
+        m_launchParams.path_guide_training_count = training->count;
+        m_launchParams.path_guide_training_capacity = training->capacity;
+    }
+}
+
+void OptixEngine::setPathGuideGridDebug(bool visualize, uint32_t level) {
+    m_launchParams.debug_grid_visualize = visualize ? 1u : 0u;
+    m_launchParams.debug_grid_level = level;
+}
+
+void OptixEngine::setPathGuideNoJitter(bool noJitter) {
+    m_launchParams.path_guide_no_jitter = noJitter ? 1u : 0u;
+}
+
+void OptixEngine::setPathGuideEnabled(bool enabled) {
+    m_launchParams.path_guide_enabled = enabled ? 1u : 0u;
+}
+
+void OptixEngine::setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel) {
+    m_launchParams.path_guide_start_level = startLevel;
+    m_launchParams.path_guide_min_level = minLevel;
+    m_launchParams.path_guide_max_level = maxLevel;
+}
+
+void OptixEngine::setPathGuideMISWeight(float weight) {
+    m_launchParams.path_guide_mis_weight = weight;
+}
+
+void OptixEngine::setPathGuideTrainingProbability(float prob) {
+    m_launchParams.path_guide_training_probability = prob;
+}
+
+void OptixEngine::setPathGuideDebugEnabled(bool enabled) {
+    m_launchParams.path_guide_debug_enabled = enabled ? 1u : 0u;
+}
+
+void OptixEngine::resetPathGuideStats(cudaStream_t stream) {
+    if (m_pathGuideDebugStats) {
+        if (stream) {
+            cudaMemsetAsync(m_pathGuideDebugStats, 0, 6 * sizeof(uint32_t), stream);
+        } else {
+            cudaMemset(m_pathGuideDebugStats, 0, 6 * sizeof(uint32_t));
+        }
+    }
+}
+
+OptixEngine::PathGuideStats OptixEngine::readPathGuideStats() {
+    PathGuideStats stats = {};
+    if (m_pathGuideDebugStats) {
+        uint32_t data[6] = {0};
+        cudaMemcpy(data, m_pathGuideDebugStats, 6 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        stats.attempts = data[0];
+        stats.cellFound = data[1];
+        stats.validLobe = data[2];
+        stats.belowHorizon = data[3];
+        stats.contributed = data[4];
+        stats.bsdfSampled = data[5];
+    }
+    return stats;
+}
+
 uint32_t OptixEngine::pickInstance(uint32_t screenX, uint32_t screenY, cudaStream_t stream) {
+    PickResultBuffer result = pickInstanceAndPosition(screenX, screenY, stream);
+    return result.instanceId;
+}
+
+PickResultBuffer OptixEngine::pickInstanceAndPosition(uint32_t screenX, uint32_t screenY, cudaStream_t stream) {
+    PickResultBuffer noHitResult = {};
+    noHitResult.instanceId = UINT32_MAX;
+    noHitResult.hitX = 0.0f;
+    noHitResult.hitY = 0.0f;
+    noHitResult.hitZ = 0.0f;
+
     if (!m_pipeline || !m_pickBuffer || screenX >= m_width || screenY >= m_height) {
-        return UINT32_MAX;
+        return noHitResult;
     }
 
     // Initialize pick result to "no hit"
-    uint32_t noHit = UINT32_MAX;
-    cudaMemcpyAsync(reinterpret_cast<void*>(m_pickBuffer), &noHit, sizeof(uint32_t),
+    cudaMemcpyAsync(reinterpret_cast<void*>(m_pickBuffer), &noHitResult, sizeof(PickResultBuffer),
                     cudaMemcpyHostToDevice, stream);
 
     // Set up pick mode
@@ -781,21 +939,26 @@ uint32_t OptixEngine::pickInstance(uint32_t screenX, uint32_t screenY, cudaStrea
                     cudaMemcpyHostToDevice, stream);
 
     // Launch with 1x1 dimensions (single ray)
-    OPTIX_CHECK(optixLaunch(
+    OptixResult launchResult = optixLaunch(
         m_pipeline,
         stream,
         m_launchParamsBuffer,
         sizeof(LaunchParams),
         &m_sbt,
         1, 1, 1  // Single pixel launch
-    ));
+    );
 
     // Restore normal mode
     m_launchParams.pick_mode = 0;
 
-    // Read back result
-    uint32_t result;
-    cudaMemcpyAsync(&result, reinterpret_cast<void*>(m_pickBuffer), sizeof(uint32_t),
+    if (launchResult != OPTIX_SUCCESS) {
+        std::cerr << "[OptiX] Pick launch failed: " << optixGetErrorName(launchResult) << "\n";
+        return noHitResult;
+    }
+
+    // Read back full result
+    PickResultBuffer result;
+    cudaMemcpyAsync(&result, reinterpret_cast<void*>(m_pickBuffer), sizeof(PickResultBuffer),
                     cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 

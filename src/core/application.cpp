@@ -1,11 +1,17 @@
 #include "application.h"
+#include "hemisphere_vis.h"
 #include "model_loader.h"
 #include <glm/glm.hpp>
+#include <algorithm>
 #include <iostream>
+#include <cstring>
+#include <cmath>
 
 namespace spectra {
 
 Application* Application::s_instance = nullptr;
+
+Application::Application() = default;
 
 Application::~Application() {
     shutdown();
@@ -62,6 +68,108 @@ bool Application::init() {
     cudaMalloc(reinterpret_cast<void**>(&m_accumulationBuffer), bufferSize);
     cudaMemset(m_accumulationBuffer, 0, bufferSize);
     m_optixEngine->setAccumulationBuffer(m_accumulationBuffer);
+
+    // Sparse multi-res path guide grid (collision-free)
+    m_pathGuideGrid = std::make_unique<PathGuideGrid>();
+    PathGuideGridConfig gridConfig;
+    gridConfig.num_levels = 8;
+    gridConfig.base_resolution = 16;
+    gridConfig.per_level_scale = 2.0f;
+    gridConfig.entry_stride = PATH_GUIDE_ENTRY_STRIDE_DEFAULT;
+    if (!m_pathGuideGrid->init(gridConfig)) {
+        std::cerr << "[App] Path guide grid init failed (non-fatal)\n";
+        m_pathGuideGrid.reset();
+    }
+
+    // Initialize wireframe renderer for grid debug visualization
+    m_wireframeRenderer = std::make_unique<WireframeRenderer>();
+    if (!m_wireframeRenderer->init(m_shaderDir)) {
+        std::cerr << "[App] Wireframe renderer init failed (non-fatal)\n";
+        m_wireframeRenderer.reset();
+    }
+    // Always add the debug panel when we have UI (so G key shows it); use grid data if initialized
+    if (m_uiManager) {
+        uint32_t numLevels = 8;
+        uint32_t totalCells = 0;
+        uint32_t entryStride = PATH_GUIDE_ENTRY_STRIDE_DEFAULT;
+        uint32_t baseResolution = 16;
+        float perLevelScale = 2.0f;
+        float boundsMin[3] = { -10.0f, -10.0f, -10.0f };
+        float boundsMax[3] = {  10.0f,  10.0f,  10.0f };
+        if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+            SparsePathGuideDescriptor d = m_pathGuideGrid->getDescriptor();
+            numLevels = d.num_levels;
+            totalCells = m_pathGuideGrid->getTotalCells();
+            entryStride = d.entry_stride;
+            baseResolution = d.base_resolution;
+            perLevelScale = d.per_level_scale;
+            boundsMin[0] = d.bounds_min[0]; boundsMin[1] = d.bounds_min[1]; boundsMin[2] = d.bounds_min[2];
+            boundsMax[0] = d.bounds_max[0]; boundsMax[1] = d.bounds_max[1]; boundsMax[2] = d.bounds_max[2];
+        }
+        m_uiManager->addPathGuideGridDebugPanel(
+            numLevels, totalCells, entryStride,
+            baseResolution, perLevelScale,
+            boundsMin, boundsMax,
+            m_debugGridVisualize,
+            [this](bool v) { m_debugGridVisualize = v; },
+            [this](uint32_t l) {
+                m_debugGridLevel = l;
+                if (m_wireframeRenderer && m_wireframeRenderer->isInitialized() &&
+                    m_pathGuideGrid && m_pathGuideGrid->hasSparseData()) {
+                    auto vertices = m_pathGuideGrid->generateEdgeVertices(l);
+                    m_wireframeRenderer->updateVertices(vertices);
+                }
+            },
+            nullptr,  // No manual build button (auto-build handles it)
+            [this](bool enabled) {
+                // "Enable Guiding" toggle -> Running / Disabled
+                if (m_optixEngine) {
+                    if (enabled) {
+                        m_pathGuideMode = PathGuideMode::Running;
+                        m_pathGuideTrainingFrameCount = 0;
+                        m_optixEngine->setPathGuideEnabled(true);
+                        m_optixEngine->setPathGuideDebugEnabled(true);
+                    } else {
+                        m_pathGuideMode = PathGuideMode::Disabled;
+                        m_optixEngine->setPathGuideEnabled(false);
+                        m_optixEngine->setPathGuideDebugEnabled(false);
+                    }
+                    // Lighting model changed — reset accumulation to avoid blending
+                    // guided and non-guided frames
+                    m_optixEngine->resetAccumulation();
+                }
+            },
+            [this]() {
+                // "Pause" callback
+                if (m_pathGuideMode == PathGuideMode::Running) {
+                    m_pathGuideMode = PathGuideMode::Paused;
+                    // Mode change reflected in UI status panel
+                }
+            },
+            [this]() {
+                // "Build & Step" callback
+                if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+                    m_pathGuideMode = PathGuideMode::StepOnce;
+                    if (m_optixEngine) {
+                        m_optixEngine->setPathGuideEnabled(true);
+                        m_optixEngine->setPathGuideDebugEnabled(true);
+                    }
+                    // Mode change reflected in UI status panel
+                }
+            });
+    }
+
+    // Cell inspector panel
+    if (m_uiManager) {
+        m_uiManager->addCellInspectorPanel();
+    }
+
+    // Hemisphere visualization
+    m_hemisphereVis = std::make_unique<HemisphereVis>();
+    if (!m_hemisphereVis->init(m_shaderDir)) {
+        std::cerr << "[App] Hemisphere vis init failed (non-fatal)\n";
+        m_hemisphereVis.reset();
+    }
 
     m_prevCameraParams = m_camera->getCameraParams();
     m_running = true;
@@ -182,36 +290,125 @@ bool Application::loadScene() {
 
     // Load model if specified
     if (!m_config.modelPath.empty() && std::filesystem::exists(m_config.modelPath)) {
+        std::vector<std::filesystem::path> filesToLoad;
+
+        if (std::filesystem::is_directory(m_config.modelPath)) {
+            // Directory mode: scan for all .obj files
+            std::cout << "[App] Scanning directory for OBJ files: " << m_config.modelPath << "\n";
+            for (const auto& entry : std::filesystem::directory_iterator(m_config.modelPath)) {
+                if (!entry.is_regular_file()) continue;
+                std::string ext = entry.path().extension().string();
+                if (ext == ".obj" || ext == ".OBJ") {
+                    filesToLoad.push_back(entry.path());
+                }
+            }
+            std::sort(filesToLoad.begin(), filesToLoad.end());
+            std::cout << "[App] Found " << filesToLoad.size() << " OBJ files\n";
+        } else {
+            filesToLoad.push_back(m_config.modelPath);
+        }
+
         ModelLoader loader;
-        auto model = loader.load(m_config.modelPath);
-        if (model) {
+        uint32_t globalInstanceId = 0;
+        bool anyLoaded = false;
+
+        // Track scene bounding box for camera auto-fit
+        glm::vec3 sceneMin(std::numeric_limits<float>::max());
+        glm::vec3 sceneMax(std::numeric_limits<float>::lowest());
+
+        for (const auto& filePath : filesToLoad) {
+            auto model = loader.load(filePath);
+            if (!model) continue;
+
             std::cout << "[App] Loaded model: " << model->name << "\n";
+
+            // Track material index offset for this model
+            uint32_t materialOffset = static_cast<uint32_t>(m_materialManager->getMaterialCount());
 
             for (const auto& matData : model->materials) {
                 m_materialManager->addMaterial(matData);
             }
 
+            // Accumulate bounding box from all mesh vertices
+            for (const auto& mesh : model->meshes) {
+                for (const auto& vert : mesh.vertices) {
+                    sceneMin.x = std::min(sceneMin.x, vert.position.x);
+                    sceneMin.y = std::min(sceneMin.y, vert.position.y);
+                    sceneMin.z = std::min(sceneMin.z, vert.position.z);
+                    sceneMax.x = std::max(sceneMax.x, vert.position.x);
+                    sceneMax.y = std::max(sceneMax.y, vert.position.y);
+                    sceneMax.z = std::max(sceneMax.z, vert.position.z);
+                }
+            }
+
             uint32_t modelNodeIdx = m_sceneHierarchy->addModel(model->name);
-            uint32_t instanceId = 0;
 
             for (const auto& instance : model->instances) {
                 if (instance.meshIndex < model->meshes.size()) {
-                    const MeshData& mesh = model->meshes[instance.meshIndex];
+                    // Adjust material index to account for previously loaded materials
+                    MeshData mesh = model->meshes[instance.meshIndex];
+                    mesh.materialIndex += materialOffset;
+
                     uint32_t gasIndex = m_sceneManager->addMesh(mesh);
                     if (gasIndex != UINT32_MAX) {
                         m_sceneManager->addInstance(gasIndex, instance.transform);
-                        std::string name = "Instance " + std::to_string(instanceId);
-                        m_sceneHierarchy->addInstance(modelNodeIdx, instance.meshIndex, instanceId, name);
-                        instanceId++;
+                        std::string name = "Instance " + std::to_string(globalInstanceId);
+                        m_sceneHierarchy->addInstance(modelNodeIdx, instance.meshIndex, globalInstanceId, name);
+                        globalInstanceId++;
                     }
                 }
             }
 
-            if (m_sceneManager->buildIAS()) {
-                m_sceneManager->updateSBT();
-                m_optixEngine->setSceneHandle(m_sceneManager->getSceneHandle());
-                m_optixEngine->setGeometryBuffers(m_sceneManager->getVertexBuffers(),
-                                                   m_sceneManager->getIndexBuffers());
+            anyLoaded = true;
+        }
+
+        if (anyLoaded && m_sceneManager->buildIAS()) {
+            m_sceneManager->updateSBT();
+            m_optixEngine->setSceneHandle(m_sceneManager->getSceneHandle());
+            m_optixEngine->setGeometryBuffers(m_sceneManager->getVertexBuffers(),
+                                               m_sceneManager->getIndexBuffers());
+
+            // Auto-fit camera to scene bounding box
+            glm::vec3 center = (sceneMin + sceneMax) * 0.5f;
+            glm::vec3 extent = sceneMax - sceneMin;
+            float maxExtent = std::max({extent.x, extent.y, extent.z});
+
+            if (maxExtent > 0.0f) {
+                // Pull back along +Z from center so camera looks into the scene
+                float halfFovRad = glm::radians(m_camera->getFOV() * 0.5f);
+                float distance = (maxExtent * 0.5f) / std::tan(halfFovRad) * 1.2f;
+
+                // Find the thinnest axis — for a Cornell Box that's typically the
+                // depth axis (the open face). Place the camera on the side of the
+                // thinnest extent so it looks *into* the box.
+                glm::vec3 camPos = center;
+                float yaw = -90.0f; // default: looking along -Z
+
+                if (extent.x <= extent.y && extent.x <= extent.z) {
+                    // Thinnest along X — place camera on +X looking -X
+                    camPos.x = sceneMax.x + distance * 0.3f;
+                    yaw = 180.0f;
+                } else if (extent.z <= extent.x && extent.z <= extent.y) {
+                    // Thinnest along Z — place camera on +Z looking -Z
+                    camPos.z = sceneMax.z + distance * 0.3f;
+                    yaw = -90.0f;
+                } else {
+                    // Thinnest along Y (unusual) — fall back to +Z
+                    camPos.z = sceneMax.z + distance * 0.3f;
+                    yaw = -90.0f;
+                }
+
+                m_camera->setPosition(camPos);
+                m_camera->setYawPitch(yaw, 0.0f);
+
+                // Scale move speed to scene size
+                m_camera->setMoveSpeed(maxExtent * 0.5f);
+
+                std::cout << "[App] Scene bounds: ("
+                          << sceneMin.x << ", " << sceneMin.y << ", " << sceneMin.z << ") -> ("
+                          << sceneMax.x << ", " << sceneMax.y << ", " << sceneMax.z << ")\n";
+                std::cout << "[App] Camera auto-fit to: ("
+                          << camPos.x << ", " << camPos.y << ", " << camPos.z << ")\n";
             }
         }
     }
@@ -290,6 +487,7 @@ void Application::wireUICallbacks() {
         }
         m_lightManager->syncToGpu(m_optixEngine.get(), m_cudaInterop->getStream());
         m_optixEngine->resetAccumulation();
+        resetPathGuideTraining();
     });
 
     m_uiManager->setLightInfoRequestCallback([this](SceneNodeType type, uint32_t index) -> ui::LightInfo {
@@ -378,6 +576,7 @@ void Application::setupCallbacks() {
         m_optixEngine->setAccumulationBuffer(m_accumulationBuffer);
         m_optixEngine->resetAccumulation();
         m_optixEngine->setDimensions(width, height);
+        resetPathGuideTraining();
 
         m_camera->setAspectRatio(static_cast<float>(width) / static_cast<float>(height));
         m_uiManager->setScreenSize(width, height);
@@ -405,6 +604,12 @@ void Application::run() {
         if (cameraChanged(currentParams, m_prevCameraParams)) {
             m_optixEngine->resetAccumulation();
             m_prevCameraParams = currentParams;
+
+            // Reset training accumulation on camera move (fresh samples for new view)
+            if (m_pathGuideMode == PathGuideMode::Running && m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+                m_pathGuideTrainingFrameCount = 0;
+                m_pathGuideGrid->resetTrainingCount(m_cudaInterop ? m_cudaInterop->getStream() : nullptr);
+            }
         }
         m_optixEngine->setCamera(currentParams);
 
@@ -421,6 +626,16 @@ void Application::run() {
     }
 }
 
+void Application::resetPathGuideTraining() {
+    if (!m_pathGuideGrid || !m_pathGuideGrid->isInitialized()) return;
+    if (m_pathGuideMode == PathGuideMode::Disabled) return;
+
+    cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+    m_pathGuideGrid->resetTrainingCount(stream);
+    m_pathGuideGrid->clear(stream);  // Zero vMF lobes + stats (structure preserved)
+    m_pathGuideTrainingFrameCount = 0;
+}
+
 bool Application::cameraChanged(const CameraParams& a, const CameraParams& b) {
     return a.position.x != b.position.x || a.position.y != b.position.y || a.position.z != b.position.z ||
            a.forward.x != b.forward.x || a.forward.y != b.forward.y || a.forward.z != b.forward.z ||
@@ -430,13 +645,143 @@ bool Application::cameraChanged(const CameraParams& a, const CameraParams& b) {
 void Application::renderFrame() {
     m_displayIdx = (m_writeIdx + 1) % 3;
 
+    // Path guide automation: determine if we build this frame
+    m_buildThisFrame = false;
+    uint32_t savedSpp = 0;
+    if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+
+        // Always reset staging (for wireframe vis)
+        m_pathGuideGrid->resetStagingCount(stream);
+
+        // Only reset training when paused/disabled or right after a build.
+        // When Running/StepOnce, training accumulates across the build interval.
+        if (m_pathGuideMode == PathGuideMode::Paused || m_pathGuideMode == PathGuideMode::Disabled) {
+            m_pathGuideGrid->resetTrainingCount(stream);
+        }
+
+        // Determine if we should build this frame
+        if (m_pathGuideMode == PathGuideMode::Running &&
+            m_pathGuideTrainingFrameCount >= m_pathGuideAutoBuildInterval) {
+            m_buildThisFrame = true;
+        } else if (m_pathGuideMode == PathGuideMode::StepOnce) {
+            m_buildThisFrame = true;
+        }
+
+        SparsePathGuideDescriptor sparseDesc = m_pathGuideGrid->getDescriptor();
+        PathGuideStagingDescriptor stagingDesc = m_pathGuideGrid->getStagingDescriptor();
+        PathGuideTrainingStagingDescriptor trainingDesc = m_pathGuideGrid->getTrainingStagingDescriptor();
+        m_optixEngine->setPathGuideGridDescriptor(&sparseDesc, &stagingDesc, &trainingDesc);
+        m_optixEngine->setPathGuideGridDebug(m_debugGridVisualize, m_debugGridLevel);
+        const auto& config = m_pathGuideGrid->getConfig();
+        m_optixEngine->setPathGuideLevelConfig(config.start_level, config.min_level, config.max_level);
+
+        // Compute stochastic training probability to stay within buffer capacity
+        // across the multi-frame accumulation window (Müller et al. 2017 §4.1).
+        // Set to 0 when disabled/paused to avoid wasted GPU atomics and buffer writes.
+        float trainingProb = 0.0f;
+        if (m_pathGuideMode == PathGuideMode::Running || m_pathGuideMode == PathGuideMode::StepOnce) {
+            float estimatedSamplesPerFrame = static_cast<float>(m_config.width) * static_cast<float>(m_config.height);
+            float totalEstimated = estimatedSamplesPerFrame * static_cast<float>(m_pathGuideAutoBuildInterval);
+            float trainingCapacity = static_cast<float>(trainingDesc.capacity);
+            trainingProb = (totalEstimated > 0.0f) ? fminf(1.0f, trainingCapacity / totalEstimated) : 1.0f;
+        }
+        m_optixEngine->setPathGuideTrainingProbability(trainingProb);
+
+        // Keep jitter enabled on build frames — staging uses world-space hit
+        // positions, so sub-pixel jitter doesn't affect cell occupancy and
+        // disabling it injects aliased frames into the accumulation buffer.
+        m_optixEngine->setPathGuideNoJitter(false);
+        if (m_buildThisFrame) {
+            savedSpp = m_optixEngine->getSamplesPerPixel();
+            m_optixEngine->setSamplesPerPixel(1);
+        }
+
+        // Increment training frame counter when actively training
+        if (m_pathGuideMode == PathGuideMode::Running || m_pathGuideMode == PathGuideMode::StepOnce) {
+            m_pathGuideTrainingFrameCount++;
+        }
+    } else {
+        m_optixEngine->setPathGuideGridDescriptor(nullptr, nullptr, nullptr);
+    }
+
     // Render scene
     float4* devicePtr = reinterpret_cast<float4*>(m_cudaInterop->mapBuffer(m_writeIdx));
     if (!devicePtr) return;
 
     m_optixEngine->render(devicePtr, m_cudaInterop->getStream());
+
+    // Restore SPP if we changed it for the build
+    if (savedSpp > 0) {
+        m_optixEngine->setSamplesPerPixel(savedSpp);
+    }
+
     m_cudaInterop->recordRenderComplete(m_writeIdx);
     m_cudaInterop->unmapBuffer(m_writeIdx);
+
+    // Build from staging after this frame's trace has written to it
+    if (m_buildThisFrame && m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+        if (stream)
+            cudaStreamSynchronize(stream);
+        uint32_t currentFrame = m_optixEngine ? m_optixEngine->getFrameIndex() : 0;
+        if (m_pathGuideGrid->buildFromStaging(stream, currentFrame)) {
+            m_pathGuideTotalBuilds++;
+            m_pathGuideTrainingFrameCount = 0;
+
+            if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
+                auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
+                m_wireframeRenderer->updateVertices(vertices);
+            }
+            if (m_uiManager) {
+                auto d = m_pathGuideGrid->getDescriptor();
+                m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
+            }
+
+            // Run adaptive refinement every 5 builds
+            if (m_pathGuideTotalBuilds > 0 && m_pathGuideTotalBuilds % 5 == 0) {
+                if (m_pathGuideGrid->runRefinementPass(currentFrame, stream)) {
+                    if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
+                        auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
+                        m_wireframeRenderer->updateVertices(vertices);
+                    }
+                    if (m_uiManager) {
+                        auto d = m_pathGuideGrid->getDescriptor();
+                        m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
+                    }
+                }
+            }
+        }
+
+        // If StepOnce, transition to Paused after build
+        if (m_pathGuideMode == PathGuideMode::StepOnce) {
+            m_pathGuideMode = PathGuideMode::Paused;
+        }
+
+        // Reset training buffer for next accumulation window
+        m_pathGuideGrid->resetTrainingCount(stream);
+    }
+
+    // Update UI status and optionally print stats when running
+    if (m_pathGuideMode != PathGuideMode::Disabled && m_optixEngine) {
+        m_pathGuideStatsFrame++;
+        if (m_pathGuideStatsFrame >= 60) {
+            m_pathGuideStatsFrame = 0;
+            m_optixEngine->resetPathGuideStats(m_cudaInterop ? m_cudaInterop->getStream() : nullptr);
+
+            // Update automation status in UI
+            if (m_uiManager) {
+                const char* modeStr = "Disabled";
+                switch (m_pathGuideMode) {
+                    case PathGuideMode::Running:  modeStr = "Running"; break;
+                    case PathGuideMode::Paused:   modeStr = "Paused"; break;
+                    case PathGuideMode::StepOnce: modeStr = "StepOnce"; break;
+                    default: break;
+                }
+                m_uiManager->updatePathGuideAutomationStatus(modeStr, m_pathGuideTrainingFrameCount, m_pathGuideTotalBuilds);
+            }
+        }
+    }
 
     if (m_framesPipelined >= 2) {
         if (!m_cudaInterop->isRenderComplete(m_displayIdx)) {
@@ -485,6 +830,35 @@ void Application::renderFrame() {
         m_glContext->renderFullscreenQuad((m_writeIdx + 2) % 3);
     }
 
+    // Render grid wireframe overlay (same viewport and view/proj as scene)
+    // Use a much smaller near plane for the wireframe so geometry very close to the
+    // camera (e.g. within a few feet) is not clipped away.
+    if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized() &&
+        m_wireframeRenderer->getVertexCount() > 0) {
+        uint32_t w = m_glContext->getWidth();
+        uint32_t h = m_glContext->getHeight();
+        glViewport(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+        glm::mat4 view = m_camera->getViewMatrix();
+        const float wireframeNear = 0.0001f;
+        glm::mat4 proj = glm::perspective(
+            glm::radians(m_camera->getFOV()),
+            m_camera->getAspectRatio(),
+            wireframeNear,
+            m_camera->getFarPlane());
+        glm::mat4 viewProj = proj * view;
+        m_wireframeRenderer->render(viewProj, glm::vec3(0.2f, 0.8f, 1.0f));
+    }
+
+    // Hemisphere visualization inset (bottom-right corner)
+    if (m_hemisphereVis && m_inspectedCell.valid) {
+        uint32_t w = m_glContext->getWidth();
+        uint32_t h = m_glContext->getHeight();
+        float insetSize = 160.0f;
+        float insetX = static_cast<float>(w) - insetSize - 10.0f;
+        float insetY = static_cast<float>(h) - insetSize - 10.0f;
+        m_hemisphereVis->render(insetX, insetY, insetSize, w, h);
+    }
+
     m_glContext->swapBuffers();
 }
 
@@ -503,6 +877,7 @@ void Application::shutdown() {
     m_running = false;
     s_instance = nullptr;
 
+    if (m_hemisphereVis) m_hemisphereVis->shutdown();
     if (m_inputHandler) m_inputHandler->shutdown();
     if (m_uiRenderer) m_uiRenderer->shutdown();
     if (m_uiManager) m_uiManager->shutdown();
@@ -530,6 +905,7 @@ void Application::printControls() {
     std::cout << "  [ ]      - Decrease/Increase SPP\n";
     std::cout << "  H        - Toggle hierarchy panel\n";
     std::cout << "  P        - Toggle property panel\n";
+    std::cout << "  G        - Toggle grid debug panel\n";
     std::cout << "\n";
 }
 
@@ -649,6 +1025,9 @@ void Application::keyCallback(GLFWwindow* window, int key, int scancode, int act
         case GLFW_KEY_P:
             app->m_uiManager->togglePropertyPanel();
             break;
+        case GLFW_KEY_G:
+            app->m_uiManager->toggleGridDebugPanel();
+            break;
         case GLFW_KEY_L:
             if (!(mods & GLFW_MOD_CONTROL)) {
                 app->m_uiManager->toggleTheme();
@@ -712,11 +1091,75 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
     }
 
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !app->m_mouseCaptured) {
-        uint32_t picked = app->m_optixEngine->pickInstance(
+        PickResultBuffer pickResult = app->m_optixEngine->pickInstanceAndPosition(
             static_cast<uint32_t>(xpos), static_cast<uint32_t>(ypos));
-        app->m_uiManager->setSelectedInstanceId(picked);
-        app->m_optixEngine->setSelectedInstanceId(picked);
+        app->m_uiManager->setSelectedInstanceId(pickResult.instanceId);
+        app->m_optixEngine->setSelectedInstanceId(pickResult.instanceId);
         app->m_optixEngine->resetAccumulation();
+
+        // Cell inspector: look up grid cell at hit position
+        if (pickResult.instanceId != UINT32_MAX && app->m_pathGuideGrid &&
+            app->m_pathGuideGrid->hasSparseData()) {
+            const auto& cfg = app->m_pathGuideGrid->getConfig();
+            std::cout << "[CellInspect] Hit pos: (" << pickResult.hitX << ", "
+                      << pickResult.hitY << ", " << pickResult.hitZ
+                      << ") Bounds: [" << cfg.bounds_min[0] << ".." << cfg.bounds_max[0]
+                      << ", " << cfg.bounds_min[1] << ".." << cfg.bounds_max[1]
+                      << ", " << cfg.bounds_min[2] << ".." << cfg.bounds_max[2]
+                      << "] Cells: " << app->m_pathGuideGrid->getTotalCells() << "\n";
+            auto cellResult = app->m_pathGuideGrid->inspectCellAtPosition(
+                pickResult.hitX, pickResult.hitY, pickResult.hitZ);
+
+            InspectedCellInfo info = {};
+            info.worldPos[0] = pickResult.hitX;
+            info.worldPos[1] = pickResult.hitY;
+            info.worldPos[2] = pickResult.hitZ;
+
+            if (cellResult.found) {
+                info.valid = true;
+                info.level = cellResult.level;
+                info.ix = cellResult.ix;
+                info.iy = cellResult.iy;
+                info.iz = cellResult.iz;
+                std::memcpy(info.cellAABBMin, cellResult.aabbMin, sizeof(float) * 3);
+                std::memcpy(info.cellAABBMax, cellResult.aabbMax, sizeof(float) * 3);
+                // vMF lobes
+                info.theta0 = cellResult.data[0];
+                info.phi0 = cellResult.data[1];
+                info.kappa0 = cellResult.data[2];
+                info.theta1 = cellResult.data[3];
+                info.phi1 = cellResult.data[4];
+                info.kappa1 = cellResult.data[5];
+                // Stats (offsets 6-11)
+                info.sumW = cellResult.data[9];
+                float sumX = cellResult.data[6], sumY = cellResult.data[7], sumZ = cellResult.data[8];
+                float meanLen = (info.sumW > 1e-9f)
+                    ? std::sqrt(sumX*sumX + sumY*sumY + sumZ*sumZ) / info.sumW
+                    : 0.0f;
+                info.variance = 1.0f - meanLen;
+                info.pi0 = cellResult.data[10];
+                info.lastFrame = cellResult.data[11];
+
+                // Determine subdivision/coarsening status
+                const auto& config = app->m_pathGuideGrid->getConfig();
+                info.wouldSubdivide = (cellResult.level < config.max_level &&
+                    info.sumW >= config.subdivide_sample_threshold &&
+                    info.variance > config.subdivide_variance_threshold);
+                info.wouldCoarsen = (cellResult.level > config.min_level &&
+                    app->m_optixEngine->getFrameIndex() > static_cast<uint32_t>(info.lastFrame) + config.coarsen_frames_threshold);
+            }
+
+            app->m_inspectedCell = info;
+            app->m_uiManager->updateCellInspectorData(info);
+
+            // Update hemisphere vis if available
+            if (app->m_hemisphereVis && info.valid) {
+                app->m_hemisphereVis->update(
+                    info.theta0, info.phi0, info.kappa0,
+                    info.theta1, info.phi1, info.kappa1,
+                    info.pi0);
+            }
+        }
     }
 
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {

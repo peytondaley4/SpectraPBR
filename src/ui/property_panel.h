@@ -205,6 +205,8 @@ private:
     std::unique_ptr<Slider> m_angularDiameterSlider;
     std::unique_ptr<Slider> m_sizeXSlider;
     std::unique_ptr<Slider> m_sizeYSlider;
+    std::unique_ptr<Slider> m_dirAzimuthSlider;
+    std::unique_ptr<Slider> m_dirElevationSlider;
 
     // Material editing sliders
     std::unique_ptr<ColorPicker> m_baseColorPicker;

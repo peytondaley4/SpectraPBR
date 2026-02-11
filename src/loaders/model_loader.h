@@ -27,6 +27,9 @@ public:
 private:
     std::string m_lastError;
 
+    // Load OBJ/MTL file
+    std::optional<LoadedModel> loadOBJ(const std::filesystem::path& path);
+
     // Helper to generate flat normals if missing
     void generateFlatNormals(MeshData& mesh);
 

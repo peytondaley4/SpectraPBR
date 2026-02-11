@@ -37,8 +37,8 @@ extern "C" __global__ void __miss__background() {
         color = sbtData->backgroundColor;
     }
     else {
-        // Default: Black background
-        color = make_float3(0.05f, 0.05f, 0.05f);
+        // Default: True black (no phantom illumination)
+        color = make_float3(0.0f, 0.0f, 0.0f);
     }
 
     // Set payload

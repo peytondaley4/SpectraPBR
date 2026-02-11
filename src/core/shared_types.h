@@ -149,6 +149,16 @@ struct CameraParams {
 };
 
 //------------------------------------------------------------------------------
+// Pick Result Buffer (returned from pick mode: instance ID + world hit position)
+//------------------------------------------------------------------------------
+struct PickResultBuffer {
+    uint32_t instanceId;
+    float hitX;
+    float hitY;
+    float hitZ;
+};
+
+//------------------------------------------------------------------------------
 // Launch Parameters (passed to all OptiX programs)
 //------------------------------------------------------------------------------
 struct LaunchParams {
@@ -209,10 +219,42 @@ struct LaunchParams {
     uint32_t _pad_selection;
 
     // Picking mode
-    uint32_t* pick_result;      // Device buffer to store picked instance ID (1 element)
+    PickResultBuffer* pick_result;  // Device buffer for pick result (instance ID + world hit position)
     uint32_t pick_x;            // Pick pixel X coordinate
     uint32_t pick_y;            // Pick pixel Y coordinate
     uint32_t pick_mode;         // 0 = normal render, 1 = pick mode (single ray)
+
+    // Path guide grid (sparse, collision-free)
+    const uint64_t* path_guide_morton_codes;   // Sorted per level (null = no grid)
+    float* path_guide_data;
+    const uint32_t* path_guide_level_offsets;  // num_levels+1
+    uint32_t path_guide_num_levels;
+    uint32_t path_guide_entry_stride;
+    uint32_t path_guide_base_resolution;
+    float path_guide_per_level_scale;
+    float path_guide_bounds_min[3];
+    float path_guide_bounds_max[3];
+    // Staging for occupancy collection (closest-hit appends)
+    uint32_t* path_guide_staging_buffer;
+    uint32_t* path_guide_staging_count;   // Atomic
+    uint32_t path_guide_staging_capacity;
+    float* path_guide_training_buffer;    // 8 floats per entry: (level,ix,iy,iz, dir_x,dir_y,dir_z, weight)
+    uint32_t* path_guide_training_count;
+    uint32_t path_guide_training_capacity;
+    uint32_t debug_grid_visualize;  // 0 = off, 1 = show grid in viewport
+    uint32_t debug_grid_level;      // Level to visualize (0 .. num_levels-1)
+    uint32_t path_guide_no_jitter;  // When set, use center-pixel rays for deterministic staging
+    uint32_t path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
+    float path_guide_mis_weight;    // Blend factor for MIS (0.5 = balanced)
+    float path_guide_training_probability; // Stochastic subsampling rate for training (0-1)
+    // Adaptive level parameters (from config)
+    uint32_t path_guide_start_level; // Initial level for new regions
+    uint32_t path_guide_min_level;   // Coarsest allowed level
+    uint32_t path_guide_max_level;   // Finest allowed level
+
+    // Debug statistics (atomic counters, reset each frame)
+    uint32_t* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed
+    uint32_t path_guide_debug_enabled; // 1 = collect debug stats
 };
 
 //------------------------------------------------------------------------------

@@ -56,7 +56,8 @@ struct PathGuideGridConfig {
     uint32_t entry_stride = PATH_GUIDE_ENTRY_STRIDE_DEFAULT;
     float bounds_min[3] = { -10.0f, -10.0f, -10.0f };
     float bounds_max[3] = {  10.0f,  10.0f,  10.0f };
-    uint32_t staging_capacity = 1u << 22;  // 4M entries - enough for 4K single-level staging
+    uint32_t staging_capacity = 1u << 19;  // 512K entries for cell seeding (no debug staging)
+    uint32_t training_capacity = 1u << 19; // 512K training entries (~18 MB vs 144 MB at 4M)
 
     // Adaptive refinement settings
     uint32_t start_level = 2;              // Initial coarse level for new regions
@@ -65,7 +66,7 @@ struct PathGuideGridConfig {
     uint32_t refine_interval_frames = 30;  // Run refinement every N frames
     float subdivide_sample_threshold = 50.0f;    // Min sumW (luminance-weighted) before considering subdivision
     float subdivide_variance_threshold = 0.08f;  // Directional variance (1 - R̄) threshold for subdivision
-    uint32_t coarsen_frames_threshold = 120;     // Frames without hits before coarsening
+    uint32_t coarsen_frames_threshold = 480;    // Frames without hits before coarsening (high to let grid settle)
 };
 
 //------------------------------------------------------------------------------
@@ -177,6 +178,7 @@ private:
     uint32_t* m_levelOffsetsDevice = nullptr;  // num_levels+1 on device
     std::vector<uint32_t> m_levelOffsets;      // host copy
     std::vector<uint64_t> m_mortonCodesHost;   // host copy for edge generation
+    std::vector<float> m_dataHost;             // host copy to avoid D2H readback on rebuild
     uint32_t m_numLevels = 0;
     uint32_t m_entryStride = 0;
     uint32_t m_totalCells = 0;
@@ -189,6 +191,10 @@ private:
     float* m_trainingBuffer = nullptr;
     uint32_t* m_trainingCount = nullptr;
     uint32_t m_trainingCapacity = 0;
+
+    // Precomputed level resolutions: avoids std::pow in hot loops
+    static constexpr uint32_t MAX_LEVELS = 16;
+    uint32_t m_levelResolutions[MAX_LEVELS] = {};  // floor(base_res * scale^level)
 };
 
 } // namespace spectra

@@ -14,7 +14,12 @@
       "WebFetch(domain:jannovak.info)",
       "WebFetch(domain:tom94.net)",
       "WebFetch(domain:www.lalber.org)",
-      "WebFetch(domain:weschang.com)"
+      "WebFetch(domain:weschang.com)",
+      "Bash(dir:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(del \"C:\\\\Users\\\\Peyton Daley\\\\dev\\\\SpectraPBR\\\\build\\\\optix_programs\\\\closesthit.ptx\")",
+      "Bash(del \"C:\\\\Users\\\\Peyton Daley\\\\dev\\\\SpectraPBR\\\\build\\\\optix_programs\\\\raygen.ptx\")",
+      "Bash(del \"C:\\\\Users\\\\Peyton Daley\\\\dev\\\\SpectraPBR\\\\build\\\\optix_programs\\\\miss.ptx\")"
     ]
   }
 }

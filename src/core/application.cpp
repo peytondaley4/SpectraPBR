@@ -469,7 +469,10 @@ void Application::wireUICallbacks() {
     m_uiManager->setSelectionCallback([this](uint32_t instanceId) {
         m_selectionManager->setSelectedInstanceId(instanceId);
         m_optixEngine->setSelectedInstanceId(instanceId);
-        m_optixEngine->resetAccumulation();
+        // Only reset accumulation when guiding is off — avoid disrupting converged image
+        if (m_pathGuideMode != PathGuideMode::Running && m_pathGuideMode != PathGuideMode::Paused) {
+            m_optixEngine->resetAccumulation();
+        }
     });
 
     m_uiManager->setOnLightEdit([this](SceneNodeType type, uint32_t index, const ui::LightInfo& info) {
@@ -831,8 +834,7 @@ void Application::renderFrame() {
     }
 
     // Render grid wireframe overlay (same viewport and view/proj as scene)
-    // Use a much smaller near plane for the wireframe so geometry very close to the
-    // camera (e.g. within a few feet) is not clipped away.
+    // Drawn AFTER scene but BEFORE UI overlay so it doesn't obscure panels
     if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized() &&
         m_wireframeRenderer->getVertexCount() > 0) {
         uint32_t w = m_glContext->getWidth();
@@ -858,6 +860,9 @@ void Application::renderFrame() {
         float insetY = static_cast<float>(h) - insetSize - 10.0f;
         m_hemisphereVis->render(insetX, insetY, insetSize, w, h);
     }
+
+    // UI overlay drawn last so it's on top of wireframe and other overlays
+    m_glContext->renderUIOverlay();
 
     m_glContext->swapBuffers();
 }
@@ -1093,9 +1098,16 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !app->m_mouseCaptured) {
         PickResultBuffer pickResult = app->m_optixEngine->pickInstanceAndPosition(
             static_cast<uint32_t>(xpos), static_cast<uint32_t>(ypos));
-        app->m_uiManager->setSelectedInstanceId(pickResult.instanceId);
-        app->m_optixEngine->setSelectedInstanceId(pickResult.instanceId);
-        app->m_optixEngine->resetAccumulation();
+
+        // Only update selection highlight and reset accumulation when guiding is off.
+        // When guiding is active, clicks inspect cells without disrupting the scene.
+        bool guidingActive = (app->m_pathGuideMode == PathGuideMode::Running ||
+                              app->m_pathGuideMode == PathGuideMode::Paused);
+        if (!guidingActive) {
+            app->m_uiManager->setSelectedInstanceId(pickResult.instanceId);
+            app->m_optixEngine->setSelectedInstanceId(pickResult.instanceId);
+            app->m_optixEngine->resetAccumulation();
+        }
 
         // Cell inspector: look up grid cell at hit position
         if (pickResult.instanceId != UINT32_MAX && app->m_pathGuideGrid &&

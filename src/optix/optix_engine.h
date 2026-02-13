@@ -175,10 +175,13 @@ private:
     OptixProgramGroup m_raygenPG = nullptr;
     OptixProgramGroup m_missPG = nullptr;           // Radiance miss (background)
     OptixProgramGroup m_missShadowPG = nullptr;     // Shadow miss (visibility)
+    OptixProgramGroup m_missBouncePG = nullptr;     // Indirect bounce miss (background)
     OptixProgramGroup m_hitgroupPG = nullptr;       // Radiance hit (opaque)
     OptixProgramGroup m_hitgroupShadowPG = nullptr; // Shadow hit (opaque)
+    OptixProgramGroup m_hitgroupBouncePG = nullptr; // Indirect bounce hit (opaque, lightweight)
     OptixProgramGroup m_hitgroupAlphaPG = nullptr;  // Radiance hit (alpha tested)
     OptixProgramGroup m_hitgroupShadowAlphaPG = nullptr; // Shadow hit (alpha tested)
+    OptixProgramGroup m_hitgroupBounceAlphaPG = nullptr; // Indirect bounce hit (alpha tested)
 
     // Shader Binding Table
     OptixShaderBindingTable m_sbt = {};

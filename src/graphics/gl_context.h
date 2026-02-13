@@ -75,6 +75,9 @@ public:
     // Render fullscreen quad using specific display buffer index (triple buffering)
     void renderFullscreenQuad(int displayBufferIndex);
 
+    // Render UI overlay separately (call after wireframe/other overlays)
+    void renderUIOverlay();
+
     // Enable/disable UI compositing
     void setUIEnabled(bool enabled) { m_uiEnabled = enabled; }
     bool isUIEnabled() const { return m_uiEnabled; }

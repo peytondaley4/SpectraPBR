@@ -238,18 +238,36 @@ void GLContext::renderFullscreenQuad(int displayBufferIndex) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, m_displayTextures[displayBufferIndex]);
 
-    // Bind UI texture and set enabled flag
+    // Scene-only pass (uUIEnabled=0) — UI composited separately via renderUIOverlay()
+    // so that wireframe and other overlays can draw between scene and UI
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, m_uiTexture);
-    glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), m_uiEnabled ? 1 : 0);
+    glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), 0);
     glUniform1f(m_exposureLoc, m_exposure);
 
-    // Enable blending for UI compositing
+    glBindVertexArray(m_emptyVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 3);  // Fullscreen triangle
+    glBindVertexArray(0);
+
+    glUseProgram(0);
+}
+
+void GLContext::renderUIOverlay() {
+    if (!m_uiEnabled) return;
+
+    glUseProgram(m_displayProgram);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_displayTextures[0]);  // Unused but bound for shader
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_uiTexture);
+    glUniform1i(glGetUniformLocation(m_displayProgram, "uUIEnabled"), 2);  // UI-only mode
+
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glBindVertexArray(m_emptyVAO);
-    glDrawArrays(GL_TRIANGLES, 0, 3);  // Fullscreen triangle
+    glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
 
     glDisable(GL_BLEND);

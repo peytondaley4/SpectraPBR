@@ -273,9 +273,9 @@ bool SceneManager::buildIAS() {
         memcpy(oi.transform, inst.transform, sizeof(oi.transform));
 
         oi.instanceId = inst.instanceId;
-        // SBT layout: [gas0_radiance, gas0_shadow, gas1_radiance, gas1_shadow, ...]
-        // So offset = gasIndex * 2 (RAY_TYPE_COUNT)
-        oi.sbtOffset = inst.gasIndex * 2;
+        // SBT layout: [gas0_radiance, gas0_shadow, gas0_indirect, gas1_radiance, gas1_shadow, gas1_indirect, ...]
+        // So offset = gasIndex * RAY_TYPE_COUNT
+        oi.sbtOffset = inst.gasIndex * RAY_TYPE_COUNT;
         oi.visibilityMask = 0xFF;
         oi.flags = OPTIX_INSTANCE_FLAG_NONE;
         oi.traversableHandle = gas.handle;

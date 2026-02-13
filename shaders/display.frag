@@ -37,8 +37,11 @@ void main() {
     // Gamma encode (linear -> sRGB)
     vec3 srgb = linearToSrgb(mapped);
 
-    // If UI is enabled, composite UI on top (UI is already in sRGB/display space)
-    if (uUIEnabled != 0) {
+    // uUIEnabled: 0 = scene only, 1 = scene + UI composite, 2 = UI overlay only
+    if (uUIEnabled == 2) {
+        // UI-only pass: output UI texture with alpha for blending
+        fragColor = texture(uUITexture, vTexCoord);
+    } else if (uUIEnabled == 1) {
         vec4 ui = texture(uUITexture, vTexCoord);
 
         // Alpha blend: result = ui * ui.a + scene * (1 - ui.a)

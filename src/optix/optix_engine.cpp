@@ -2,6 +2,11 @@
 #include "path_guide_grid.h"
 #include <optix_stubs.h>
 #include <optix_function_table_definition.h>
+#ifdef _WIN32
+#undef min
+#undef max
+#endif
+#include <optix_stack_size.h>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -190,10 +195,10 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
     OptixPipelineLinkOptions linkOptions = {};
     linkOptions.maxTraceDepth = 3;  // Primary ray + indirect bounce + shadow ray
 
-    OptixProgramGroup programGroups[] = { 
-        m_raygenPG, m_missPG, m_missShadowPG, 
-        m_hitgroupPG, m_hitgroupShadowPG,
-        m_hitgroupAlphaPG, m_hitgroupShadowAlphaPG
+    OptixProgramGroup programGroups[] = {
+        m_raygenPG, m_missPG, m_missShadowPG, m_missBouncePG,
+        m_hitgroupPG, m_hitgroupShadowPG, m_hitgroupBouncePG,
+        m_hitgroupAlphaPG, m_hitgroupShadowAlphaPG, m_hitgroupBounceAlphaPG
     };
 
     char log[2048];
@@ -212,14 +217,38 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
 
     std::cout << "[OptiX] Pipeline created\n";
 
-    // Set stack sizes
-    OPTIX_CHECK(optixPipelineSetStackSize(
-        m_pipeline,
-        2 * 1024,   // Direct callable stack size
-        2 * 1024,   // Continuation stack size
-        2 * 1024,   // Continuation stack size from traversal
-        2           // Max traversable depth
-    ));
+    // Compute proper stack sizes from actual program requirements
+    {
+        OptixStackSizes stackSizes = {};
+        for (auto pg : programGroups) {
+            OPTIX_CHECK(optixUtilAccumulateStackSizes(pg, &stackSizes, m_pipeline));
+        }
+
+        uint32_t directCallableStackSizeFromTraversal = 0;
+        uint32_t directCallableStackSizeFromState = 0;
+        uint32_t continuationStackSize = 0;
+        OPTIX_CHECK(optixUtilComputeStackSizes(
+            &stackSizes,
+            linkOptions.maxTraceDepth,        // maxTraceDepth
+            0,                                // maxCCDepth (no continuation callables)
+            0,                                // maxDCDepth (no direct callables)
+            &directCallableStackSizeFromTraversal,
+            &directCallableStackSizeFromState,
+            &continuationStackSize
+        ));
+
+        std::cout << "[OptiX] Computed stack sizes: DC_traversal=" << directCallableStackSizeFromTraversal
+                  << " DC_state=" << directCallableStackSizeFromState
+                  << " continuation=" << continuationStackSize << "\n";
+
+        OPTIX_CHECK(optixPipelineSetStackSize(
+            m_pipeline,
+            directCallableStackSizeFromTraversal,
+            directCallableStackSizeFromState,
+            continuationStackSize,
+            2  // Max traversable depth (single-level instancing)
+        ));
+    }
 
     // Create default SBT (will be updated with materials later)
     if (!createDefaultSBT()) {
@@ -331,6 +360,23 @@ bool OptixEngine::createProgramGroups() {
         &m_missShadowPG
     ));
 
+    // Miss program group (indirect bounce - same as radiance background)
+    OptixProgramGroupDesc missIndirectDesc = {};
+    missIndirectDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    missIndirectDesc.miss.module = m_missModule;
+    missIndirectDesc.miss.entryFunctionName = "__miss__background";
+
+    logSize = sizeof(log);
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(
+        m_context,
+        &missIndirectDesc,
+        1,
+        &pgOptions,
+        log,
+        &logSize,
+        &m_missBouncePG
+    ));
+
     // Hit group program group (radiance - closesthit)
     OptixProgramGroupDesc hitgroupDesc = {};
     hitgroupDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
@@ -371,6 +417,27 @@ bool OptixEngine::createProgramGroups() {
         log,
         &logSize,
         &m_hitgroupShadowPG
+    ));
+
+    // Hit group program group (indirect bounce - lightweight closesthit, opaque)
+    OptixProgramGroupDesc hitgroupBounceDesc = {};
+    hitgroupBounceDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitgroupBounceDesc.hitgroup.moduleCH = m_closesthitModule;
+    hitgroupBounceDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance_bounce";
+    hitgroupBounceDesc.hitgroup.moduleAH = nullptr;
+    hitgroupBounceDesc.hitgroup.entryFunctionNameAH = nullptr;
+    hitgroupBounceDesc.hitgroup.moduleIS = nullptr;
+    hitgroupBounceDesc.hitgroup.entryFunctionNameIS = nullptr;
+
+    logSize = sizeof(log);
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(
+        m_context,
+        &hitgroupBounceDesc,
+        1,
+        &pgOptions,
+        log,
+        &logSize,
+        &m_hitgroupBouncePG
     ));
 
     // Hit group program group (radiance - closesthit + anyhit for alpha testing)
@@ -415,7 +482,28 @@ bool OptixEngine::createProgramGroups() {
         &m_hitgroupShadowAlphaPG
     ));
 
-    std::cout << "[OptiX] Program groups created (radiance + shadow + alpha)\n";
+    // Hit group program group (indirect bounce + anyhit for alpha testing)
+    OptixProgramGroupDesc hitgroupBounceAlphaDesc = {};
+    hitgroupBounceAlphaDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hitgroupBounceAlphaDesc.hitgroup.moduleCH = m_closesthitModule;
+    hitgroupBounceAlphaDesc.hitgroup.entryFunctionNameCH = "__closesthit__radiance_bounce";
+    hitgroupBounceAlphaDesc.hitgroup.moduleAH = m_anyhitModule;
+    hitgroupBounceAlphaDesc.hitgroup.entryFunctionNameAH = "__anyhit__alpha";
+    hitgroupBounceAlphaDesc.hitgroup.moduleIS = nullptr;
+    hitgroupBounceAlphaDesc.hitgroup.entryFunctionNameIS = nullptr;
+
+    logSize = sizeof(log);
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(
+        m_context,
+        &hitgroupBounceAlphaDesc,
+        1,
+        &pgOptions,
+        log,
+        &logSize,
+        &m_hitgroupBounceAlphaPG
+    ));
+
+    std::cout << "[OptiX] Program groups created (radiance + shadow + bounce + alpha)\n";
 
     return true;
 }
@@ -437,7 +525,7 @@ bool OptixEngine::createDefaultSBT() {
         return false;
     }
 
-    // Miss records: [0] = radiance (background), [1] = shadow (visibility)
+    // Miss records: [0] = radiance (background), [1] = shadow (visibility), [2] = indirect bounce (background)
     MissRecord missRecords[RAY_TYPE_COUNT];
 
     // Radiance miss - background (black)
@@ -447,6 +535,10 @@ bool OptixEngine::createDefaultSBT() {
     // Shadow miss - visibility
     OPTIX_CHECK(optixSbtRecordPackHeader(m_missShadowPG, &missRecords[RAY_TYPE_SHADOW]));
     missRecords[RAY_TYPE_SHADOW].backgroundColor = make_float3(0.0f, 0.0f, 0.0f);  // Not used
+
+    // Indirect bounce miss - background (same as radiance)
+    OPTIX_CHECK(optixSbtRecordPackHeader(m_missBouncePG, &missRecords[RAY_TYPE_INDIRECT]));
+    missRecords[RAY_TYPE_INDIRECT].backgroundColor = make_float3(0.0f, 0.0f, 0.0f);
 
     err = cudaMalloc(reinterpret_cast<void**>(&m_missRecord), sizeof(MissRecord) * RAY_TYPE_COUNT);
     if (err != cudaSuccess) {
@@ -460,8 +552,8 @@ bool OptixEngine::createDefaultSBT() {
         return false;
     }
 
-    // Create default hitgroup records for both ray types
-    // Layout: [radiance_0, shadow_0] per material
+    // Create default hitgroup records for all ray types
+    // Layout: [radiance_0, shadow_0, indirect_0] per material
     HitGroupRecord hitgroupRecords[RAY_TYPE_COUNT];
 
     // Default material (gray diffuse)
@@ -508,6 +600,11 @@ bool OptixEngine::createDefaultSBT() {
     OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroupShadowPG, &hitgroupRecords[RAY_TYPE_SHADOW]));
     hitgroupRecords[RAY_TYPE_SHADOW].material = defaultMat;
     hitgroupRecords[RAY_TYPE_SHADOW].geometryIndex = 0;
+
+    // Indirect bounce hit group
+    OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroupBouncePG, &hitgroupRecords[RAY_TYPE_INDIRECT]));
+    hitgroupRecords[RAY_TYPE_INDIRECT].material = defaultMat;
+    hitgroupRecords[RAY_TYPE_INDIRECT].geometryIndex = 0;
 
     err = cudaMalloc(reinterpret_cast<void**>(&m_hitgroupRecords), sizeof(HitGroupRecord) * RAY_TYPE_COUNT);
     if (err != cudaSuccess) {
@@ -556,7 +653,7 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
     }
 
     // Create hitgroup records for each material AND ray type
-    // Layout: [mat0_radiance, mat0_shadow, mat1_radiance, mat1_shadow, ...]
+    // Layout: [mat0_radiance, mat0_shadow, mat0_indirect, mat1_radiance, mat1_shadow, mat1_indirect, ...]
     // Total records = materials.size() * RAY_TYPE_COUNT
     size_t numRecords = materials.size() * RAY_TYPE_COUNT;
     std::vector<HitGroupRecord> records(numRecords);
@@ -573,6 +670,12 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
         OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroupShadowPG, &records[shadowIdx]));
         records[shadowIdx].material = materials[i];
         records[shadowIdx].geometryIndex = geometryIndices[i];
+
+        // Indirect bounce hit group for this material
+        size_t indirectIdx = i * RAY_TYPE_COUNT + RAY_TYPE_INDIRECT;
+        OPTIX_CHECK(optixSbtRecordPackHeader(m_hitgroupBouncePG, &records[indirectIdx]));
+        records[indirectIdx].material = materials[i];
+        records[indirectIdx].geometryIndex = geometryIndices[i];
     }
 
     // Allocate and copy
@@ -642,6 +745,10 @@ void OptixEngine::shutdown() {
         optixProgramGroupDestroy(m_missShadowPG);
         m_missShadowPG = nullptr;
     }
+    if (m_missBouncePG) {
+        optixProgramGroupDestroy(m_missBouncePG);
+        m_missBouncePG = nullptr;
+    }
     if (m_hitgroupPG) {
         optixProgramGroupDestroy(m_hitgroupPG);
         m_hitgroupPG = nullptr;
@@ -650,6 +757,10 @@ void OptixEngine::shutdown() {
         optixProgramGroupDestroy(m_hitgroupShadowPG);
         m_hitgroupShadowPG = nullptr;
     }
+    if (m_hitgroupBouncePG) {
+        optixProgramGroupDestroy(m_hitgroupBouncePG);
+        m_hitgroupBouncePG = nullptr;
+    }
     if (m_hitgroupAlphaPG) {
         optixProgramGroupDestroy(m_hitgroupAlphaPG);
         m_hitgroupAlphaPG = nullptr;
@@ -657,6 +768,10 @@ void OptixEngine::shutdown() {
     if (m_hitgroupShadowAlphaPG) {
         optixProgramGroupDestroy(m_hitgroupShadowAlphaPG);
         m_hitgroupShadowAlphaPG = nullptr;
+    }
+    if (m_hitgroupBounceAlphaPG) {
+        optixProgramGroupDestroy(m_hitgroupBounceAlphaPG);
+        m_hitgroupBounceAlphaPG = nullptr;
     }
     if (m_raygenModule) {
         optixModuleDestroy(m_raygenModule);

@@ -282,7 +282,8 @@ struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) HitGroupRecord {
 //------------------------------------------------------------------------------
 constexpr uint32_t RAY_TYPE_RADIANCE = 0;
 constexpr uint32_t RAY_TYPE_SHADOW   = 1;
-constexpr uint32_t RAY_TYPE_COUNT    = 2;
+constexpr uint32_t RAY_TYPE_INDIRECT = 2;  // Lightweight secondary bounce (no path guiding)
+constexpr uint32_t RAY_TYPE_COUNT    = 3;
 
 //------------------------------------------------------------------------------
 // Mesh Data (CPU-side representation for loading)

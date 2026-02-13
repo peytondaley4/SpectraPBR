@@ -66,8 +66,8 @@ inline Theme createDarkTheme() {
     Theme theme;
 
     // Panel colors - dark gray backgrounds
-    theme.panelBackground    = make_float4(0.15f, 0.15f, 0.15f, 0.95f);
-    theme.panelBackgroundAlt = make_float4(0.12f, 0.12f, 0.12f, 0.95f);
+    theme.panelBackground    = make_float4(0.15f, 0.15f, 0.15f, 1.0f);
+    theme.panelBackgroundAlt = make_float4(0.12f, 0.12f, 0.12f, 1.0f);
     theme.panelBorder        = make_float4(0.25f, 0.25f, 0.25f, 1.0f);
 
     // Button colors
@@ -120,8 +120,8 @@ inline Theme createLightTheme() {
     Theme theme;
 
     // Panel colors - light gray backgrounds
-    theme.panelBackground    = make_float4(0.94f, 0.94f, 0.94f, 0.95f);
-    theme.panelBackgroundAlt = make_float4(0.88f, 0.88f, 0.88f, 0.95f);
+    theme.panelBackground    = make_float4(0.94f, 0.94f, 0.94f, 1.0f);
+    theme.panelBackgroundAlt = make_float4(0.88f, 0.88f, 0.88f, 1.0f);
     theme.panelBorder        = make_float4(0.70f, 0.70f, 0.70f, 1.0f);
 
     // Button colors

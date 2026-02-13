@@ -374,7 +374,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         p0 = __float_as_uint(0.0f);
         p1 = __float_as_uint(0.0f);
         p2 = __float_as_uint(0.0f);
-        p3 = __float_as_uint(-2.0f);  // Mark as secondary bounce to prevent recursion
+        p3 = __float_as_uint(0.0f);
         p4 = 0xFFFFFFFFu;
 
         optixTrace(
@@ -386,9 +386,9 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
             0.0f,
             0xFF,
             OPTIX_RAY_FLAG_NONE,
-            RAY_TYPE_RADIANCE,
+            RAY_TYPE_INDIRECT,
             RAY_TYPE_COUNT,
-            RAY_TYPE_RADIANCE,
+            RAY_TYPE_INDIRECT,
             p0, p1, p2, p3, p4
         );
 
@@ -450,7 +450,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         return make_float3(0.0f, 0.0f, 0.0f);
     }
 
-    // Trace secondary ray
+    // Trace secondary ray (uses lightweight bounce shader via RAY_TYPE_INDIRECT)
     const float rayEps = 0.001f;
     float NdotD = dot(geomNormal, L);
     float3 offsetNormal = (NdotD > 0.0f) ? geomNormal : -geomNormal;
@@ -460,7 +460,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
     p0 = __float_as_uint(0.0f);
     p1 = __float_as_uint(0.0f);
     p2 = __float_as_uint(0.0f);
-    p3 = __float_as_uint(-2.0f);  // Mark as secondary bounce to prevent recursion
+    p3 = __float_as_uint(0.0f);
     p4 = 0xFFFFFFFFu;
 
     optixTrace(
@@ -472,9 +472,9 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         0.0f,
         0xFF,
         OPTIX_RAY_FLAG_NONE,
-        RAY_TYPE_RADIANCE,
+        RAY_TYPE_INDIRECT,
         RAY_TYPE_COUNT,
-        RAY_TYPE_RADIANCE,
+        RAY_TYPE_INDIRECT,
         p0, p1, p2, p3, p4
     );
 
@@ -530,10 +530,6 @@ extern "C" __global__ void __closesthit__radiance() {
         setPayloadInstanceId(instanceId);
         return;
     }
-
-    // Check if this is a secondary indirect ray (marker: p3 init to -2.0f)
-    // If so, skip indirect lighting to prevent unbounded recursion
-    const bool isSecondaryBounce = (__uint_as_float(optixGetPayload_3()) == -2.0f);
 
     float3 objectNormal = normalize(baryW * vert0.normal + baryU * vert1.normal + baryV * vert2.normal);
     float3 geomNormal = normalize(optixTransformNormalFromObjectToWorldSpace(objectNormal));
@@ -631,10 +627,10 @@ extern "C" __global__ void __closesthit__radiance() {
     Lo = Lo + emissive;
 
     // Add path-guided indirect lighting (one-bounce GI with learned direction distribution)
-    // Skip for secondary bounces to prevent unbounded recursion
+    // Secondary bounces use __closesthit__radiance_bounce via RAY_TYPE_INDIRECT, so no recursion guard needed
     float3 indirectBounceDir = make_float3(0.0f, 0.0f, 0.0f);
     float indirectBounceLuminance = 0.0f;
-    if (!isSecondaryBounce) {
+    {
         float3 guidedIndirect = computeGuidedIndirectLighting(
             hitPos, geomNormal, shadingNormal, V,
             baseColorRGB, metallic, roughness, seed,
@@ -670,23 +666,11 @@ extern "C" __global__ void __closesthit__radiance() {
         grid.bounds_max[1] = params.path_guide_bounds_max[1];
         grid.bounds_max[2] = params.path_guide_bounds_max[2];
 
-        // Stage debug level for visualization (separate from training level)
-        if (params.path_guide_staging_buffer != nullptr && params.path_guide_staging_count != nullptr &&
-            params.path_guide_staging_capacity > 0) {
-            PathGuideStagingDevice staging = {};
-            staging.buffer = params.path_guide_staging_buffer;
-            staging.count = params.path_guide_staging_count;
-            staging.capacity = params.path_guide_staging_capacity;
-
-            unsigned int debugLev = params.debug_grid_level;
-            if (debugLev < grid.num_levels) {
-                float nx, ny, nz;
-                worldToNormalized(grid, hitPos.x, hitPos.y, hitPos.z, nx, ny, nz);
-                int ix, iy, iz;
-                normalizedToCell(nx, ny, nz, debugLev, grid, ix, iy, iz);
-                pathGuideStagingAppend(staging, debugLev, ix, iy, iz);
-            }
-        }
+        // NOTE: Debug-level staging was removed. It wrote 2M entries per frame
+        // (one per pixel) into the staging buffer, inflating buildFromStaging's
+        // sort from ~500K to 2.5M entries and adding ~150ms of CPU overhead.
+        // The wireframe visualization now uses cells created by cell seeding
+        // and training, which cover all visible surfaces via generateEdgeVerticesAllLevels().
 
         // Cell seeding: ensure every visible surface gets a cell, even in shadow.
         // Decoupled from training — cells are created for ALL hits (stochastically),
@@ -719,58 +703,173 @@ extern "C" __global__ void __closesthit__radiance() {
         }
 
         // Training: stochastic subsampling per Müller et al. 2017 §4.1
-        // Only hits with positive luminance contribute directional training data.
+        // Train from direct lighting AND/OR indirect bounce — either source is valid.
         if (params.path_guide_training_buffer != nullptr && params.path_guide_training_count != nullptr &&
-            params.path_guide_training_capacity > 0 && contribLuminance > 0.0f &&
+            params.path_guide_training_capacity > 0 &&
+            (contribLuminance > 0.0f || indirectBounceLuminance > 1e-6f) &&
             randomFloat(seed) < params.path_guide_training_probability) {
-            float len = sqrtf(lightDir.x*lightDir.x + lightDir.y*lightDir.y + lightDir.z*lightDir.z);
-            if (len > 1e-6f) {
-                // Find finest existing cell for this position
-                unsigned int foundLevel = 0;
-                unsigned int cellIdx = hierarchicalCellLookup(
-                    grid, hitPos.x, hitPos.y, hitPos.z,
-                    params.path_guide_max_level,
-                    params.path_guide_min_level,
-                    &foundLevel);
 
-                float nx, ny, nz;
-                worldToNormalized(grid, hitPos.x, hitPos.y, hitPos.z, nx, ny, nz);
-                int ix, iy, iz;
+            // Find finest existing cell for this position
+            unsigned int foundLevel = 0;
+            unsigned int cellIdx = hierarchicalCellLookup(
+                grid, hitPos.x, hitPos.y, hitPos.z,
+                params.path_guide_max_level,
+                params.path_guide_min_level,
+                &foundLevel);
 
-                unsigned int trainLevel;
-                if (cellIdx != 0xFFFFFFFFu) {
-                    trainLevel = foundLevel;
-                    normalizedToCell(nx, ny, nz, trainLevel, grid, ix, iy, iz);
-                } else {
-                    trainLevel = params.path_guide_start_level;
-                    normalizedToCell(nx, ny, nz, trainLevel, grid, ix, iy, iz);
+            float nx, ny, nz;
+            worldToNormalized(grid, hitPos.x, hitPos.y, hitPos.z, nx, ny, nz);
+            int ix, iy, iz;
+
+            unsigned int trainLevel;
+            if (cellIdx != 0xFFFFFFFFu) {
+                trainLevel = foundLevel;
+                normalizedToCell(nx, ny, nz, trainLevel, grid, ix, iy, iz);
+            } else {
+                trainLevel = params.path_guide_start_level;
+                normalizedToCell(nx, ny, nz, trainLevel, grid, ix, iy, iz);
+            }
+
+            PathGuideTrainingStagingDevice trainStaging = {};
+            trainStaging.buffer = params.path_guide_training_buffer;
+            trainStaging.count = params.path_guide_training_count;
+            trainStaging.capacity = params.path_guide_training_capacity;
+
+            // Train from direct lighting direction
+            if (contribLuminance > 0.0f) {
+                float len = sqrtf(lightDir.x*lightDir.x + lightDir.y*lightDir.y + lightDir.z*lightDir.z);
+                if (len > 1e-6f) {
+                    float ux = lightDir.x / len, uy = lightDir.y / len, uz = lightDir.z / len;
+                    pathGuideTrainingAppend(trainStaging, trainLevel, ix, iy, iz, ux, uy, uz, contribLuminance, params.frame_index);
                 }
+            }
 
-                PathGuideTrainingStagingDevice trainStaging = {};
-                trainStaging.buffer = params.path_guide_training_buffer;
-                trainStaging.count = params.path_guide_training_count;
-                trainStaging.capacity = params.path_guide_training_capacity;
-                float ux = lightDir.x / len, uy = lightDir.y / len, uz = lightDir.z / len;
-                pathGuideTrainingAppend(trainStaging, trainLevel, ix, iy, iz, ux, uy, uz, contribLuminance, params.frame_index);
-
-                // Also train from indirect bounce direction
-                float blen = sqrtf(indirectBounceDir.x*indirectBounceDir.x +
-                                   indirectBounceDir.y*indirectBounceDir.y +
-                                   indirectBounceDir.z*indirectBounceDir.z);
-                if (blen > 1e-6f && indirectBounceLuminance > 1e-6f) {
-                    float bx = indirectBounceDir.x / blen;
-                    float by = indirectBounceDir.y / blen;
-                    float bz = indirectBounceDir.z / blen;
-                    float bounceNdotL = fmaxf(dot(shadingNormal, make_float3(bx, by, bz)), 0.0f);
-                    float bounceWeight = indirectBounceLuminance * bounceNdotL;
-                    if (bounceWeight > 1e-6f) {
-                        pathGuideTrainingAppend(trainStaging, trainLevel, ix, iy, iz,
-                            bx, by, bz, bounceWeight, params.frame_index);
-                    }
+            // Train from indirect bounce direction
+            float blen = sqrtf(indirectBounceDir.x*indirectBounceDir.x +
+                               indirectBounceDir.y*indirectBounceDir.y +
+                               indirectBounceDir.z*indirectBounceDir.z);
+            if (blen > 1e-6f && indirectBounceLuminance > 1e-6f) {
+                float bx = indirectBounceDir.x / blen;
+                float by = indirectBounceDir.y / blen;
+                float bz = indirectBounceDir.z / blen;
+                float bounceNdotL = fmaxf(dot(shadingNormal, make_float3(bx, by, bz)), 0.0f);
+                float bounceWeight = indirectBounceLuminance * bounceNdotL;
+                if (bounceWeight > 1e-6f) {
+                    pathGuideTrainingAppend(trainStaging, trainLevel, ix, iy, iz,
+                        bx, by, bz, bounceWeight, params.frame_index);
                 }
             }
         }
     }
+
+    setPayloadColor(Lo);
+    setPayloadHitDistance(optixGetRayTmax());
+    setPayloadInstanceId(instanceId);
+}
+
+//------------------------------------------------------------------------------
+// Lightweight Closest Hit for Secondary Bounces (indirect rays)
+// No path guiding, no training, no debug stats — just material eval + direct lighting
+//------------------------------------------------------------------------------
+
+extern "C" __global__ void __closesthit__radiance_bounce() {
+    const HitGroupData* sbtData = reinterpret_cast<HitGroupData*>(optixGetSbtDataPointer());
+    const GpuMaterial& material = sbtData->material;
+    const unsigned int instanceId = optixGetInstanceId();
+    const unsigned int primIdx = optixGetPrimitiveIndex();
+    const float2 barycentrics = optixGetTriangleBarycentrics();
+    const float baryU = barycentrics.x;
+    const float baryV = barycentrics.y;
+    const float baryW = 1.0f - baryU - baryV;
+
+    const GpuVertex* vertices = reinterpret_cast<const GpuVertex*>(params.vertex_buffers[instanceId]);
+    const unsigned int* indices = reinterpret_cast<const unsigned int*>(params.index_buffers[instanceId]);
+
+    const unsigned int i0 = indices[primIdx * 3 + 0];
+    const unsigned int i1 = indices[primIdx * 3 + 1];
+    const unsigned int i2 = indices[primIdx * 3 + 2];
+
+    const GpuVertex& vert0 = vertices[i0];
+    const GpuVertex& vert1 = vertices[i1];
+    const GpuVertex& vert2 = vertices[i2];
+
+    float3 objectPos = baryW * vert0.position + baryU * vert1.position + baryV * vert2.position;
+    float3 hitPos = optixTransformPointFromObjectToWorldSpace(objectPos);
+
+    float3 objectNormal = normalize(baryW * vert0.normal + baryU * vert1.normal + baryV * vert2.normal);
+    float3 geomNormal = normalize(optixTransformNormalFromObjectToWorldSpace(objectNormal));
+
+    float4 tangent = baryW * vert0.tangent + baryU * vert1.tangent + baryV * vert2.tangent;
+    float3 objectTangent = make_float3(tangent.x, tangent.y, tangent.z);
+    float3 worldTangent = normalize(optixTransformVectorFromObjectToWorldSpace(objectTangent));
+    float bitangentSign = tangent.w;
+
+    float2 texCoord = make_float2(
+        baryW * vert0.u + baryU * vert1.u + baryV * vert2.u,
+        baryW * vert0.v + baryU * vert1.v + baryV * vert2.v
+    );
+
+    float rayDistance = optixGetRayTmax();
+    float texLOD = calculateTextureLOD(rayDistance);
+
+    // Material evaluation (same as primary but no clearcoat/sheen for perf)
+    float4 baseColorTex = sampleTexture(material.baseColorTex, texCoord, make_float4(1.0f, 1.0f, 1.0f, 1.0f), texLOD);
+    float4 baseColor = make_float4(
+        material.baseColor.x * baseColorTex.x,
+        material.baseColor.y * baseColorTex.y,
+        material.baseColor.z * baseColorTex.z,
+        material.baseColor.w * baseColorTex.w
+    );
+
+    float metallic = material.metallic;
+    float roughness = material.roughness;
+    if (material.metallicRoughnessTex != 0) {
+        float4 mrSample = tex2DLod<float4>(material.metallicRoughnessTex, texCoord.x, texCoord.y, texLOD);
+        roughness = material.roughness * mrSample.y;
+        metallic = material.metallic * mrSample.z;
+    }
+    roughness = fmaxf(roughness, 0.04f);
+
+    float3 emissive = material.emissive;
+    if (material.emissiveTex != 0) {
+        float4 emissiveTex = tex2DLod<float4>(material.emissiveTex, texCoord.x, texCoord.y, texLOD);
+        emissive = make_float3(
+            material.emissive.x * emissiveTex.x,
+            material.emissive.y * emissiveTex.y,
+            material.emissive.z * emissiveTex.z
+        );
+    }
+
+    float3 shadingNormal = geomNormal;
+    if (material.normalTex != 0) {
+        float4 normalSample = tex2DLod<float4>(material.normalTex, texCoord.x, texCoord.y, texLOD);
+        float3 tangentNormal = unpackNormal(normalSample);
+        shadingNormal = applyNormalMap(tangentNormal, geomNormal, worldTangent, bitangentSign);
+    }
+
+    float3 rayDir = optixGetWorldRayDirection();
+    if (material.doubleSided && dot(shadingNormal, rayDir) > 0.0f) {
+        shadingNormal = -shadingNormal;
+        geomNormal = -geomNormal;
+    }
+
+    float3 V = normalize(params.camera.position - hitPos);
+    float3 baseColorRGB = make_float3(baseColor.x, baseColor.y, baseColor.z);
+
+    // Generate seed for random sampling
+    unsigned int pixelIdx = optixGetLaunchIndex().y * params.width + optixGetLaunchIndex().x;
+    unsigned int dirHash = __float_as_uint(rayDir.x) ^ __float_as_uint(rayDir.y) ^ __float_as_uint(rayDir.z);
+    unsigned int seed = pixelIdx ^ (params.frame_index * 0x9E3779B9u) ^ dirHash;
+
+    // Direct lighting only (no indirect bounce, no path guiding)
+    float3 Lo = computeStandardDirectLighting(
+        hitPos, geomNormal, shadingNormal, V,
+        baseColorRGB, metallic, roughness,
+        material.clearcoat, material.clearcoatRoughness,
+        material.sheenColor, material.sheenRoughness, seed);
+
+    Lo = Lo + emissive;
+    Lo = clamp(Lo, 0.0f, 1000.0f);
 
     setPayloadColor(Lo);
     setPayloadHitDistance(optixGetRayTmax());

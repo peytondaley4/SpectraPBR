@@ -19,7 +19,8 @@
 // Ray types
 constexpr unsigned int RAY_TYPE_RADIANCE = 0;
 constexpr unsigned int RAY_TYPE_SHADOW   = 1;
-constexpr unsigned int RAY_TYPE_COUNT    = 2;
+constexpr unsigned int RAY_TYPE_INDIRECT = 2;  // Lightweight secondary bounce (no path guiding)
+constexpr unsigned int RAY_TYPE_COUNT    = 3;
 
 // Alpha modes
 constexpr unsigned int ALPHA_MODE_OPAQUE = 0;

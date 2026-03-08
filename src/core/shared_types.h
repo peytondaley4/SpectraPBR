@@ -238,23 +238,28 @@ struct LaunchParams {
     uint32_t* path_guide_staging_buffer;
     uint32_t* path_guide_staging_count;   // Atomic
     uint32_t path_guide_staging_capacity;
-    float* path_guide_training_buffer;    // 8 floats per entry: (level,ix,iy,iz, dir_x,dir_y,dir_z, weight)
-    uint32_t* path_guide_training_count;
-    uint32_t path_guide_training_capacity;
     uint32_t debug_grid_visualize;  // 0 = off, 1 = show grid in viewport
     uint32_t debug_grid_level;      // Level to visualize (0 .. num_levels-1)
     uint32_t path_guide_no_jitter;  // When set, use center-pixel rays for deterministic staging
     uint32_t path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
     float path_guide_mis_weight;    // Blend factor for MIS (0.5 = balanced)
-    float path_guide_training_probability; // Stochastic subsampling rate for training (0-1)
     // Adaptive level parameters (from config)
     uint32_t path_guide_start_level; // Initial level for new regions
     uint32_t path_guide_min_level;   // Coarsest allowed level
     uint32_t path_guide_max_level;   // Finest allowed level
+    uint32_t path_guide_level_resolutions[16];  // Precomputed floor(base_res * scale^level)
+
+    // Hash table for O(1) cell lookup (replaces binary search)
+    const uint64_t* path_guide_hash_keys;        // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF
+    const uint32_t* path_guide_hash_values;      // flat cell index
+    uint32_t path_guide_hash_table_size;          // power of 2
+    uint32_t path_guide_hash_shift;               // 64 - log2(hash_table_size)
 
     // Debug statistics (atomic counters, reset each frame)
     uint32_t* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed
     uint32_t path_guide_debug_enabled; // 1 = collect debug stats
+
+    uint32_t max_bounce_depth;          // Max recursive bounces for glass/transmission
 };
 
 //------------------------------------------------------------------------------
@@ -307,6 +312,8 @@ struct MaterialData {
     // Core texture paths
     std::string baseColorTexPath;
     std::string normalTexPath;
+    bool normalTexIsBumpMap = false;  // true = grayscale height map (OBJ), needs gradient conversion
+    float bumpStrength = 1.0f;       // Strength for bump-to-normal conversion
     std::string metallicRoughnessTexPath;
     std::string emissiveTexPath;
 

@@ -73,7 +73,7 @@ public:
     // Map specific buffer for CUDA access (triple buffering)
     float* mapBuffer(int index);
 
-    // Map UI PBO for CUDA access
+    // Map UI PBO for CUDA access (uses UI stream, not render stream)
     float* mapUIPBO();
 
     // Unmap PBO (must call after rendering, before OpenGL uses it)
@@ -82,7 +82,7 @@ public:
     // Unmap specific buffer (triple buffering)
     void unmapBuffer(int index);
 
-    // Unmap UI PBO
+    // Unmap UI PBO (uses UI stream, not render stream)
     void unmapUIPBO();
 
     // Record an event when render completes (triple buffering)

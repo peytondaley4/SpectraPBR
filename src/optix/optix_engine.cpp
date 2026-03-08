@@ -11,6 +11,7 @@
 #include <sstream>
 #include <iostream>
 #include <cstring>
+#include <cmath>
 
 namespace spectra {
 
@@ -51,6 +52,16 @@ bool OptixEngine::init(CUcontext cudaContext) {
         std::cerr << "[OptiX] Failed to allocate launch params buffer: " << cudaGetErrorString(err) << "\n";
         return false;
     }
+
+    // Allocate double-buffered pinned launch params for async H2D upload
+    for (int i = 0; i < 2; i++) {
+        err = cudaMallocHost(&m_pinnedLaunchParams[i], sizeof(LaunchParams));
+        if (err != cudaSuccess) {
+            std::cerr << "[OptiX] Failed to allocate pinned launch params[" << i << "]: " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+    }
+    m_pinnedLaunchIdx = 0;
 
     // Initialize launch params with defaults
     m_launchParams = {};
@@ -118,14 +129,15 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.path_guide_staging_buffer = nullptr;
     m_launchParams.path_guide_staging_count = nullptr;
     m_launchParams.path_guide_staging_capacity = 0;
-    m_launchParams.path_guide_training_buffer = nullptr;
-    m_launchParams.path_guide_training_count = nullptr;
-    m_launchParams.path_guide_training_capacity = 0;
+    m_launchParams.path_guide_hash_keys = nullptr;
+    m_launchParams.path_guide_hash_values = nullptr;
+    m_launchParams.path_guide_hash_table_size = 0;
+    m_launchParams.path_guide_hash_shift = 64;
     m_launchParams.debug_grid_visualize = 0;
     m_launchParams.debug_grid_level = 0;
     m_launchParams.path_guide_no_jitter = 0;
     m_launchParams.path_guide_enabled = 0;     // Disabled by default
-    m_launchParams.path_guide_mis_weight = 0.5f;  // Balanced MIS
+    m_launchParams.path_guide_mis_weight = 0.3f;  // Conservative: guide needs time to converge
     // Adaptive level parameters (defaults, updated when grid is set)
     m_launchParams.path_guide_start_level = 2;
     m_launchParams.path_guide_min_level = 1;
@@ -149,6 +161,8 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.path_guide_debug_stats = m_pathGuideDebugStats;
     m_launchParams.path_guide_debug_enabled = 0;  // Disabled by default
 
+    m_launchParams.max_bounce_depth = 8;  // Glass/transmission bounce limit
+
     return true;
 }
 
@@ -157,7 +171,7 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
     m_pipelineCompileOptions = {};
     m_pipelineCompileOptions.usesMotionBlur = false;
     m_pipelineCompileOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
-    m_pipelineCompileOptions.numPayloadValues = 5;      // color (3) + hitDistance (1) + instanceId (1)
+    m_pipelineCompileOptions.numPayloadValues = 6;      // color (3) + hitDistance (1) + instanceId (1) + depth (1)
     m_pipelineCompileOptions.numAttributeValues = 2;    // barycentrics (u, v)
     m_pipelineCompileOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     m_pipelineCompileOptions.pipelineLaunchParamsVariableName = "params";
@@ -193,7 +207,7 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
 
     // Link pipeline
     OptixPipelineLinkOptions linkOptions = {};
-    linkOptions.maxTraceDepth = 3;  // Primary ray + indirect bounce + shadow ray
+    linkOptions.maxTraceDepth = 12;  // max_bounce_depth(8) + 3 (opaque indirect + bounce shadow) + 1 margin
 
     OptixProgramGroup programGroups[] = {
         m_raygenPG, m_missPG, m_missShadowPG, m_missBouncePG,
@@ -717,6 +731,12 @@ void OptixEngine::shutdown() {
         cudaFree(reinterpret_cast<void*>(m_launchParamsBuffer));
         m_launchParamsBuffer = 0;
     }
+    for (int i = 0; i < 2; i++) {
+        if (m_pinnedLaunchParams[i]) {
+            cudaFreeHost(m_pinnedLaunchParams[i]);
+            m_pinnedLaunchParams[i] = nullptr;
+        }
+    }
     if (m_raygenRecord) {
         cudaFree(reinterpret_cast<void*>(m_raygenRecord));
         m_raygenRecord = 0;
@@ -824,10 +844,16 @@ void OptixEngine::render(float4* outputBuffer, cudaStream_t stream) {
     m_launchParams.random_seed = m_frameIndex * 17 + 31;  // Simple per-frame seed
     // Note: accumulated_frames is managed by caller via resetAccumulation()
 
-    // Copy params to device
+    // Copy to pinned staging buffer, then async DMA to device.
+    // cudaMemcpyAsync from pageable memory implicitly synchronizes the stream,
+    // blocking the CPU for the entire previous frame's GPU time. Pinned memory
+    // eliminates this stall, letting the CPU stay ahead of the GPU.
+    int idx = m_pinnedLaunchIdx;
+    m_pinnedLaunchIdx = 1 - m_pinnedLaunchIdx;
+    std::memcpy(m_pinnedLaunchParams[idx], &m_launchParams, sizeof(LaunchParams));
     cudaMemcpyAsync(
         reinterpret_cast<void*>(m_launchParamsBuffer),
-        &m_launchParams,
+        m_pinnedLaunchParams[idx],
         sizeof(LaunchParams),
         cudaMemcpyHostToDevice,
         stream
@@ -917,8 +943,7 @@ uint32_t OptixEngine::getAccumulatedFrames() const {
 }
 
 void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
-    const PathGuideStagingDescriptor* staging,
-    const PathGuideTrainingStagingDescriptor* training) {
+    const PathGuideStagingDescriptor* staging) {
     auto zeroBounds = [this]() {
         m_launchParams.path_guide_bounds_min[0] = m_launchParams.path_guide_bounds_min[1] = m_launchParams.path_guide_bounds_min[2] = 0.0f;
         m_launchParams.path_guide_bounds_max[0] = m_launchParams.path_guide_bounds_max[1] = m_launchParams.path_guide_bounds_max[2] = 0.0f;
@@ -932,6 +957,11 @@ void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sp
         m_launchParams.path_guide_base_resolution = 0;
         m_launchParams.path_guide_per_level_scale = 1.0f;
         zeroBounds();
+        std::memset(m_launchParams.path_guide_level_resolutions, 0, sizeof(m_launchParams.path_guide_level_resolutions));
+        m_launchParams.path_guide_hash_keys = nullptr;
+        m_launchParams.path_guide_hash_values = nullptr;
+        m_launchParams.path_guide_hash_table_size = 0;
+        m_launchParams.path_guide_hash_shift = 64;
     } else {
         m_launchParams.path_guide_morton_codes = sparse->morton_codes;
         m_launchParams.path_guide_data = sparse->data;
@@ -946,6 +976,16 @@ void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sp
         m_launchParams.path_guide_bounds_max[0] = sparse->bounds_max[0];
         m_launchParams.path_guide_bounds_max[1] = sparse->bounds_max[1];
         m_launchParams.path_guide_bounds_max[2] = sparse->bounds_max[2];
+        // Precompute level resolutions to avoid powf() on GPU
+        for (uint32_t l = 0; l < 16; l++) {
+            float res = std::floor(static_cast<float>(sparse->base_resolution) *
+                std::pow(sparse->per_level_scale, static_cast<float>(l)));
+            m_launchParams.path_guide_level_resolutions[l] = (res < 1.0f) ? 1u : static_cast<uint32_t>(res);
+        }
+        m_launchParams.path_guide_hash_keys = sparse->hash_keys;
+        m_launchParams.path_guide_hash_values = sparse->hash_values;
+        m_launchParams.path_guide_hash_table_size = sparse->hash_table_size;
+        m_launchParams.path_guide_hash_shift = sparse->hash_shift;
     }
     if (!staging) {
         m_launchParams.path_guide_staging_buffer = nullptr;
@@ -955,15 +995,6 @@ void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sp
         m_launchParams.path_guide_staging_buffer = staging->buffer;
         m_launchParams.path_guide_staging_count = staging->count;
         m_launchParams.path_guide_staging_capacity = staging->capacity;
-    }
-    if (!training) {
-        m_launchParams.path_guide_training_buffer = nullptr;
-        m_launchParams.path_guide_training_count = nullptr;
-        m_launchParams.path_guide_training_capacity = 0;
-    } else {
-        m_launchParams.path_guide_training_buffer = training->buffer;
-        m_launchParams.path_guide_training_count = training->count;
-        m_launchParams.path_guide_training_capacity = training->capacity;
     }
 }
 
@@ -988,10 +1019,6 @@ void OptixEngine::setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel
 
 void OptixEngine::setPathGuideMISWeight(float weight) {
     m_launchParams.path_guide_mis_weight = weight;
-}
-
-void OptixEngine::setPathGuideTrainingProbability(float prob) {
-    m_launchParams.path_guide_training_probability = prob;
 }
 
 void OptixEngine::setPathGuideDebugEnabled(bool enabled) {

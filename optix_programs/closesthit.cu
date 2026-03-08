@@ -111,7 +111,7 @@ __forceinline__ __device__ float3 computeStandardDirectLighting(
             if (cumulative >= target) {
                 const GpuPointLight& light = params.point_lights[i];
                 float3 lightVec = light.position - hitPos;
-                float distance = length(lightVec);
+                float distance = fmaxf(length(lightVec), 0.001f);  // Prevent Inf from 1/d²
                 float3 L = lightVec / distance;
                 float NdotL = dot(shadingNormal, L);
                 if (NdotL > 0.0f) {
@@ -152,13 +152,24 @@ __forceinline__ __device__ float3 computeStandardDirectLighting(
                 cumulative += lum;
                 if (cumulative >= target) {
                     const GpuAreaLight& light = params.area_lights[i];
-                    float3 lightVec = light.position - hitPos;
-                    float distance = length(lightVec);
+
+                    // Sample a random point on the rectangular light surface
+                    float3 bitangent = cross(light.normal, light.tangent);
+                    float u = randomFloat(seed) - 0.5f; // [-0.5, 0.5]
+                    float v = randomFloat(seed) - 0.5f;
+                    float3 samplePos = light.position
+                        + light.tangent  * (u * light.size.x)
+                        + bitangent      * (v * light.size.y);
+
+                    float3 lightVec = samplePos - hitPos;
+                    float distance = fmaxf(length(lightVec), 0.001f);
                     float3 L = lightVec / distance;
                     float NdotL = dot(shadingNormal, L);
                     float lightNdotL = -dot(light.normal, L);
                     if (NdotL > 0.0f && lightNdotL > 0.0f) {
                         bool visible = traceShadowRay(hitPos, geomNormal, L, distance);
+                        // PDF of uniform rectangular sample = 1/area, so area cancels
+                        // Solid angle measure: dA * cos(theta_light) / dist^2
                         float att = lightNdotL / (distance * distance);
                         float3 brdf = evalBRDF(L, V, shadingNormal, baseColor, metallic, roughness, clearcoat, clearcoatRoughness, sheenColor, sheenRoughness);
                         float3 contrib = brdf * light.emission * light.area * att * NdotL * (visible ? (params.total_light_luminance / lum) : 0.0f);
@@ -288,31 +299,8 @@ __forceinline__ __device__ float3 sampleGGXDirection(
     return normalize(L);
 }
 
-__forceinline__ __device__ float3 computeGuidedIndirectLighting(
-    const float3& hitPos,
-    const float3& geomNormal,
-    const float3& shadingNormal,
-    const float3& V,
-    const float3& baseColor,
-    float metallic,
-    float roughness,
-    unsigned int& seed,
-    float3* out_bounceDir = nullptr,
-    float* out_bounceLuminance = nullptr)
-{
-    if (out_bounceDir) *out_bounceDir = make_float3(0.0f, 0.0f, 0.0f);
-    if (out_bounceLuminance) *out_bounceLuminance = 0.0f;
-    // Early out if guiding is disabled
-    if (params.path_guide_enabled == 0) {
-        return make_float3(0.0f, 0.0f, 0.0f);
-    }
-
-    incrementGuideStat(GUIDE_STAT_ATTEMPTS);
-
-    // MIS blend factor: probability of using guide vs BSDF
-    float alpha = params.path_guide_mis_weight;  // e.g., 0.5 = equal probability
-
-    // Build grid descriptor
+// Build grid descriptor from launch params (called once per hit, shared by guiding + training)
+__forceinline__ __device__ SparsePathGuideDescriptorDevice buildGridDescriptor() {
     SparsePathGuideDescriptorDevice grid = {};
     grid.morton_codes = params.path_guide_morton_codes;
     grid.data = params.path_guide_data;
@@ -327,30 +315,51 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
     grid.bounds_max[0] = params.path_guide_bounds_max[0];
     grid.bounds_max[1] = params.path_guide_bounds_max[1];
     grid.bounds_max[2] = params.path_guide_bounds_max[2];
+    for (int i = 0; i < 16; i++)
+        grid.level_resolutions[i] = params.path_guide_level_resolutions[i];
+    grid.hash_keys = params.path_guide_hash_keys;
+    grid.hash_values = params.path_guide_hash_values;
+    grid.hash_table_size = params.path_guide_hash_table_size;
+    grid.hash_shift = params.path_guide_hash_shift;
+    return grid;
+}
 
-    // Try to find a cell for this position
-    unsigned int foundLevel = 0;
-    unsigned int cellIdx = 0xFFFFFFFFu;
-    bool hasValidGuide = false;
+__forceinline__ __device__ float3 computeGuidedIndirectLighting(
+    const SparsePathGuideDescriptorDevice& grid,
+    unsigned int cellIdx,
+    bool hasValidGuide,
+    const TrilinearInfo& trilinear,
+    const float3& hitPos,
+    const float3& geomNormal,
+    const float3& shadingNormal,
+    const float3& V,
+    const float3& baseColor,
+    float metallic,
+    float roughness,
+    unsigned int& seed,
+    float3* out_bounceDir = nullptr,
+    float* out_bounceLuminance = nullptr,
+    float* out_incidentLuminance = nullptr,
+    float* out_samplingPdf = nullptr)
+{
+    if (out_bounceDir) *out_bounceDir = make_float3(0.0f, 0.0f, 0.0f);
+    if (out_bounceLuminance) *out_bounceLuminance = 0.0f;
+    if (out_incidentLuminance) *out_incidentLuminance = 0.0f;
+    if (out_samplingPdf) *out_samplingPdf = 1.0f;
+    // Early out if guiding is disabled
+    if (params.path_guide_enabled == 0) {
+        return make_float3(0.0f, 0.0f, 0.0f);
+    }
 
-    if (params.path_guide_morton_codes != nullptr &&
-        params.path_guide_data != nullptr &&
-        params.path_guide_level_offsets != nullptr) {
+    incrementGuideStat(GUIDE_STAT_ATTEMPTS);
 
-        cellIdx = hierarchicalCellLookup(
-            grid, hitPos.x, hitPos.y, hitPos.z,
-            params.path_guide_max_level,
-            params.path_guide_min_level,
-            &foundLevel);
+    // MIS blend factor: probability of using guide vs BSDF
+    float alpha = params.path_guide_mis_weight;  // e.g., 0.5 = equal probability
 
-        if (cellIdx != 0xFFFFFFFFu) {
-            incrementGuideStat(GUIDE_STAT_CELL_FOUND);
-            // Check if cell has valid lobes (kappa > 0)
-            float* cell = sparseCellDataPtr(grid, cellIdx);
-            if (cell != nullptr && (cell[2] > 1e-6f || cell[5] > 1e-6f)) {
-                hasValidGuide = true;
-                incrementGuideStat(GUIDE_STAT_VALID_LOBE);
-            }
+    if (cellIdx != 0xFFFFFFFFu) {
+        incrementGuideStat(GUIDE_STAT_CELL_FOUND);
+        if (hasValidGuide) {
+            incrementGuideStat(GUIDE_STAT_VALID_LOBE);
         }
     }
 
@@ -370,12 +379,13 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         float3 offsetNormal = (NdotD > 0.0f) ? geomNormal : -geomNormal;
         float3 offsetOrigin = hitPos + offsetNormal * rayEps;
 
-        unsigned int p0, p1, p2, p3, p4;
+        unsigned int p0, p1, p2, p3, p4, p5;
         p0 = __float_as_uint(0.0f);
         p1 = __float_as_uint(0.0f);
         p2 = __float_as_uint(0.0f);
         p3 = __float_as_uint(0.0f);
         p4 = 0xFFFFFFFFu;
+        p5 = getPayloadDepth() + 1;
 
         optixTrace(
             params.scene_handle,
@@ -389,16 +399,19 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
             RAY_TYPE_INDIRECT,
             RAY_TYPE_COUNT,
             RAY_TYPE_INDIRECT,
-            p0, p1, p2, p3, p4
+            p0, p1, p2, p3, p4, p5
         );
 
         float3 Li = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
+        float liLum = 0.2126f * Li.x + 0.7152f * Li.y + 0.0722f * Li.z;
         float3 brdf = evaluateGGX_BRDF(V, L, shadingNormal, baseColor, metallic, roughness);
         float3 contrib = brdf * Li * NdotL / brdfPdf;
         float3 result = clamp(contrib, 0.0f, 100.0f);
         float lum = 0.2126f * result.x + 0.7152f * result.y + 0.0722f * result.z;
         if (out_bounceDir && lum > 1e-6f) *out_bounceDir = L;
         if (out_bounceLuminance) *out_bounceLuminance = lum;
+        if (out_incidentLuminance) *out_incidentLuminance = liLum;
+        if (out_samplingPdf) *out_samplingPdf = brdfPdf;
         return result;
     }
 
@@ -422,7 +435,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         }
 
         L = make_float3(guideX, guideY, guideZ);
-        guidePdf = pathGuidePdfDirection(grid, cellIdx, guideX, guideY, guideZ);
+        guidePdf = trilinearGuidePdf(grid, trilinear, guideX, guideY, guideZ);
         brdfPdf = computeGGXPdf(V, L, shadingNormal, roughness);
 
     } else {
@@ -433,7 +446,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
 
         L = sampleGGXDirection(V, shadingNormal, roughness, u1, u2);
         brdfPdf = computeGGXPdf(V, L, shadingNormal, roughness);
-        guidePdf = pathGuidePdfDirection(grid, cellIdx, L.x, L.y, L.z);
+        guidePdf = trilinearGuidePdf(grid, trilinear, L.x, L.y, L.z);
     }
 
     // Check if direction is valid
@@ -456,12 +469,13 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
     float3 offsetNormal = (NdotD > 0.0f) ? geomNormal : -geomNormal;
     float3 offsetOrigin = hitPos + offsetNormal * rayEps;
 
-    unsigned int p0, p1, p2, p3, p4;
+    unsigned int p0, p1, p2, p3, p4, p5;
     p0 = __float_as_uint(0.0f);
     p1 = __float_as_uint(0.0f);
     p2 = __float_as_uint(0.0f);
     p3 = __float_as_uint(0.0f);
     p4 = 0xFFFFFFFFu;
+    p5 = getPayloadDepth() + 1;
 
     optixTrace(
         params.scene_handle,
@@ -475,7 +489,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         RAY_TYPE_INDIRECT,
         RAY_TYPE_COUNT,
         RAY_TYPE_INDIRECT,
-        p0, p1, p2, p3, p4
+        p0, p1, p2, p3, p4, p5
     );
 
     float3 incomingRadiance = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
@@ -491,8 +505,18 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
 
     float3 result = clamp(contrib, 0.0f, 100.0f);
     float lum = 0.2126f * result.x + 0.7152f * result.y + 0.0722f * result.z;
+    // Training uses importance-weighted Li to make training unbiased regardless
+    // of sampling strategy. Without this, guide-sampled directions oversample the
+    // current lobe mean, creating a self-reinforcing feedback loop where cells
+    // converge to different modes. Li/p(ω) makes each deposit an unbiased
+    // estimate of ∫Li(ω)dω, breaking the feedback loop.
+    // Müller 2017 avoids this with iterative rebuilds (fresh tree each iteration);
+    // in our online setting, importance weighting is the correct substitute.
+    float liLum = 0.2126f * incomingRadiance.x + 0.7152f * incomingRadiance.y + 0.0722f * incomingRadiance.z;
     if (out_bounceDir && lum > 1e-6f) *out_bounceDir = L;
     if (out_bounceLuminance) *out_bounceLuminance = lum;
+    if (out_incidentLuminance) *out_incidentLuminance = liLum;
+    if (out_samplingPdf) *out_samplingPdf = combinedPdf;
     return result;
 }
 
@@ -581,8 +605,12 @@ extern "C" __global__ void __closesthit__radiance() {
         shadingNormal = applyNormalMap(tangentNormal, geomNormal, worldTangent, bitangentSign);
     }
 
+    // Double-sided: use unperturbed vertex normal for front/back check
+    // Save original geometric normal before flip for glass entering/exiting detection
     float3 rayDir = optixGetWorldRayDirection();
-    if (material.doubleSided && dot(shadingNormal, rayDir) > 0.0f) {
+    float3 origGeomNormal = geomNormal;
+    float3 origShadingNormal = shadingNormal;
+    if (material.doubleSided && dot(geomNormal, rayDir) > 0.0f) {
         shadingNormal = -shadingNormal;
         geomNormal = -geomNormal;
     }
@@ -610,10 +638,69 @@ extern "C" __global__ void __closesthit__radiance() {
 
     float3 baseColorRGB = make_float3(baseColor.x, baseColor.y, baseColor.z);
 
-    // Generate seed for random sampling
+    // Generate seed for random sampling (moved before glass block so randomFloat is available)
     unsigned int pixelIdx = optixGetLaunchIndex().y * params.width + optixGetLaunchIndex().x;
     unsigned int dirHash = __float_as_uint(rayDir.x) ^ __float_as_uint(rayDir.y) ^ __float_as_uint(rayDir.z);
     unsigned int seed = pixelIdx ^ (params.frame_index * 0x9E3779B9u) ^ dirHash;
+
+    // ── Glass / Transmission ──
+    if (material.transmission > 0.0f) {
+        unsigned int depth = getPayloadDepth();
+        if (depth < params.max_bounce_depth) {
+            float3 I = rayDir;
+            // Use original (pre-double-sided-flip) geometric normal for entering/exiting.
+            // The double-sided flip makes both normals face the ray, which would make
+            // every hit look like "entering" — trapping rays inside with the wrong eta.
+            bool entering = dot(origGeomNormal, I) < 0.0f;
+
+            float eta = entering ? (1.0f / material.ior) : material.ior;
+            float3 N  = entering ? origShadingNormal : -origShadingNormal;
+            float3 gN = entering ? origGeomNormal    : -origGeomNormal;
+
+            float F = fresnelDielectric(dot(N, -I), eta);
+
+            float3 newDir;
+            bool reflected;
+            if (randomFloat(seed) < F) {
+                newDir = reflect(I, N);
+                reflected = true;
+            } else {
+                if (!refract(I, N, eta, newDir)) {
+                    newDir = reflect(I, N);  // total internal reflection
+                    reflected = true;
+                } else {
+                    reflected = false;
+                }
+            }
+
+            float3 origin = hitPos + (reflected ? gN : -gN) * 0.001f;
+            unsigned int gp0, gp1, gp2, gp3, gp4, gp5;
+            gp0 = gp1 = gp2 = __float_as_uint(0.0f);
+            gp3 = __float_as_uint(0.0f);
+            gp4 = 0xFFFFFFFFu;
+            gp5 = depth + 1;
+
+            optixTrace(params.scene_handle, origin, normalize(newDir),
+                       0.001f, 10000.0f, 0.0f, 0xFF, OPTIX_RAY_FLAG_NONE,
+                       RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
+                       gp0, gp1, gp2, gp3, gp4, gp5);
+
+            float3 result = make_float3(
+                __uint_as_float(gp0), __uint_as_float(gp1), __uint_as_float(gp2));
+
+            // Tint refracted rays by base color (colored glass)
+            if (!reflected)
+                result = result * baseColorRGB;
+
+            result = result + emissive;
+            setPayloadColor(clamp(result, 0.0f, 1000.0f));
+            setPayloadHitDistance(optixGetRayTmax());
+            setPayloadInstanceId(instanceId);
+            setPayloadDepth(depth);
+            return;
+        }
+        // depth exceeded → fall through to opaque shading
+    }
 
     float3 lightDir = make_float3(0.0f, 0.0f, 0.0f);
     float contribLuminance = 0.0f;
@@ -626,15 +713,62 @@ extern "C" __global__ void __closesthit__radiance() {
 
     Lo = Lo + emissive;
 
+    // Build grid descriptor once, shared by guiding and training.
+    // Hierarchical lookup finds the exact cell; trilinear interpolation smooths
+    // sampling boundaries. Training uses exact cell only (no trilinear) to
+    // prevent spatial coupling that creates large-scale mode boundaries.
+    SparsePathGuideDescriptorDevice grid;
+    unsigned int exactCellIdx = 0xFFFFFFFFu;   // exact cell (for training + seeding)
+    unsigned int guideCellIdx = 0xFFFFFFFFu;   // stochastic trilinear cell for sampling
+    unsigned int guideFoundLevel = 0;
+    bool hasValidGuide = false;
+    TrilinearInfo allNeighbors;                // all trilinear neighbors (for training via stochastic box filter)
+    allNeighbors.weightSum = 0.0f;
+    TrilinearInfo guideTrilinear;              // filtered: cells with valid lobes (for guiding)
+    guideTrilinear.weightSum = 0.0f;
+
+    if (params.path_guide_num_levels > 0) {
+        grid = buildGridDescriptor();
+
+        if (params.path_guide_morton_codes != nullptr &&
+            params.path_guide_data != nullptr &&
+            params.path_guide_level_offsets != nullptr) {
+            exactCellIdx = hierarchicalCellLookup(
+                grid, hitPos.x, hitPos.y, hitPos.z,
+                params.path_guide_max_level,
+                params.path_guide_min_level,
+                &guideFoundLevel);
+            if (exactCellIdx != 0xFFFFFFFFu) {
+                // Compute trilinear neighbors for smooth sampling/PDF at boundaries.
+                // Kept in outer scope: reused for training (stochastic box filter).
+                allNeighbors = computeTrilinearNeighbors(
+                    grid, hitPos.x, hitPos.y, hitPos.z, guideFoundLevel);
+                // Filter for guiding (cells with valid vMF lobes only)
+                guideTrilinear = filterTrilinearByValidLobes(grid, allNeighbors);
+                // Stochastically select one cell for sampling
+                float interpRand = randomFloat(seed);
+                guideCellIdx = stochasticSelectCell(guideTrilinear, interpRand);
+                if (guideCellIdx != 0xFFFFFFFFu) {
+                    hasValidGuide = true;
+                }
+            }
+        }
+    }
+
     // Add path-guided indirect lighting (one-bounce GI with learned direction distribution)
     // Secondary bounces use __closesthit__radiance_bounce via RAY_TYPE_INDIRECT, so no recursion guard needed
     float3 indirectBounceDir = make_float3(0.0f, 0.0f, 0.0f);
     float indirectBounceLuminance = 0.0f;
+    float indirectIncidentLuminance = 0.0f;
+    float indirectSamplingPdf = 1.0f;
     {
         float3 guidedIndirect = computeGuidedIndirectLighting(
+            grid, guideCellIdx, hasValidGuide,
+            guideTrilinear,
             hitPos, geomNormal, shadingNormal, V,
             baseColorRGB, metallic, roughness, seed,
-            &indirectBounceDir, &indirectBounceLuminance);
+            &indirectBounceDir, &indirectBounceLuminance, &indirectIncidentLuminance,
+            &indirectSamplingPdf);
         Lo = Lo + guidedIndirect;
     }
 
@@ -648,47 +782,23 @@ extern "C" __global__ void __closesthit__radiance() {
 
     Lo = clamp(Lo, 0.0f, 1000.0f);
 
-    // Path guiding: collect occupancy for debug visualization and train direction distributions
-    // Reference: Müller et al., "Practical Path Guiding for Efficient Light-Transport Simulation", EGSR 2017
+    // Path guiding: collect occupancy and train direction distributions.
+    //
+    // Two key techniques from the literature ensure correct online training:
+    //
+    // 1. Importance-weighted training (Li / p(ω)): Makes each deposit an
+    //    unbiased estimate of ∫Li(ω)dω regardless of sampling strategy.
+    //
+    // 2. Stochastic box filter via trilinear neighbor reuse (Müller 2017):
+    //    Stochastically selecting one trilinear neighbor (weighted by
+    //    trilinear weights) is equivalent to jittering by ±0.5 cells.
+    //    Reuses the already-computed allNeighbors, avoiding an extra
+    //    hierarchical binary search through global memory.
     if (params.path_guide_num_levels > 0) {
-        SparsePathGuideDescriptorDevice grid = {};
-        grid.morton_codes = params.path_guide_morton_codes;
-        grid.data = params.path_guide_data;
-        grid.level_offsets = params.path_guide_level_offsets;
-        grid.num_levels = params.path_guide_num_levels;
-        grid.entry_stride = params.path_guide_entry_stride;
-        grid.base_resolution = params.path_guide_base_resolution;
-        grid.per_level_scale = params.path_guide_per_level_scale;
-        grid.bounds_min[0] = params.path_guide_bounds_min[0];
-        grid.bounds_min[1] = params.path_guide_bounds_min[1];
-        grid.bounds_min[2] = params.path_guide_bounds_min[2];
-        grid.bounds_max[0] = params.path_guide_bounds_max[0];
-        grid.bounds_max[1] = params.path_guide_bounds_max[1];
-        grid.bounds_max[2] = params.path_guide_bounds_max[2];
-
-        // NOTE: Debug-level staging was removed. It wrote 2M entries per frame
-        // (one per pixel) into the staging buffer, inflating buildFromStaging's
-        // sort from ~500K to 2.5M entries and adding ~150ms of CPU overhead.
-        // The wireframe visualization now uses cells created by cell seeding
-        // and training, which cover all visible surfaces via generateEdgeVerticesAllLevels().
-
-        // Cell seeding: ensure every visible surface gets a cell, even in shadow.
-        // Decoupled from training — cells are created for ALL hits (stochastically),
-        // while training data is only collected where there's light to learn from.
-        if (params.path_guide_training_probability > 0.0f &&
-            params.path_guide_staging_buffer != nullptr && params.path_guide_staging_count != nullptr &&
-            params.path_guide_staging_capacity > 0 &&
-            randomFloat(seed) < params.path_guide_training_probability) {
-
-            unsigned int foundLevel = 0;
-            unsigned int cellIdx = hierarchicalCellLookup(
-                grid, hitPos.x, hitPos.y, hitPos.z,
-                params.path_guide_max_level,
-                params.path_guide_min_level,
-                &foundLevel);
-
-            if (cellIdx == 0xFFFFFFFFu) {
-                // No cell exists — seed one at start level so all geometry gets coverage
+        if (exactCellIdx == 0xFFFFFFFFu) {
+            // No cell exists — seed one at start level so all geometry gets coverage.
+            if (params.path_guide_staging_buffer != nullptr && params.path_guide_staging_count != nullptr &&
+                params.path_guide_staging_capacity > 0) {
                 float nx, ny, nz;
                 worldToNormalized(grid, hitPos.x, hitPos.y, hitPos.z, nx, ny, nz);
                 int ix, iy, iz;
@@ -700,63 +810,32 @@ extern "C" __global__ void __closesthit__radiance() {
                 staging.capacity = params.path_guide_staging_capacity;
                 pathGuideStagingAppend(staging, params.path_guide_start_level, ix, iy, iz);
             }
-        }
+        } else if (indirectIncidentLuminance > 1e-6f) {
+            // Stochastic box filter via trilinear neighbor reuse (Müller 2017):
+            // The trilinear weights from computeTrilinearNeighbors are exactly
+            // the box filter kernel overlap probabilities. Stochastically selecting
+            // one neighbor (weighted by trilinear weights) is mathematically
+            // equivalent to jittering the position by ±0.5 cells and looking up
+            // the cell — but avoids an extra hierarchical binary search.
+            unsigned int trainCellIdx = stochasticSelectCell(allNeighbors, randomFloat(seed));
 
-        // Training: stochastic subsampling per Müller et al. 2017 §4.1
-        // Train from direct lighting AND/OR indirect bounce — either source is valid.
-        if (params.path_guide_training_buffer != nullptr && params.path_guide_training_count != nullptr &&
-            params.path_guide_training_capacity > 0 &&
-            (contribLuminance > 0.0f || indirectBounceLuminance > 1e-6f) &&
-            randomFloat(seed) < params.path_guide_training_probability) {
+            // Fall back to exact cell if no trilinear neighbor found
+            if (trainCellIdx == 0xFFFFFFFFu) trainCellIdx = exactCellIdx;
 
-            // Find finest existing cell for this position
-            unsigned int foundLevel = 0;
-            unsigned int cellIdx = hierarchicalCellLookup(
-                grid, hitPos.x, hitPos.y, hitPos.z,
-                params.path_guide_max_level,
-                params.path_guide_min_level,
-                &foundLevel);
-
-            float nx, ny, nz;
-            worldToNormalized(grid, hitPos.x, hitPos.y, hitPos.z, nx, ny, nz);
-            int ix, iy, iz;
-
-            unsigned int trainLevel;
-            if (cellIdx != 0xFFFFFFFFu) {
-                trainLevel = foundLevel;
-                normalizedToCell(nx, ny, nz, trainLevel, grid, ix, iy, iz);
-            } else {
-                trainLevel = params.path_guide_start_level;
-                normalizedToCell(nx, ny, nz, trainLevel, grid, ix, iy, iz);
-            }
-
-            PathGuideTrainingStagingDevice trainStaging = {};
-            trainStaging.buffer = params.path_guide_training_buffer;
-            trainStaging.count = params.path_guide_training_count;
-            trainStaging.capacity = params.path_guide_training_capacity;
-
-            // Train from direct lighting direction
-            if (contribLuminance > 0.0f) {
-                float len = sqrtf(lightDir.x*lightDir.x + lightDir.y*lightDir.y + lightDir.z*lightDir.z);
-                if (len > 1e-6f) {
-                    float ux = lightDir.x / len, uy = lightDir.y / len, uz = lightDir.z / len;
-                    pathGuideTrainingAppend(trainStaging, trainLevel, ix, iy, iz, ux, uy, uz, contribLuminance, params.frame_index);
-                }
-            }
-
-            // Train from indirect bounce direction
-            float blen = sqrtf(indirectBounceDir.x*indirectBounceDir.x +
-                               indirectBounceDir.y*indirectBounceDir.y +
-                               indirectBounceDir.z*indirectBounceDir.z);
-            if (blen > 1e-6f && indirectBounceLuminance > 1e-6f) {
-                float bx = indirectBounceDir.x / blen;
-                float by = indirectBounceDir.y / blen;
-                float bz = indirectBounceDir.z / blen;
-                float bounceNdotL = fmaxf(dot(shadingNormal, make_float3(bx, by, bz)), 0.0f);
-                float bounceWeight = indirectBounceLuminance * bounceNdotL;
-                if (bounceWeight > 1e-6f) {
-                    pathGuideTrainingAppend(trainStaging, trainLevel, ix, iy, iz,
-                        bx, by, bz, bounceWeight, params.frame_index);
+            float* cell = sparseCellDataPtr(grid, trainCellIdx);
+            if (cell != nullptr) {
+                float blen = sqrtf(indirectBounceDir.x*indirectBounceDir.x +
+                                   indirectBounceDir.y*indirectBounceDir.y +
+                                   indirectBounceDir.z*indirectBounceDir.z);
+                if (blen > 1e-6f) {
+                    float bx = indirectBounceDir.x / blen;
+                    float by = indirectBounceDir.y / blen;
+                    float bz = indirectBounceDir.z / blen;
+                    // Importance-weighted training: Li / p(ω)
+                    // Clamp to prevent extreme weights from corrupting cell sums.
+                    float trainWeight = indirectIncidentLuminance / fmaxf(indirectSamplingPdf, 1e-4f);
+                    trainWeight = fminf(trainWeight, 500.0f);
+                    pathGuideTrainCell(cell, bx, by, bz, trainWeight, params.frame_index);
                 }
             }
         }
@@ -848,7 +927,9 @@ extern "C" __global__ void __closesthit__radiance_bounce() {
     }
 
     float3 rayDir = optixGetWorldRayDirection();
-    if (material.doubleSided && dot(shadingNormal, rayDir) > 0.0f) {
+    float3 origGeomNormal = geomNormal;
+    float3 origShadingNormal = shadingNormal;
+    if (material.doubleSided && dot(geomNormal, rayDir) > 0.0f) {
         shadingNormal = -shadingNormal;
         geomNormal = -geomNormal;
     }
@@ -856,10 +937,67 @@ extern "C" __global__ void __closesthit__radiance_bounce() {
     float3 V = normalize(params.camera.position - hitPos);
     float3 baseColorRGB = make_float3(baseColor.x, baseColor.y, baseColor.z);
 
-    // Generate seed for random sampling
+    // Generate seed for random sampling (moved before glass block)
     unsigned int pixelIdx = optixGetLaunchIndex().y * params.width + optixGetLaunchIndex().x;
     unsigned int dirHash = __float_as_uint(rayDir.x) ^ __float_as_uint(rayDir.y) ^ __float_as_uint(rayDir.z);
     unsigned int seed = pixelIdx ^ (params.frame_index * 0x9E3779B9u) ^ dirHash;
+
+    // ── Glass / Transmission ──
+    if (material.transmission > 0.0f) {
+        unsigned int depth = getPayloadDepth();
+        if (depth < params.max_bounce_depth) {
+            float3 I = rayDir;
+            // Use original (pre-double-sided-flip) geometric normal for entering/exiting
+            bool entering = dot(origGeomNormal, I) < 0.0f;
+
+            float eta = entering ? (1.0f / material.ior) : material.ior;
+            float3 N  = entering ? origShadingNormal : -origShadingNormal;
+            float3 gN = entering ? origGeomNormal    : -origGeomNormal;
+
+            float F = fresnelDielectric(dot(N, -I), eta);
+
+            float3 newDir;
+            bool reflected;
+            if (randomFloat(seed) < F) {
+                newDir = reflect(I, N);
+                reflected = true;
+            } else {
+                if (!refract(I, N, eta, newDir)) {
+                    newDir = reflect(I, N);  // total internal reflection
+                    reflected = true;
+                } else {
+                    reflected = false;
+                }
+            }
+
+            float3 origin = hitPos + (reflected ? gN : -gN) * 0.001f;
+            unsigned int gp0, gp1, gp2, gp3, gp4, gp5;
+            gp0 = gp1 = gp2 = __float_as_uint(0.0f);
+            gp3 = __float_as_uint(0.0f);
+            gp4 = 0xFFFFFFFFu;
+            gp5 = depth + 1;
+
+            optixTrace(params.scene_handle, origin, normalize(newDir),
+                       0.001f, 10000.0f, 0.0f, 0xFF, OPTIX_RAY_FLAG_NONE,
+                       RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
+                       gp0, gp1, gp2, gp3, gp4, gp5);
+
+            float3 result = make_float3(
+                __uint_as_float(gp0), __uint_as_float(gp1), __uint_as_float(gp2));
+
+            // Tint refracted rays by base color (colored glass)
+            if (!reflected)
+                result = result * baseColorRGB;
+
+            result = result + emissive;
+            setPayloadColor(clamp(result, 0.0f, 1000.0f));
+            setPayloadHitDistance(optixGetRayTmax());
+            setPayloadInstanceId(instanceId);
+            setPayloadDepth(depth);
+            return;
+        }
+        // depth exceeded → fall through to opaque shading
+    }
 
     // Direct lighting only (no indirect bounce, no path guiding)
     float3 Lo = computeStandardDirectLighting(

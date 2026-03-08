@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <string>
 #include <memory>
+#include <future>
 
 namespace spectra {
 
@@ -141,6 +142,10 @@ private:
     // Buffers
     float4* m_accumulationBuffer = nullptr;
 
+    // Scene bounds (world space, computed during loadScene)
+    glm::vec3 m_sceneMin = glm::vec3(0.0f);
+    glm::vec3 m_sceneMax = glm::vec3(0.0f);
+
     // State
     FrameTimer m_timer;
     QualityMode m_qualityMode = QUALITY_BALANCED;
@@ -180,6 +185,9 @@ private:
     uint32_t m_pathGuideAutoBuildInterval = 8;  // Rebuild every N frames (Müller et al. recommend frequent rebuilds)
     uint32_t m_pathGuideTotalBuilds = 0;
     bool m_buildThisFrame = false;
+    bool m_pathGuideBuildInFlight = false;
+    std::future<bool> m_buildFuture;         // Background thread for CPU-heavy build processing
+    bool m_buildThreadActive = false;        // True while background build thread is running
     uint32_t m_pathGuideStatsFrame = 0;      // Frame counter for stats printing
 
     // Cell inspector state (populated on click)

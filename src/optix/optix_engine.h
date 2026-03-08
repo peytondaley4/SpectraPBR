@@ -11,7 +11,6 @@ namespace spectra {
 
 struct SparsePathGuideDescriptor;
 struct PathGuideStagingDescriptor;
-struct PathGuideTrainingStagingDescriptor;
 
 // OptiX error checking macro
 #define OPTIX_CHECK(call)                                                        \
@@ -133,13 +132,11 @@ public:
 
     // Path guide grid (sparse + staging)
     void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
-        const PathGuideStagingDescriptor* staging,
-        const PathGuideTrainingStagingDescriptor* training = nullptr);
+        const PathGuideStagingDescriptor* staging);
     void setPathGuideGridDebug(bool visualize, uint32_t level);
     void setPathGuideNoJitter(bool noJitter);
     void setPathGuideEnabled(bool enabled);
     void setPathGuideMISWeight(float weight);
-    void setPathGuideTrainingProbability(float prob);
     void setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel);
 
     // Path guide debugging
@@ -193,6 +190,13 @@ private:
     // Launch parameters
     LaunchParams m_launchParams = {};
     CUdeviceptr m_launchParamsBuffer = 0;
+
+    // Double-buffered pinned launch params for truly async H2D upload.
+    // cudaMemcpyAsync from pageable memory implicitly synchronizes the stream,
+    // blocking the CPU for the entire previous frame's GPU time (~50ms at 20 FPS).
+    // Pinned memory eliminates this per-frame CPU stall.
+    LaunchParams* m_pinnedLaunchParams[2] = { nullptr, nullptr };
+    int m_pinnedLaunchIdx = 0;
 
     // State
     uint32_t m_width = 0;

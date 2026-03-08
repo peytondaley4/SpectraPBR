@@ -246,23 +246,28 @@ struct GpuLaunchParams {
     unsigned int* path_guide_staging_buffer;
     unsigned int* path_guide_staging_count;
     unsigned int path_guide_staging_capacity;
-    float* path_guide_training_buffer;
-    unsigned int* path_guide_training_count;
-    unsigned int path_guide_training_capacity;
     unsigned int debug_grid_visualize;
     unsigned int debug_grid_level;
     unsigned int path_guide_no_jitter;  // When set, use center-pixel rays for deterministic staging
     unsigned int path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
     float path_guide_mis_weight;        // Blend factor for MIS (0.5 = balanced)
-    float path_guide_training_probability; // Stochastic subsampling rate for training (0-1)
     // Adaptive level parameters (from config)
     unsigned int path_guide_start_level; // Initial level for new regions
     unsigned int path_guide_min_level;   // Coarsest allowed level
     unsigned int path_guide_max_level;   // Finest allowed level
+    unsigned int path_guide_level_resolutions[16];  // Precomputed floor(base_res * scale^level)
+
+    // Hash table for O(1) cell lookup (replaces binary search)
+    const unsigned long long* path_guide_hash_keys;    // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF
+    const unsigned int* path_guide_hash_values;        // flat cell index
+    unsigned int path_guide_hash_table_size;            // power of 2
+    unsigned int path_guide_hash_shift;                 // 64 - log2(hash_table_size)
 
     // Debug statistics (atomic counters, reset each frame)
     unsigned int* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed
     unsigned int path_guide_debug_enabled; // 1 = collect debug stats
+
+    unsigned int max_bounce_depth;      // Max recursive bounces for glass/transmission
 };
 
 //------------------------------------------------------------------------------

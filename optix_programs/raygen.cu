@@ -57,12 +57,13 @@ extern "C" __global__ void __raygen__simple() {
                       + params.camera.up * (ndcY * tanHalfFovY);
         rayDir = normalize(rayDir);
 
-        unsigned int p0, p1, p2, p3, p4;
+        unsigned int p0, p1, p2, p3, p4, p5;
         p0 = __float_as_uint(0.0f);
         p1 = __float_as_uint(0.0f);
         p2 = __float_as_uint(0.0f);
         p3 = __float_as_uint(-1.0f);
         p4 = 0xFFFFFFFFu;
+        p5 = 0;  // Initial bounce depth
 
         if (params.scene_handle != 0) {
             optixTrace(
@@ -77,7 +78,7 @@ extern "C" __global__ void __raygen__simple() {
                 RAY_TYPE_RADIANCE,
                 RAY_TYPE_COUNT,
                 RAY_TYPE_RADIANCE,
-                p0, p1, p2, p3, p4
+                p0, p1, p2, p3, p4, p5
             );
         } else {
             p0 = __float_as_uint(u);

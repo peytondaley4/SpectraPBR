@@ -57,7 +57,6 @@ struct PathGuideGridConfig {
     float bounds_min[3] = { -10.0f, -10.0f, -10.0f };
     float bounds_max[3] = {  10.0f,  10.0f,  10.0f };
     uint32_t staging_capacity = 1u << 19;  // 512K entries for cell seeding (no debug staging)
-    uint32_t training_capacity = 1u << 19; // 512K training entries (~18 MB vs 144 MB at 4M)
 
     // Adaptive refinement settings
     uint32_t start_level = 2;              // Initial coarse level for new regions
@@ -82,6 +81,12 @@ struct SparsePathGuideDescriptor {
     float per_level_scale;
     float bounds_min[3];
     float bounds_max[3];
+
+    // Hash table for O(1) cell lookup
+    const uint64_t* hash_keys = nullptr;
+    const uint32_t* hash_values = nullptr;
+    uint32_t hash_table_size = 0;
+    uint32_t hash_shift = 0;
 };
 
 //------------------------------------------------------------------------------
@@ -90,13 +95,6 @@ struct SparsePathGuideDescriptor {
 struct PathGuideStagingDescriptor {
     uint32_t* buffer;    // 4 × capacity: [level, ix, iy, iz] per entry (device)
     uint32_t* count;     // Atomic counter (device), 1 element
-    uint32_t capacity;
-};
-
-// Training staging: (level, ix, iy, iz, dir_x, dir_y, dir_z, weight) per entry, 8 floats
-struct PathGuideTrainingStagingDescriptor {
-    float* buffer;
-    uint32_t* count;
     uint32_t capacity;
 };
 
@@ -118,7 +116,6 @@ public:
 
     // Staging: call before each frame to let closest-hit append occupancy
     void resetStagingCount(cudaStream_t stream = nullptr);
-    void resetTrainingCount(cudaStream_t stream = nullptr);
 
     // Build sparse grid from staging (readback, sort/unique, upload). Call after trace.
     // currentFrame: used to initialize lastHitFrame for newly-created cells so they
@@ -126,8 +123,16 @@ public:
     bool buildFromStaging(cudaStream_t stream = nullptr, uint32_t currentFrame = 0);
 
     SparsePathGuideDescriptor getDescriptor() const;
+    SparsePathGuideDescriptor getRenderDescriptor() const;  // Always returns active render grid
     PathGuideStagingDescriptor getStagingDescriptor() const;
-    PathGuideTrainingStagingDescriptor getTrainingStagingDescriptor() const;
+
+    // ── Async readback pipeline (double-buffered, non-blocking) ──
+    bool initAsync();
+    void shutdownAsync();
+    void beginAsyncReadback(cudaStream_t renderStream, uint32_t currentFrame);
+    bool pollAsyncReadback();
+    bool finishBuildFromReadback();
+    void swapGrids(cudaStream_t renderStream = nullptr);
 
     uint32_t getNumLevels() const { return m_numLevels; }
     uint32_t getEntryStride() const { return m_entryStride; }
@@ -160,9 +165,6 @@ public:
     };
     CellInspectionResult inspectCellAtPosition(float px, float py, float pz) const;
 
-    // Read training sample count from device
-    uint32_t readTrainingCount(cudaStream_t stream = nullptr) const;
-
     // Get refinement statistics
     uint32_t getStartLevel() const { return m_config.start_level; }
     uint32_t getMinLevel() const { return m_config.min_level; }
@@ -188,13 +190,59 @@ private:
     uint32_t* m_stagingCount = nullptr;
     uint32_t m_stagingCapacity = 0;
 
-    float* m_trainingBuffer = nullptr;
-    uint32_t* m_trainingCount = nullptr;
-    uint32_t m_trainingCapacity = 0;
-
     // Precomputed level resolutions: avoids std::pow in hot loops
     static constexpr uint32_t MAX_LEVELS = 16;
     uint32_t m_levelResolutions[MAX_LEVELS] = {};  // floor(base_res * scale^level)
+
+    // Hash table for single-grid path (device memory)
+    uint64_t* m_hashKeys = nullptr;
+    uint32_t* m_hashValues = nullptr;
+    uint32_t  m_hashTableSize = 0;
+    uint32_t  m_hashShift = 0;
+    uint32_t  m_hashAllocated = 0;
+
+    // Build hash table from current morton codes + level offsets, upload to GPU
+    bool buildAndUploadHashTable(uint64_t*& outKeys, uint32_t*& outValues,
+                                 uint32_t& outSize, uint32_t& outShift, uint32_t& outAllocated,
+                                 const std::vector<uint64_t>& mortonHost,
+                                 uint32_t totalCells,
+                                 cudaStream_t stream = nullptr);
+
+    // ── Double-buffered GPU grid (render vs build) ──
+    struct GridBuffers {
+        uint64_t* mortonCodes = nullptr;
+        float*    data = nullptr;
+        uint32_t* levelOffsetsDevice = nullptr;
+        uint32_t  totalCells = 0;
+        uint32_t  allocatedCells = 0;
+
+        // Hash table (device memory)
+        uint64_t* hashKeys = nullptr;
+        uint32_t* hashValues = nullptr;
+        uint32_t  hashTableSize = 0;
+        uint32_t  hashShift = 0;
+        uint32_t  hashAllocated = 0;  // current GPU capacity
+    };
+    GridBuffers m_grids[2];
+    int m_renderGridIdx = 0;
+    int m_buildGridIdx = 1;
+
+    // Async readback infrastructure
+    cudaStream_t m_readbackStream = nullptr;
+    cudaEvent_t  m_renderDoneEvent = nullptr;
+    cudaEvent_t  m_readbackDoneEvent = nullptr;
+
+    // Pinned host buffers (required for non-blocking async D2H)
+    uint32_t* m_pinnedStagingCount = nullptr;
+    uint32_t* m_pinnedStagingBuffer = nullptr;
+    size_t    m_pinnedStagingBufferCapacity = 0;
+    float*    m_pinnedGpuData = nullptr;
+    size_t    m_pinnedGpuDataCapacity = 0;
+
+    enum class AsyncState { Idle, ReadbackInFlight, ReadbackReady };
+    AsyncState m_asyncState = AsyncState::Idle;
+    uint32_t m_pendingCurrentFrame = 0;
+    bool m_asyncInitialized = false;
 };
 
 } // namespace spectra

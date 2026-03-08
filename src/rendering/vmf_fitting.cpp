@@ -27,8 +27,9 @@ bool fitFromSums(float sumX, float sumY, float sumZ, float sumW,
     // Sra (2012): kappa from R_bar for vMF
     float denom = std::max(1.0f - Rbar*Rbar, 0.01f);
     float kappa = (Rbar * (3.0f - Rbar*Rbar)) / denom;
-    // Clamp κ: at κ > ~40, exp(-2κ) underflows in Wood/Ulrich sampling
-    kappa = std::min(kappa, 80.0f);
+    // Clamp κ: exp(-2κ) underflows at large κ, but Wood/Ulrich handles this
+    // gracefully (arg clamps to 1e-10 → w≈1). Allow tighter fits for converged scenes.
+    kappa = std::min(kappa, 300.0f);
 
     float theta = std::acos(std::max(-1.0f, std::min(1.0f, ny)));
     float phi = std::atan2(nz, nx);
@@ -43,10 +44,12 @@ bool fitFromSums(float sumX, float sumY, float sumZ, float sumW,
 float vmfPdfCpu(float kappa, float cosTheta)
 {
     if (kappa <= 1e-6f) return INV_4PI;
-    float sinhK = std::sinh(kappa);
-    if (sinhK < 1e-10f) return INV_4PI;
-    float C3 = kappa / (4.0f * PI * sinhK);
-    return C3 * std::exp(kappa * cosTheta);
+    // Numerically stable form: kappa/(2pi) * exp(kappa*(cosTheta-1)) / (1-exp(-2*kappa))
+    float exp_neg2k = std::exp(-2.0f * kappa);
+    float denom = 1.0f - exp_neg2k;
+    if (denom < 1e-10f) denom = 1.0f;
+    float pdf = (kappa / TWO_PI) * std::exp(kappa * (cosTheta - 1.0f)) / denom;
+    return std::max(pdf, 0.0f);
 }
 
 bool fitTwoLobes(

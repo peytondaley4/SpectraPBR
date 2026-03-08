@@ -30,6 +30,14 @@ __forceinline__ __device__ void setPayloadInstanceId(unsigned int instanceId) {
     optixSetPayload_4(instanceId);
 }
 
+__forceinline__ __device__ void setPayloadDepth(unsigned int depth) {
+    optixSetPayload_5(depth);
+}
+
+__forceinline__ __device__ unsigned int getPayloadDepth() {
+    return optixGetPayload_5();
+}
+
 __forceinline__ __device__ float3 getPayloadColor() {
     return make_float3(
         __uint_as_float(optixGetPayload_0()),

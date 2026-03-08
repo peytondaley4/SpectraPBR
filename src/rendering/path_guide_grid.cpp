@@ -65,31 +65,6 @@ bool PathGuideGrid::init(const PathGuideGridConfig& config) {
     }
     m_stagingCapacity = config.staging_capacity;
 
-    // Training staging: 9 floats per entry (level, ix, iy, iz, dir_x, dir_y, dir_z, weight, frame)
-    uint32_t trainCap = config.training_capacity > 0 ? config.training_capacity : config.staging_capacity;
-    err = cudaMalloc(&m_trainingBuffer, trainCap * 9 * sizeof(float));
-    if (err != cudaSuccess) {
-        cudaFree(m_stagingCount);
-        cudaFree(m_stagingBuffer);
-        m_stagingBuffer = nullptr;
-        m_stagingCount = nullptr;
-        std::cerr << "[PathGuideGrid] cudaMalloc training buffer failed: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
-    err = cudaMalloc(&m_trainingCount, sizeof(uint32_t));
-    if (err != cudaSuccess) {
-        cudaFree(m_trainingBuffer);
-        cudaFree(m_stagingCount);
-        cudaFree(m_stagingBuffer);
-        m_trainingBuffer = nullptr;
-        m_stagingBuffer = nullptr;
-        m_stagingCount = nullptr;
-        std::cerr << "[PathGuideGrid] cudaMalloc training count failed: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
-    m_trainingCapacity = trainCap;
-    cudaMemset(m_trainingCount, 0, sizeof(uint32_t));
-
     // Sparse arrays: start empty (no cells until build)
     m_totalCells = 0;
     m_mortonCodes = nullptr;
@@ -122,20 +97,23 @@ bool PathGuideGrid::init(const PathGuideGridConfig& config) {
 }
 
 void PathGuideGrid::shutdown() {
+    shutdownAsync();
     if (m_mortonCodes) { cudaFree(m_mortonCodes); m_mortonCodes = nullptr; }
     if (m_data) { cudaFree(m_data); m_data = nullptr; }
     if (m_levelOffsetsDevice) { cudaFree(m_levelOffsetsDevice); m_levelOffsetsDevice = nullptr; }
     if (m_stagingBuffer) { cudaFree(m_stagingBuffer); m_stagingBuffer = nullptr; }
     if (m_stagingCount) { cudaFree(m_stagingCount); m_stagingCount = nullptr; }
-    if (m_trainingBuffer) { cudaFree(m_trainingBuffer); m_trainingBuffer = nullptr; }
-    if (m_trainingCount) { cudaFree(m_trainingCount); m_trainingCount = nullptr; }
+    if (m_hashKeys) { cudaFree(m_hashKeys); m_hashKeys = nullptr; }
+    if (m_hashValues) { cudaFree(m_hashValues); m_hashValues = nullptr; }
+    m_hashTableSize = 0;
+    m_hashShift = 0;
+    m_hashAllocated = 0;
     m_levelOffsets.clear();
     m_numLevels = 0;
     m_entryStride = 0;
     m_totalCells = 0;
     m_allocatedCells = 0;
     m_stagingCapacity = 0;
-    m_trainingCapacity = 0;
 }
 
 void PathGuideGrid::clear(cudaStream_t stream) {
@@ -145,6 +123,8 @@ void PathGuideGrid::clear(cudaStream_t stream) {
         cudaMemsetAsync(m_data, 0, numBytes, stream);
     else
         cudaMemset(m_data, 0, numBytes);
+    // Also zero host copy to reset lifetime totals
+    std::fill(m_dataHost.begin(), m_dataHost.end(), 0.0f);
 }
 
 void PathGuideGrid::resetStagingCount(cudaStream_t stream) {
@@ -156,14 +136,6 @@ void PathGuideGrid::resetStagingCount(cudaStream_t stream) {
         cudaMemsetAsync(m_stagingCount, 0, sizeof(uint32_t), stream);
     else
         cudaMemset(m_stagingCount, 0, sizeof(uint32_t));
-}
-
-void PathGuideGrid::resetTrainingCount(cudaStream_t stream) {
-    if (!m_trainingCount) return;
-    if (stream)
-        cudaMemsetAsync(m_trainingCount, 0, sizeof(uint32_t), stream);
-    else
-        cudaMemset(m_trainingCount, 0, sizeof(uint32_t));
 }
 
 bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame) {
@@ -179,12 +151,11 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
         std::cerr << "[PathGuideGrid] read staging count failed: " << cudaGetErrorString(err) << std::endl;
         return false;
     }
-    if (count == 0) {
-        // No new staging data this build — keep existing grid instead of clearing.
-        // Clearing caused cells to disappear whenever a build frame had zero hits (e.g. camera
-        // pointed at sky), and only some cells would come back on later builds.
-        return true;
-    }
+    // When count == 0 (no new staging entries), the grid structure doesn't change
+    // but training data still needs processing. Don't return early — let the function
+    // flow through with zero staging entries so the existing-cell merge and training
+    // processing still run.
+
     // count = number of entries (each entry = 4 uints: level, ix, iy, iz)
     uint32_t rawCount = count;  // Keep original for overflow detection
     if (count > m_stagingCapacity) {
@@ -197,10 +168,12 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
     uint32_t numUints = count * 4;
 
     std::vector<uint32_t> staging(numUints);
-    err = cudaMemcpy(staging.data(), m_stagingBuffer, numUints * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        std::cerr << "[PathGuideGrid] read staging buffer failed: " << cudaGetErrorString(err) << "\n";
-        return false;
+    if (numUints > 0) {
+        err = cudaMemcpy(staging.data(), m_stagingBuffer, numUints * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            std::cerr << "[PathGuideGrid] read staging buffer failed: " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
     }
 
     // Build unique (level, morton) and sort. Same staging data produces the same
@@ -246,12 +219,10 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 
-    // Save previous grid BEFORE overwriting m_levelOffsets (needed for data carry-forward)
-    // Uses persistent host copy (m_dataHost) to avoid blocking D2H readback
+    // Save previous grid BEFORE overwriting m_levelOffsets (needed for GPU readback carry-forward)
     std::vector<uint64_t> prevMorton = m_mortonCodesHost;
     std::vector<uint32_t> prevOffsets = m_levelOffsets;  // OLD offsets
     uint32_t prevTotalCells = m_mortonCodesHost.empty() ? 0 : static_cast<uint32_t>(m_mortonCodesHost.size());
-    std::vector<float> prevData = m_dataHost;  // Already on host, no GPU readback needed
 
     // Per-level counts and prefix sum
     m_levelOffsets.assign(m_numLevels + 1, 0u);
@@ -277,159 +248,167 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
         mortonHost[idx] = k.morton;
     }
 
-    // Carry forward existing cell data (vMF lobes + stats) for cells that persist
-    if (prevTotalCells > 0 && !prevData.empty()) {
+    // Keep CPU copy for edge generation
+    m_mortonCodesHost = mortonHost;
+
+    // Read back GPU data containing atomic-accumulated interval sums.
+    // The GPU m_data has current vMF params (offsets 0-5, 10) AND the interval
+    // sums (offsets 6-9) accumulated via atomicAdd in pathGuideTrainAtomic(),
+    // plus lastHitFrame (offset 11) via atomicMax.
+    // For persistent cells, use GPU readback; for new cells, dataHost is zeroed.
+    std::vector<float> gpuReadback;
+    if (m_data && prevTotalCells > 0) {
+        size_t gpuFloats = static_cast<size_t>(prevTotalCells) * m_entryStride;
+        gpuReadback.resize(gpuFloats);
+        err = cudaMemcpy(gpuReadback.data(), m_data, gpuFloats * sizeof(float), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            std::cerr << "[PathGuideGrid] Failed to read GPU data: " << cudaGetErrorString(err) << std::endl;
+            gpuReadback.clear();
+        }
+    }
+
+    // Carry forward from GPU readback: persistent cells get their live GPU data
+    // (which includes atomically-accumulated interval sums)
+    if (!gpuReadback.empty() && prevTotalCells > 0) {
         for (uint32_t lev = 0; lev < m_numLevels && lev < static_cast<uint32_t>(prevOffsets.size()) - 1; lev++) {
-            uint32_t prevStart = prevOffsets[lev];
-            uint32_t prevEnd = prevOffsets[lev + 1];
-            uint32_t newStart = m_levelOffsets[lev];
-            uint32_t newEnd = m_levelOffsets[lev + 1];
-            // Both are sorted by morton within level — merge with two pointers
-            uint32_t pi = prevStart, ni = newStart;
-            while (pi < prevEnd && ni < newEnd) {
-                if (prevMorton[pi] < mortonHost[ni]) {
-                    pi++;
-                } else if (prevMorton[pi] > mortonHost[ni]) {
-                    ni++;
+            uint32_t pStart = prevOffsets[lev];
+            uint32_t pEnd = prevOffsets[lev + 1];
+            uint32_t nStart = m_levelOffsets[lev];
+            uint32_t nEnd = m_levelOffsets[lev + 1];
+            uint32_t pi2 = pStart, ni2 = nStart;
+            while (pi2 < pEnd && ni2 < nEnd) {
+                if (prevMorton[pi2] < mortonHost[ni2]) {
+                    pi2++;
+                } else if (prevMorton[pi2] > mortonHost[ni2]) {
+                    ni2++;
                 } else {
-                    // Same cell exists in both — copy data
-                    size_t srcOff = static_cast<size_t>(pi) * m_entryStride;
-                    size_t dstOff = static_cast<size_t>(ni) * m_entryStride;
-                    std::memcpy(&dataHost[dstOff], &prevData[srcOff], m_entryStride * sizeof(float));
-                    pi++;
-                    ni++;
+                    // Persistent cell: overwrite with GPU data (has live interval sums)
+                    size_t srcOff = static_cast<size_t>(pi2) * m_entryStride;
+                    size_t dstOff = static_cast<size_t>(ni2) * m_entryStride;
+                    std::memcpy(&dataHost[dstOff], &gpuReadback[srcOff], m_entryStride * sizeof(float));
+                    pi2++;
+                    ni2++;
                 }
             }
         }
     }
 
-    // Keep CPU copy for edge generation
-    m_mortonCodesHost = mortonHost;
-
-    // Merge training data into vMF lobes (Practical Path Guiding: fit direction distribution per cell)
-    // Note: caller already synchronized the stream before calling buildFromStaging
-    if (m_trainingBuffer && m_trainingCount && m_trainingCapacity > 0 && m_totalCells > 0) {
-        uint32_t trainCount = 0;
-        err = cudaMemcpy(&trainCount, m_trainingCount, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        // Training count logged in build summary below
-
-        if (err == cudaSuccess && trainCount > 0) {
-            // Clamp to capacity
-            if (trainCount > m_trainingCapacity) {
-                trainCount = m_trainingCapacity;
-            }
-
-            size_t trainFloats = static_cast<size_t>(trainCount) * 9;
-            std::vector<float> training(trainFloats);
-            err = cudaMemcpy(training.data(), m_trainingBuffer, trainFloats * sizeof(float), cudaMemcpyDeviceToHost);
-            if (err != cudaSuccess) {
-                std::cerr << "[PathGuideGrid] Failed to read training buffer: " << cudaGetErrorString(err) << std::endl;
-            } else {
-
-                // Per-cell sample collection for 2-lobe vMF fitting
-                struct CellSample { float dx, dy, dz, w; };
-                std::vector<std::vector<CellSample>> cellSamples(m_totalCells);
-                std::vector<float> sumX(m_totalCells, 0.0f), sumY(m_totalCells, 0.0f), sumZ(m_totalCells, 0.0f);
-                std::vector<float> sumW(m_totalCells, 0.0f);
-                std::vector<uint32_t> lastFrame(m_totalCells, 0);
-                uint32_t matchedSamples = 0;
-
-                for (size_t t = 0; t + 9 <= trainFloats; t += 9) {
-                    uint32_t lev = static_cast<uint32_t>(training[t + 0]);
-                    uint32_t ix  = static_cast<uint32_t>(training[t + 1]);
-                    uint32_t iy  = static_cast<uint32_t>(training[t + 2]);
-                    uint32_t iz  = static_cast<uint32_t>(training[t + 3]);
-                    float dx = training[t + 4], dy = training[t + 5], dz = training[t + 6], w = training[t + 7];
-                    uint32_t frame = static_cast<uint32_t>(training[t + 8]);
-                    if (lev >= m_numLevels || w <= 0.0f) continue;
-                    uint32_t resU = m_levelResolutions[lev];
-                    if (ix >= resU) ix = resU - 1;
-                    if (iy >= resU) iy = resU - 1;
-                    if (iz >= resU) iz = resU - 1;
-                    uint64_t morton = mortonEncode(ix, iy, iz);
-                    uint32_t start = m_levelOffsets[lev], end = m_levelOffsets[lev + 1];
-                    auto it = std::lower_bound(mortonHost.begin() + start, mortonHost.begin() + end, morton);
-                    if (it == mortonHost.begin() + end || *it != morton) continue;
-                    size_t g = static_cast<size_t>(it - mortonHost.begin());
-                    if (g >= m_totalCells) continue;  // Safety check
-                    cellSamples[g].push_back({dx, dy, dz, w});
-                    sumX[g] += dx * w;
-                    sumY[g] += dy * w;
-                    sumZ[g] += dz * w;
-                    sumW[g] += w;
-                    if (frame > lastFrame[g]) lastFrame[g] = frame;
-                    matchedSamples++;
-                }
-
-                uint32_t cellsWithData = 0;
-                uint32_t cellsWith2Lobes = 0;
-                for (size_t g = 0; g < m_totalCells; g++) {
-                    size_t base = g * m_entryStride;
-
-                    // Safety check for entry stride
-                    if (m_entryStride < 12) {
-                        std::cerr << "[PathGuideGrid] ERROR: entry_stride " << m_entryStride << " < 12, skipping stats" << std::endl;
-                        break;
-                    }
-                    if (base + 11 >= dataHost.size()) {
-                        std::cerr << "[PathGuideGrid] ERROR: base+11=" << (base+11) << " >= dataHost.size()=" << dataHost.size() << std::endl;
-                        break;
-                    }
-
-                    uint32_t sampleCount = static_cast<uint32_t>(cellSamples[g].size());
-
-                    if (sampleCount >= 20) {
-                        // 2-lobe EM fit from per-sample data
-                        std::vector<float> dxArr(sampleCount), dyArr(sampleCount), dzArr(sampleCount), wArr(sampleCount);
-                        for (uint32_t s = 0; s < sampleCount; s++) {
-                            dxArr[s] = cellSamples[g][s].dx;
-                            dyArr[s] = cellSamples[g][s].dy;
-                            dzArr[s] = cellSamples[g][s].dz;
-                            wArr[s]  = cellSamples[g][s].w;
-                        }
-                        vmf_fitting::TwoLobeFitResult fit;
-                        if (vmf_fitting::fitTwoLobes(dxArr.data(), dyArr.data(), dzArr.data(), wArr.data(), sampleCount, fit)) {
-                            dataHost[base + 0] = fit.theta0;
-                            dataHost[base + 1] = fit.phi0;
-                            dataHost[base + 2] = fit.kappa0;
-                            dataHost[base + 3] = fit.theta1;
-                            dataHost[base + 4] = fit.phi1;
-                            dataHost[base + 5] = fit.kappa1;
-                            dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = fit.pi0;
-                            cellsWithData++;
-                            if (fit.kappa1 > 0.5f) cellsWith2Lobes++;
-                        }
-                    } else if (sumW[g] >= 1e-9f) {
-                        // Single-lobe fit from sums
-                        float theta, phi, kappa;
-                        if (vmf_fitting::fitFromSums(sumX[g], sumY[g], sumZ[g], sumW[g], theta, phi, kappa)) {
-                            dataHost[base + 0] = theta;
-                            dataHost[base + 1] = phi;
-                            dataHost[base + 2] = kappa;
-                            dataHost[base + 3] = 0.0f;  // lobe 1 inactive
-                            dataHost[base + 4] = 0.0f;
-                            dataHost[base + 5] = 0.0f;
-                            dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = 1.0f;
-                            cellsWithData++;
-                        }
-                    }
-
-                    // Store refinement stats (at offsets 6-9, 11)
-                    dataHost[base + 6] += sumX[g];
-                    dataHost[base + 7] += sumY[g];
-                    dataHost[base + 8] += sumZ[g];
-                    dataHost[base + 9] += sumW[g];
-                    // offset 10 is pi_0 (already written above), don't accumulate
-                    if (lastFrame[g] > 0) {
-                        dataHost[base + 11] = static_cast<float>(lastFrame[g]);
+    // Resize m_dataHost for new cell count (preserves lifetime totals for persistent cells
+    // via the carry-forward above; new cells start at zero)
+    {
+        std::vector<float> newDataHost(static_cast<size_t>(m_totalCells) * m_entryStride, 0.0f);
+        // Carry forward lifetime totals from old m_dataHost for persistent cells
+        if (!m_dataHost.empty() && prevTotalCells > 0) {
+            for (uint32_t lev = 0; lev < m_numLevels && lev < static_cast<uint32_t>(prevOffsets.size()) - 1; lev++) {
+                uint32_t pStart = prevOffsets[lev];
+                uint32_t pEnd = prevOffsets[lev + 1];
+                uint32_t nStart = m_levelOffsets[lev];
+                uint32_t nEnd = m_levelOffsets[lev + 1];
+                uint32_t pi3 = pStart, ni3 = nStart;
+                while (pi3 < pEnd && ni3 < nEnd) {
+                    if (prevMorton[pi3] < mortonHost[ni3]) { pi3++; }
+                    else if (prevMorton[pi3] > mortonHost[ni3]) { ni3++; }
+                    else {
+                        size_t srcOff = static_cast<size_t>(pi3) * m_entryStride;
+                        size_t dstOff = static_cast<size_t>(ni3) * m_entryStride;
+                        std::memcpy(&newDataHost[dstOff], &m_dataHost[srcOff], m_entryStride * sizeof(float));
+                        pi3++; ni3++;
                     }
                 }
-                std::cout << "[PathGuide] Build: " << m_totalCells << " cells, "
-                          << cellsWithData << " fitted (" << cellsWith2Lobes << " 2-lobe), "
-                          << matchedSamples << "/" << trainCount << " samples\n";
             }
         }
-        resetTrainingCount(stream);
+        m_dataHost = std::move(newDataHost);
+    }
+
+    // Accumulate interval sums into lifetime totals with EMA decay, then fit
+    // vMF from cumulative sums. Müller 2017 rebuilds from scratch each iteration;
+    // in our online setting, EMA decay is the substitute. A lower decay (0.7)
+    // gives an effective window of ~3 builds, preventing cells from being
+    // permanently committed to early modes while retaining enough history for
+    // stable fitting. Combined with importance-weighted training (Li/p on GPU),
+    // this allows cells to adapt as the guide improves.
+    constexpr float EMA_DECAY = 0.7f;
+    uint32_t cellsWithData = 0;
+    if (m_totalCells > 0 && m_entryStride >= 12) {
+        for (size_t g = 0; g < m_totalCells; g++) {
+            size_t base = g * m_entryStride;
+            if (base + 11 >= dataHost.size()) break;
+
+            // Extract interval sums from carried-forward GPU data
+            float iSumX = dataHost[base + 6];
+            float iSumY = dataHost[base + 7];
+            float iSumZ = dataHost[base + 8];
+            float iSumW = dataHost[base + 9];
+
+            // Accumulate into lifetime totals with EMA decay
+            size_t hostBase = g * m_entryStride;
+            if (hostBase + 11 < m_dataHost.size()) {
+                m_dataHost[hostBase + 6] = EMA_DECAY * m_dataHost[hostBase + 6] + iSumX;
+                m_dataHost[hostBase + 7] = EMA_DECAY * m_dataHost[hostBase + 7] + iSumY;
+                m_dataHost[hostBase + 8] = EMA_DECAY * m_dataHost[hostBase + 8] + iSumZ;
+                m_dataHost[hostBase + 9] = EMA_DECAY * m_dataHost[hostBase + 9] + iSumW;
+                m_dataHost[hostBase + 11] = dataHost[base + 11];
+            }
+
+            // Fit from cumulative sums (much more stable than interval-only)
+            float cumSumX = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 6] : iSumX;
+            float cumSumY = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 7] : iSumY;
+            float cumSumZ = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 8] : iSumZ;
+            float cumSumW = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 9] : iSumW;
+
+            if (cumSumW >= 1.0f) {
+                float theta0, phi0, kappa0;
+                if (vmf_fitting::fitFromSums(cumSumX, cumSumY, cumSumZ, cumSumW, theta0, phi0, kappa0)) {
+                    dataHost[base + 0] = theta0;
+                    dataHost[base + 1] = phi0;
+                    dataHost[base + 2] = kappa0;
+                    dataHost[base + 3] = 0.0f;  // lobe 1 inactive by default
+                    dataHost[base + 4] = 0.0f;
+                    dataHost[base + 5] = 0.0f;
+                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = 1.0f;
+                    cellsWithData++;
+
+                    // Two-lobe fitting: if interval sums point in a significantly
+                    // different direction from cumulative, fit a second lobe.
+                    // This captures bimodal distributions where indirect light
+                    // arrives from multiple paths (e.g., two windows in a room).
+                    float iLen = std::sqrt(iSumX*iSumX + iSumY*iSumY + iSumZ*iSumZ);
+                    if (iSumW >= 2.0f && iLen > 1e-6f) {
+                        float iNx = iSumX / iLen, iNy = iSumY / iLen, iNz = iSumZ / iLen;
+                        // Cumulative mean direction
+                        float cumLen = std::sqrt(cumSumX*cumSumX + cumSumY*cumSumY + cumSumZ*cumSumZ);
+                        if (cumLen > 1e-6f) {
+                            float cNx = cumSumX / cumLen, cNy = cumSumY / cumLen, cNz = cumSumZ / cumLen;
+                            float cosAngle = iNx*cNx + iNy*cNy + iNz*cNz;
+                            // If interval direction diverges >45° from cumulative, fit lobe 1
+                            if (cosAngle < 0.707f) {
+                                float theta1, phi1, kappa1;
+                                if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
+                                    dataHost[base + 3] = theta1;
+                                    dataHost[base + 4] = phi1;
+                                    dataHost[base + 5] = kappa1;
+                                    // Mixture weight: ratio of cumulative to total,
+                                    // scaled by effective sample count
+                                    float effCum = cumSumW;
+                                    float effInt = iSumW / (1.0f - EMA_DECAY);  // Scale interval to match cumulative timescale
+                                    float pi0 = effCum / (effCum + effInt);
+                                    pi0 = std::max(0.1f, std::min(0.9f, pi0));
+                                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = pi0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Zero interval stats for next accumulation window
+            dataHost[base + 6] = 0.0f;
+            dataHost[base + 7] = 0.0f;
+            dataHost[base + 8] = 0.0f;
+            dataHost[base + 9] = 0.0f;
+        }
+        std::cout << "[PathGuide] Build: " << m_totalCells << " cells, "
+                  << cellsWithData << " fitted\n";
     }
 
     // Initialize lastHitFrame for newly-created cells (those with lastHitFrame == 0)
@@ -444,10 +423,17 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
         }
     }
 
-    // keys are already sorted by (level, morton), so mortonHost is sorted per level
-
-    // Save host-side copy to avoid D2H readback on next build
-    m_dataHost = std::move(dataHost);
+    // Save host-side copy: dataHost has fitted vMF params + zeroed interval stats.
+    // m_dataHost retains lifetime cumulative stats for refinement decisions.
+    // We need m_dataHost to have the fitted vMF params too for inspectCellAtPosition.
+    for (size_t g = 0; g < m_totalCells; g++) {
+        size_t base = g * m_entryStride;
+        if (base + 11 >= dataHost.size()) break;
+        // Copy vMF params and pi_0 from dataHost to m_dataHost
+        for (uint32_t k = 0; k < 6; k++)
+            m_dataHost[base + k] = dataHost[base + k];
+        m_dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET];
+    }
 
     // Reuse existing GPU buffers if they're large enough; only reallocate when growing
     if (m_totalCells > m_allocatedCells) {
@@ -478,7 +464,9 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
         std::cerr << "[PathGuideGrid] cudaMemcpy morton_codes failed: " << cudaGetErrorString(err) << "\n";
         return false;
     }
-    err = cudaMemcpy(m_data, m_dataHost.data(),
+    // Upload dataHost to GPU: has fitted vMF params + zeroed interval stats (offsets 6-9),
+    // ready for next accumulation window via atomicAdd.
+    err = cudaMemcpy(m_data, dataHost.data(),
         static_cast<size_t>(m_totalCells) * m_entryStride * sizeof(float), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         cudaFree(m_data);
@@ -498,8 +486,103 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
         std::cerr << "[PathGuideGrid] cudaMemcpy level_offsets failed: " << cudaGetErrorString(err) << "\n";
         return false;
     }
+    // Build hash table for O(1) lookups on GPU
+    buildAndUploadHashTable(m_hashKeys, m_hashValues, m_hashTableSize, m_hashShift,
+                            m_hashAllocated, m_mortonCodesHost, m_totalCells, stream);
+
+    // Sync hash table to render grid if async is active
+    if (m_asyncInitialized) {
+        GridBuffers& renderGrid = m_grids[m_renderGridIdx];
+        renderGrid.hashKeys = m_hashKeys;
+        renderGrid.hashValues = m_hashValues;
+        renderGrid.hashTableSize = m_hashTableSize;
+        renderGrid.hashShift = m_hashShift;
+        renderGrid.hashAllocated = m_hashAllocated;
+    }
+
     // Reset staging count so next accumulation starts fresh
     resetStagingCount(stream);
+    return true;
+}
+
+bool PathGuideGrid::buildAndUploadHashTable(
+    uint64_t*& outKeys, uint32_t*& outValues,
+    uint32_t& outSize, uint32_t& outShift, uint32_t& outAllocated,
+    const std::vector<uint64_t>& mortonHost,
+    uint32_t totalCells,
+    cudaStream_t stream)
+{
+    if (totalCells == 0) {
+        outSize = 0;
+        outShift = 64;
+        return true;
+    }
+
+    // Table size: next power of 2 >= totalCells * 2 (50% load factor), minimum 64
+    uint32_t tableSize = 64;
+    while (tableSize < totalCells * 2) tableSize *= 2;
+    // Shift for Fibonacci hashing: top bits of 64-bit product
+    uint32_t shift = 64;
+    for (uint32_t s = tableSize; s > 1; s >>= 1) shift--;
+
+    // Build hash table on CPU
+    std::vector<uint64_t> keys(tableSize, 0xFFFFFFFFFFFFFFFFULL);
+    std::vector<uint32_t> values(tableSize, 0xFFFFFFFFu);
+    uint32_t mask = tableSize - 1;
+
+    for (uint32_t level = 0; level < m_numLevels; level++) {
+        uint32_t start = m_levelOffsets[level];
+        uint32_t end = m_levelOffsets[level + 1];
+        for (uint32_t i = start; i < end; i++) {
+            uint64_t key = (static_cast<uint64_t>(level) << 48) | mortonHost[i];
+            uint32_t slot = static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ULL) >> shift) & mask;
+            while (keys[slot] != 0xFFFFFFFFFFFFFFFFULL) {
+                slot = (slot + 1) & mask;
+            }
+            keys[slot] = key;
+            values[slot] = i;
+        }
+    }
+
+    // Allocate/grow GPU buffers if needed
+    if (tableSize > outAllocated) {
+        if (outKeys) cudaFree(outKeys);
+        if (outValues) cudaFree(outValues);
+        outKeys = nullptr;
+        outValues = nullptr;
+
+        cudaError_t err = cudaMalloc(&outKeys, tableSize * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            std::cerr << "[PathGuideGrid] Hash table cudaMalloc keys failed: " << cudaGetErrorString(err) << "\n";
+            outSize = 0;
+            outShift = 64;
+            return false;
+        }
+        err = cudaMalloc(&outValues, tableSize * sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            cudaFree(outKeys);
+            outKeys = nullptr;
+            std::cerr << "[PathGuideGrid] Hash table cudaMalloc values failed: " << cudaGetErrorString(err) << "\n";
+            outSize = 0;
+            outShift = 64;
+            return false;
+        }
+        outAllocated = tableSize;
+    }
+
+    // Upload to GPU
+    if (stream) {
+        cudaMemcpyAsync(outKeys, keys.data(), tableSize * sizeof(uint64_t),
+            cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(outValues, values.data(), tableSize * sizeof(uint32_t),
+            cudaMemcpyHostToDevice, stream);
+    } else {
+        cudaMemcpy(outKeys, keys.data(), tableSize * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(outValues, values.data(), tableSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    }
+
+    outSize = tableSize;
+    outShift = shift;
     return true;
 }
 
@@ -518,6 +601,45 @@ SparsePathGuideDescriptor PathGuideGrid::getDescriptor() const {
     d.bounds_max[0] = m_config.bounds_max[0];
     d.bounds_max[1] = m_config.bounds_max[1];
     d.bounds_max[2] = m_config.bounds_max[2];
+    d.hash_keys = m_hashKeys;
+    d.hash_values = m_hashValues;
+    d.hash_table_size = m_hashTableSize;
+    d.hash_shift = m_hashShift;
+    return d;
+}
+
+SparsePathGuideDescriptor PathGuideGrid::getRenderDescriptor() const {
+    SparsePathGuideDescriptor d = {};
+    if (m_asyncInitialized) {
+        const GridBuffers& g = m_grids[m_renderGridIdx];
+        d.morton_codes = g.mortonCodes;
+        d.data = g.data;
+        d.level_offsets = g.levelOffsetsDevice;
+        d.num_levels = m_numLevels;
+        d.entry_stride = m_entryStride;
+        d.hash_keys = g.hashKeys;
+        d.hash_values = g.hashValues;
+        d.hash_table_size = g.hashTableSize;
+        d.hash_shift = g.hashShift;
+    } else {
+        d.morton_codes = m_mortonCodes;
+        d.data = m_data;
+        d.level_offsets = m_levelOffsetsDevice;
+        d.num_levels = m_numLevels;
+        d.entry_stride = m_entryStride;
+        d.hash_keys = m_hashKeys;
+        d.hash_values = m_hashValues;
+        d.hash_table_size = m_hashTableSize;
+        d.hash_shift = m_hashShift;
+    }
+    d.base_resolution = m_config.base_resolution;
+    d.per_level_scale = m_config.per_level_scale;
+    d.bounds_min[0] = m_config.bounds_min[0];
+    d.bounds_min[1] = m_config.bounds_min[1];
+    d.bounds_min[2] = m_config.bounds_min[2];
+    d.bounds_max[0] = m_config.bounds_max[0];
+    d.bounds_max[1] = m_config.bounds_max[1];
+    d.bounds_max[2] = m_config.bounds_max[2];
     return d;
 }
 
@@ -526,14 +648,6 @@ PathGuideStagingDescriptor PathGuideGrid::getStagingDescriptor() const {
     d.buffer = m_stagingBuffer;
     d.count = m_stagingCount;
     d.capacity = m_stagingCapacity;
-    return d;
-}
-
-PathGuideTrainingStagingDescriptor PathGuideGrid::getTrainingStagingDescriptor() const {
-    PathGuideTrainingStagingDescriptor d = {};
-    d.buffer = m_trainingBuffer;
-    d.count = m_trainingCount;
-    d.capacity = m_trainingCapacity;
     return d;
 }
 
@@ -891,8 +1005,10 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
     m_totalCells = static_cast<uint32_t>(newCells.size());
     if (m_totalCells == 0) {
         m_mortonCodesHost.clear();
-        cudaMemcpy(m_levelOffsetsDevice, m_levelOffsets.data(),
-            (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        m_hashTableSize = 0;
+        m_hashShift = 64;
+        cudaMemcpyAsync(m_levelOffsetsDevice, m_levelOffsets.data(),
+            (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
         return true;
     }
 
@@ -975,11 +1091,54 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
         m_allocatedCells = m_totalCells;
     }
 
-    cudaMemcpy(m_mortonCodes, mortonHost.data(), m_totalCells * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(m_data, m_dataHost.data(),
-        static_cast<size_t>(m_totalCells) * m_entryStride * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(m_levelOffsetsDevice, m_levelOffsets.data(),
-        (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // Use async copies on the render stream to avoid blocking ALL streams.
+    // Sync cudaMemcpy uses the default stream which synchronizes every stream on the device.
+    // These pageable-to-device copies still briefly block the CPU (CUDA runtime behavior),
+    // but they don't stall unrelated streams like the readback stream.
+    cudaMemcpyAsync(m_mortonCodes, mortonHost.data(), m_totalCells * sizeof(uint64_t),
+        cudaMemcpyHostToDevice, stream);
+
+    // Upload with zeroed interval stats (offsets 6-9) so the GPU starts fresh.
+    // m_dataHost contains lifetime cumulative sums at [6-9] which must NOT be
+    // uploaded — otherwise the GPU atomicAdds on top of them and the next
+    // buildFromStaging reads them back as interval data, compounding the totals.
+    {
+        std::vector<float> gpuUpload = m_dataHost;
+        for (size_t g = 0; g < m_totalCells; g++) {
+            size_t base = g * m_entryStride;
+            gpuUpload[base + 6] = 0.0f;
+            gpuUpload[base + 7] = 0.0f;
+            gpuUpload[base + 8] = 0.0f;
+            gpuUpload[base + 9] = 0.0f;
+        }
+        cudaMemcpyAsync(m_data, gpuUpload.data(),
+            static_cast<size_t>(m_totalCells) * m_entryStride * sizeof(float),
+            cudaMemcpyHostToDevice, stream);
+    }
+
+    cudaMemcpyAsync(m_levelOffsetsDevice, m_levelOffsets.data(),
+        (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+
+    // Rebuild hash table after refinement changed the grid structure
+    buildAndUploadHashTable(m_hashKeys, m_hashValues, m_hashTableSize, m_hashShift,
+                            m_hashAllocated, m_mortonCodesHost, m_totalCells, stream);
+
+    // When async is initialized, the m_* pointers may have been reallocated.
+    // Sync them back to the render grid's GridBuffers so getRenderDescriptor()
+    // returns the updated pointers instead of stale (freed) ones.
+    if (m_asyncInitialized) {
+        GridBuffers& renderGrid = m_grids[m_renderGridIdx];
+        renderGrid.mortonCodes = m_mortonCodes;
+        renderGrid.data = m_data;
+        renderGrid.totalCells = m_totalCells;
+        renderGrid.allocatedCells = m_allocatedCells;
+        renderGrid.levelOffsetsDevice = m_levelOffsetsDevice;
+        renderGrid.hashKeys = m_hashKeys;
+        renderGrid.hashValues = m_hashValues;
+        renderGrid.hashTableSize = m_hashTableSize;
+        renderGrid.hashShift = m_hashShift;
+        renderGrid.hashAllocated = m_hashAllocated;
+    }
 
     return true;
 }
@@ -1057,12 +1216,557 @@ PathGuideGrid::CellInspectionResult PathGuideGrid::inspectCellAtPosition(float p
     return result;
 }
 
-uint32_t PathGuideGrid::readTrainingCount(cudaStream_t stream) const {
-    if (!m_trainingCount) return 0;
-    uint32_t count = 0;
-    if (stream) cudaStreamSynchronize(stream);
-    cudaMemcpy(&count, m_trainingCount, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    return count;
+//------------------------------------------------------------------------------
+// Async readback pipeline
+//------------------------------------------------------------------------------
+
+bool PathGuideGrid::initAsync() {
+    if (m_asyncInitialized) return true;
+    if (!m_stagingBuffer || !m_levelOffsetsDevice) return false;
+
+    // Create low-priority non-blocking readback stream
+    int leastPriority = 0, greatestPriority = 0;
+    cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority);
+    cudaError_t err = cudaStreamCreateWithPriority(&m_readbackStream, cudaStreamNonBlocking, leastPriority);
+    if (err != cudaSuccess) {
+        std::cerr << "[PathGuideGrid] Failed to create readback stream: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+
+    // Create events (timing disabled for lowest overhead)
+    err = cudaEventCreateWithFlags(&m_renderDoneEvent, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        std::cerr << "[PathGuideGrid] Failed to create render done event: " << cudaGetErrorString(err) << "\n";
+        shutdownAsync();
+        return false;
+    }
+    err = cudaEventCreateWithFlags(&m_readbackDoneEvent, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        std::cerr << "[PathGuideGrid] Failed to create readback done event: " << cudaGetErrorString(err) << "\n";
+        shutdownAsync();
+        return false;
+    }
+
+    // Pinned staging count (4 bytes)
+    err = cudaMallocHost(&m_pinnedStagingCount, sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        std::cerr << "[PathGuideGrid] Failed to alloc pinned staging count: " << cudaGetErrorString(err) << "\n";
+        shutdownAsync();
+        return false;
+    }
+
+    // Pinned staging buffer
+    m_pinnedStagingBufferCapacity = static_cast<size_t>(m_stagingCapacity) * 4;
+    err = cudaMallocHost(&m_pinnedStagingBuffer, m_pinnedStagingBufferCapacity * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        std::cerr << "[PathGuideGrid] Failed to alloc pinned staging buffer: " << cudaGetErrorString(err) << "\n";
+        shutdownAsync();
+        return false;
+    }
+
+    // Initialize both grid buffers with their own levelOffsetsDevice
+    for (int i = 0; i < 2; i++) {
+        err = cudaMalloc(&m_grids[i].levelOffsetsDevice, (m_numLevels + 1) * sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            std::cerr << "[PathGuideGrid] Failed to alloc grid[" << i << "] level_offsets: " << cudaGetErrorString(err) << "\n";
+            shutdownAsync();
+            return false;
+        }
+        // Copy current level offsets to both grids
+        cudaMemcpy(m_grids[i].levelOffsetsDevice, m_levelOffsets.data(),
+            (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    }
+
+    // Free the original m_levelOffsetsDevice from init() — both grids now have their own copies.
+    // Redirect m_levelOffsetsDevice to grid[0]'s copy for compatibility with getDescriptor().
+    if (m_levelOffsetsDevice &&
+        m_levelOffsetsDevice != m_grids[0].levelOffsetsDevice &&
+        m_levelOffsetsDevice != m_grids[1].levelOffsetsDevice) {
+        cudaFree(m_levelOffsetsDevice);
+    }
+    m_levelOffsetsDevice = m_grids[0].levelOffsetsDevice;
+
+    // Copy existing single-buffer state into grid[0] (render grid)
+    m_grids[0].mortonCodes = m_mortonCodes;
+    m_grids[0].data = m_data;
+    m_grids[0].totalCells = m_totalCells;
+    m_grids[0].allocatedCells = m_allocatedCells;
+
+    // Build grid[1] starts empty (will be populated on first finishBuildFromReadback)
+    m_grids[1].mortonCodes = nullptr;
+    m_grids[1].data = nullptr;
+    m_grids[1].totalCells = 0;
+    m_grids[1].allocatedCells = 0;
+
+    m_renderGridIdx = 0;
+    m_buildGridIdx = 1;
+    m_asyncState = AsyncState::Idle;
+    m_asyncInitialized = true;
+
+    std::cout << "[PathGuideGrid] Async pipeline initialized (readback stream priority=" << leastPriority << ")\n";
+    return true;
+}
+
+void PathGuideGrid::shutdownAsync() {
+    if (m_readbackStream) {
+        cudaStreamSynchronize(m_readbackStream);
+        cudaStreamDestroy(m_readbackStream);
+        m_readbackStream = nullptr;
+    }
+    if (m_renderDoneEvent) { cudaEventDestroy(m_renderDoneEvent); m_renderDoneEvent = nullptr; }
+    if (m_readbackDoneEvent) { cudaEventDestroy(m_readbackDoneEvent); m_readbackDoneEvent = nullptr; }
+    if (m_pinnedStagingCount) { cudaFreeHost(m_pinnedStagingCount); m_pinnedStagingCount = nullptr; }
+    if (m_pinnedStagingBuffer) { cudaFreeHost(m_pinnedStagingBuffer); m_pinnedStagingBuffer = nullptr; }
+    m_pinnedStagingBufferCapacity = 0;
+    if (m_pinnedGpuData) { cudaFreeHost(m_pinnedGpuData); m_pinnedGpuData = nullptr; }
+    m_pinnedGpuDataCapacity = 0;
+
+    // Free grid buffers. After swapGrids(), m_mortonCodes/m_data/m_levelOffsetsDevice
+    // alias one of the grid buffers. We collect all unique device pointers to free,
+    // avoiding double-frees.
+    {
+        // Collect unique pointers to free
+        void* toFree[10] = {};
+        int nFree = 0;
+        auto addUnique = [&](void* p) {
+            if (!p) return;
+            for (int j = 0; j < nFree; j++) {
+                if (toFree[j] == p) return;
+            }
+            toFree[nFree++] = p;
+        };
+        for (int i = 0; i < 2; i++) {
+            addUnique(m_grids[i].mortonCodes);
+            addUnique(m_grids[i].data);
+            addUnique(m_grids[i].levelOffsetsDevice);
+            addUnique(m_grids[i].hashKeys);
+            addUnique(m_grids[i].hashValues);
+        }
+        for (int j = 0; j < nFree; j++) {
+            cudaFree(toFree[j]);
+        }
+    }
+
+    for (int i = 0; i < 2; i++) {
+        m_grids[i].mortonCodes = nullptr;
+        m_grids[i].data = nullptr;
+        m_grids[i].levelOffsetsDevice = nullptr;
+        m_grids[i].totalCells = 0;
+        m_grids[i].allocatedCells = 0;
+        m_grids[i].hashKeys = nullptr;
+        m_grids[i].hashValues = nullptr;
+        m_grids[i].hashTableSize = 0;
+        m_grids[i].hashShift = 0;
+        m_grids[i].hashAllocated = 0;
+    }
+
+    // Null out the single-buffer aliases so shutdown() doesn't double-free
+    m_mortonCodes = nullptr;
+    m_data = nullptr;
+    m_levelOffsetsDevice = nullptr;
+    m_totalCells = 0;
+    m_allocatedCells = 0;
+    m_hashKeys = nullptr;
+    m_hashValues = nullptr;
+    m_hashTableSize = 0;
+    m_hashShift = 0;
+    m_hashAllocated = 0;
+
+    m_asyncState = AsyncState::Idle;
+    m_asyncInitialized = false;
+}
+
+void PathGuideGrid::beginAsyncReadback(cudaStream_t renderStream, uint32_t currentFrame) {
+    if (!m_asyncInitialized || m_asyncState != AsyncState::Idle) return;
+
+    const GridBuffers& renderGrid = m_grids[m_renderGridIdx];
+
+    // Mark render + staging writes complete on renderStream
+    cudaEventRecord(m_renderDoneEvent, renderStream);
+
+    // Readback stream waits for render to finish
+    cudaStreamWaitEvent(m_readbackStream, m_renderDoneEvent, 0);
+
+    // Async D2H: staging count
+    cudaMemcpyAsync(m_pinnedStagingCount, m_stagingCount, sizeof(uint32_t),
+        cudaMemcpyDeviceToHost, m_readbackStream);
+
+    // Async D2H: staging buffer
+    size_t stagingBytes = m_pinnedStagingBufferCapacity * sizeof(uint32_t);
+    cudaMemcpyAsync(m_pinnedStagingBuffer, m_stagingBuffer, stagingBytes,
+        cudaMemcpyDeviceToHost, m_readbackStream);
+
+    // Async D2H: render grid's cell data (if any)
+    if (renderGrid.data && renderGrid.totalCells > 0) {
+        size_t gpuDataFloats = static_cast<size_t>(renderGrid.totalCells) * m_entryStride;
+        // Grow pinned buffer if needed
+        if (gpuDataFloats > m_pinnedGpuDataCapacity) {
+            if (m_pinnedGpuData) cudaFreeHost(m_pinnedGpuData);
+            m_pinnedGpuDataCapacity = gpuDataFloats + gpuDataFloats / 4;  // 25% headroom
+            cudaError_t err = cudaMallocHost(&m_pinnedGpuData, m_pinnedGpuDataCapacity * sizeof(float));
+            if (err != cudaSuccess) {
+                std::cerr << "[PathGuideGrid] Failed to grow pinned GPU data buffer: " << cudaGetErrorString(err) << "\n";
+                m_pinnedGpuData = nullptr;
+                m_pinnedGpuDataCapacity = 0;
+            }
+        }
+        if (m_pinnedGpuData) {
+            cudaMemcpyAsync(m_pinnedGpuData, renderGrid.data, gpuDataFloats * sizeof(float),
+                cudaMemcpyDeviceToHost, m_readbackStream);
+        }
+    }
+
+    // Reset staging count on the readback stream AFTER the D2H copies complete,
+    // so the count is not zeroed before the readback reads it (WAR hazard fix).
+    cudaMemsetAsync(m_stagingCount, 0, sizeof(uint32_t), m_readbackStream);
+
+    // Mark readback + staging reset complete
+    cudaEventRecord(m_readbackDoneEvent, m_readbackStream);
+
+    // Render stream must wait for the staging count reset before the next frame's
+    // staging writes, otherwise atomicAdd would increment a stale count.
+    cudaStreamWaitEvent(renderStream, m_readbackDoneEvent, 0);
+
+    m_pendingCurrentFrame = currentFrame;
+    m_asyncState = AsyncState::ReadbackInFlight;
+}
+
+bool PathGuideGrid::pollAsyncReadback() {
+    if (m_asyncState != AsyncState::ReadbackInFlight) return false;
+    cudaError_t err = cudaEventQuery(m_readbackDoneEvent);
+    if (err == cudaSuccess) {
+        m_asyncState = AsyncState::ReadbackReady;
+        return true;
+    }
+    if (err != cudaErrorNotReady) {
+        // Real error (not just "still in flight") — log and abort the build
+        std::cerr << "[PathGuideGrid] pollAsyncReadback error: " << cudaGetErrorString(err) << "\n";
+        m_asyncState = AsyncState::Idle;
+    }
+    return false;
+}
+
+bool PathGuideGrid::finishBuildFromReadback() {
+    if (m_asyncState != AsyncState::ReadbackReady) return false;
+
+    const GridBuffers& renderGrid = m_grids[m_renderGridIdx];
+    GridBuffers& buildGrid = m_grids[m_buildGridIdx];
+    uint32_t currentFrame = m_pendingCurrentFrame;
+
+    // Read count from pinned memory
+    uint32_t count = *m_pinnedStagingCount;
+    if (count > m_stagingCapacity) count = m_stagingCapacity;
+    uint32_t numEntries = count;
+
+    // Deduplicate staging entries using a hash set — O(n) instead of O(n log n).
+    // Most staging entries are duplicates (many rays hit the same cell), so this
+    // reduces the sort from 500K+ entries down to typically 2K-10K unique cells.
+    struct CellKey {
+        uint32_t level;
+        uint64_t morton;
+        bool operator<(const CellKey& o) const {
+            if (level != o.level) return level < o.level;
+            return morton < o.morton;
+        }
+        bool operator==(const CellKey& o) const {
+            return level == o.level && morton == o.morton;
+        }
+    };
+
+    // Pack (level, morton) into a single uint64_t for fast hashing
+    std::unordered_set<uint64_t> uniqueSet;
+    uniqueSet.reserve(std::min(numEntries, 32768u) + m_totalCells);
+
+    for (uint32_t i = 0; i < numEntries; i++) {
+        uint32_t level = m_pinnedStagingBuffer[i * 4 + 0];
+        uint32_t ix    = m_pinnedStagingBuffer[i * 4 + 1];
+        uint32_t iy    = m_pinnedStagingBuffer[i * 4 + 2];
+        uint32_t iz    = m_pinnedStagingBuffer[i * 4 + 3];
+        if (level >= m_numLevels) continue;
+        uint32_t resU = m_levelResolutions[level];
+        if (ix >= resU) ix = resU - 1;
+        if (iy >= resU) iy = resU - 1;
+        if (iz >= resU) iz = resU - 1;
+        uint64_t morton = mortonEncode(ix, iy, iz);
+        uniqueSet.insert((uint64_t(level) << 60) | morton);
+    }
+
+    // Merge existing cells (cumulative grid)
+    if (!m_mortonCodesHost.empty() && m_totalCells > 0) {
+        for (uint32_t lev = 0; lev < m_numLevels; lev++) {
+            uint32_t start = m_levelOffsets[lev];
+            uint32_t end = m_levelOffsets[lev + 1];
+            for (uint32_t i = start; i < end; i++) {
+                uniqueSet.insert((uint64_t(lev) << 60) | m_mortonCodesHost[i]);
+            }
+        }
+    }
+
+    // Convert to sorted vector (only unique cells, typically 100x fewer than staging entries)
+    std::vector<CellKey> keys;
+    keys.reserve(uniqueSet.size());
+    for (uint64_t packed : uniqueSet) {
+        uint32_t level = static_cast<uint32_t>(packed >> 60);
+        uint64_t morton = packed & ((1ull << 60) - 1);
+        keys.push_back({ level, morton });
+    }
+    std::sort(keys.begin(), keys.end());
+
+    // Save previous grid state
+    std::vector<uint64_t> prevMorton = m_mortonCodesHost;
+    std::vector<uint32_t> prevOffsets = m_levelOffsets;
+    uint32_t prevTotalCells = renderGrid.totalCells;
+
+    // Per-level counts and prefix sum
+    m_levelOffsets.assign(m_numLevels + 1, 0u);
+    for (const auto& k : keys)
+        m_levelOffsets[k.level + 1]++;
+    for (uint32_t l = 0; l < m_numLevels; l++)
+        m_levelOffsets[l + 1] += m_levelOffsets[l];
+
+    m_totalCells = static_cast<uint32_t>(keys.size());
+    if (m_totalCells == 0) {
+        m_mortonCodesHost.clear();
+        cudaMemcpyAsync(buildGrid.levelOffsetsDevice, m_levelOffsets.data(),
+            (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, m_readbackStream);
+        buildGrid.totalCells = 0;
+        m_asyncState = AsyncState::Idle;
+        return true;
+    }
+
+    std::vector<uint64_t> mortonHost(m_totalCells);
+    std::vector<float> dataHost(static_cast<size_t>(m_totalCells) * m_entryStride, 0.0f);
+    std::vector<uint32_t> levelCellCount(m_numLevels, 0u);
+    for (const auto& k : keys) {
+        uint32_t base = m_levelOffsets[k.level];
+        uint32_t idx = base + levelCellCount[k.level]++;
+        mortonHost[idx] = k.morton;
+    }
+
+    m_mortonCodesHost = mortonHost;
+
+    // Carry forward GPU data from pinned readback (same merge logic as buildFromStaging)
+    if (m_pinnedGpuData && prevTotalCells > 0) {
+        for (uint32_t lev = 0; lev < m_numLevels && lev < static_cast<uint32_t>(prevOffsets.size()) - 1; lev++) {
+            uint32_t pStart = prevOffsets[lev];
+            uint32_t pEnd = prevOffsets[lev + 1];
+            uint32_t nStart = m_levelOffsets[lev];
+            uint32_t nEnd = m_levelOffsets[lev + 1];
+            uint32_t pi2 = pStart, ni2 = nStart;
+            while (pi2 < pEnd && ni2 < nEnd) {
+                if (prevMorton[pi2] < mortonHost[ni2]) { pi2++; }
+                else if (prevMorton[pi2] > mortonHost[ni2]) { ni2++; }
+                else {
+                    size_t srcOff = static_cast<size_t>(pi2) * m_entryStride;
+                    size_t dstOff = static_cast<size_t>(ni2) * m_entryStride;
+                    std::memcpy(&dataHost[dstOff], &m_pinnedGpuData[srcOff], m_entryStride * sizeof(float));
+                    pi2++; ni2++;
+                }
+            }
+        }
+    }
+
+    // Carry forward lifetime totals from m_dataHost
+    {
+        std::vector<float> newDataHost(static_cast<size_t>(m_totalCells) * m_entryStride, 0.0f);
+        if (!m_dataHost.empty() && !prevMorton.empty()) {
+            for (uint32_t lev = 0; lev < m_numLevels && lev < static_cast<uint32_t>(prevOffsets.size()) - 1; lev++) {
+                uint32_t pStart = prevOffsets[lev];
+                uint32_t pEnd = prevOffsets[lev + 1];
+                uint32_t nStart = m_levelOffsets[lev];
+                uint32_t nEnd = m_levelOffsets[lev + 1];
+                uint32_t pi3 = pStart, ni3 = nStart;
+                while (pi3 < pEnd && ni3 < nEnd) {
+                    if (prevMorton[pi3] < mortonHost[ni3]) { pi3++; }
+                    else if (prevMorton[pi3] > mortonHost[ni3]) { ni3++; }
+                    else {
+                        size_t srcOff = static_cast<size_t>(pi3) * m_entryStride;
+                        size_t dstOff = static_cast<size_t>(ni3) * m_entryStride;
+                        std::memcpy(&newDataHost[dstOff], &m_dataHost[srcOff], m_entryStride * sizeof(float));
+                        pi3++; ni3++;
+                    }
+                }
+            }
+        }
+        m_dataHost = std::move(newDataHost);
+    }
+
+    // Accumulate interval sums into lifetime totals with EMA decay, then fit
+    // from cumulative sums (same logic as buildFromStaging — see comments there).
+    constexpr float EMA_DECAY = 0.7f;
+    uint32_t cellsWithData = 0;
+    if (m_totalCells > 0 && m_entryStride >= 12) {
+        for (size_t g = 0; g < m_totalCells; g++) {
+            size_t base = g * m_entryStride;
+            if (base + 11 >= dataHost.size()) break;
+
+            float iSumX = dataHost[base + 6];
+            float iSumY = dataHost[base + 7];
+            float iSumZ = dataHost[base + 8];
+            float iSumW = dataHost[base + 9];
+
+            // Accumulate into lifetime totals with EMA decay
+            size_t hostBase = g * m_entryStride;
+            if (hostBase + 11 < m_dataHost.size()) {
+                m_dataHost[hostBase + 6] = EMA_DECAY * m_dataHost[hostBase + 6] + iSumX;
+                m_dataHost[hostBase + 7] = EMA_DECAY * m_dataHost[hostBase + 7] + iSumY;
+                m_dataHost[hostBase + 8] = EMA_DECAY * m_dataHost[hostBase + 8] + iSumZ;
+                m_dataHost[hostBase + 9] = EMA_DECAY * m_dataHost[hostBase + 9] + iSumW;
+                m_dataHost[hostBase + 11] = dataHost[base + 11];
+            }
+
+            // Fit from cumulative sums
+            float cumSumX = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 6] : iSumX;
+            float cumSumY = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 7] : iSumY;
+            float cumSumZ = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 8] : iSumZ;
+            float cumSumW = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 9] : iSumW;
+
+            if (cumSumW >= 1.0f) {
+                float theta0, phi0, kappa0;
+                if (vmf_fitting::fitFromSums(cumSumX, cumSumY, cumSumZ, cumSumW, theta0, phi0, kappa0)) {
+                    dataHost[base + 0] = theta0;
+                    dataHost[base + 1] = phi0;
+                    dataHost[base + 2] = kappa0;
+                    dataHost[base + 3] = 0.0f;
+                    dataHost[base + 4] = 0.0f;
+                    dataHost[base + 5] = 0.0f;
+                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = 1.0f;
+                    cellsWithData++;
+
+                    // Two-lobe fitting (same logic as buildFromStaging)
+                    float iLen = std::sqrt(iSumX*iSumX + iSumY*iSumY + iSumZ*iSumZ);
+                    if (iSumW >= 2.0f && iLen > 1e-6f) {
+                        float iNx = iSumX / iLen, iNy = iSumY / iLen, iNz = iSumZ / iLen;
+                        float cumLen = std::sqrt(cumSumX*cumSumX + cumSumY*cumSumY + cumSumZ*cumSumZ);
+                        if (cumLen > 1e-6f) {
+                            float cNx = cumSumX / cumLen, cNy = cumSumY / cumLen, cNz = cumSumZ / cumLen;
+                            float cosAngle = iNx*cNx + iNy*cNy + iNz*cNz;
+                            if (cosAngle < 0.707f) {
+                                float theta1, phi1, kappa1;
+                                if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
+                                    dataHost[base + 3] = theta1;
+                                    dataHost[base + 4] = phi1;
+                                    dataHost[base + 5] = kappa1;
+                                    float effCum = cumSumW;
+                                    float effInt = iSumW / (1.0f - EMA_DECAY);
+                                    float pi0 = effCum / (effCum + effInt);
+                                    pi0 = std::max(0.1f, std::min(0.9f, pi0));
+                                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = pi0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Zero interval stats for upload
+            dataHost[base + 6] = 0.0f;
+            dataHost[base + 7] = 0.0f;
+            dataHost[base + 8] = 0.0f;
+            dataHost[base + 9] = 0.0f;
+        }
+        std::cout << "[PathGuide] Async build: " << m_totalCells << " cells, "
+                  << cellsWithData << " fitted\n";
+    }
+
+    // Initialize lastHitFrame for newly-created cells
+    if (currentFrame > 0) {
+        float currentFrameF = static_cast<float>(currentFrame);
+        for (size_t g = 0; g < m_totalCells; g++) {
+            size_t base = g * m_entryStride;
+            if (base + 11 < dataHost.size() && dataHost[base + 11] == 0.0f) {
+                dataHost[base + 11] = currentFrameF;
+            }
+        }
+    }
+
+    // Save vMF params to m_dataHost
+    for (size_t g = 0; g < m_totalCells; g++) {
+        size_t base = g * m_entryStride;
+        if (base + 11 >= dataHost.size()) break;
+        for (uint32_t k = 0; k < 6; k++)
+            m_dataHost[base + k] = dataHost[base + k];
+        m_dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET];
+    }
+
+    // Upload to build grid (async on readback stream)
+    // Allocate with 2x headroom to minimize cudaMalloc/cudaFree frequency.
+    // On WDDM, cudaMalloc/cudaFree cause implicit device-wide synchronization
+    // that stalls the render stream even when called from a background thread.
+    if (m_totalCells > buildGrid.allocatedCells) {
+        uint32_t newCapacity = std::max(m_totalCells * 2u, 8192u);
+
+        uint64_t* newMorton = nullptr;
+        float* newData = nullptr;
+        cudaError_t err = cudaMalloc(&newMorton, newCapacity * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            std::cerr << "[PathGuideGrid] Async: cudaMalloc morton failed: " << cudaGetErrorString(err) << "\n";
+            m_asyncState = AsyncState::Idle;
+            return false;
+        }
+        err = cudaMalloc(&newData, static_cast<size_t>(newCapacity) * m_entryStride * sizeof(float));
+        if (err != cudaSuccess) {
+            cudaFree(newMorton);
+            std::cerr << "[PathGuideGrid] Async: cudaMalloc data failed: " << cudaGetErrorString(err) << "\n";
+            m_asyncState = AsyncState::Idle;
+            return false;
+        }
+
+        // Free old after successful allocation
+        if (buildGrid.mortonCodes) cudaFree(buildGrid.mortonCodes);
+        if (buildGrid.data) cudaFree(buildGrid.data);
+        buildGrid.mortonCodes = newMorton;
+        buildGrid.data = newData;
+        buildGrid.allocatedCells = newCapacity;
+    }
+
+    cudaMemcpyAsync(buildGrid.mortonCodes, mortonHost.data(),
+        m_totalCells * sizeof(uint64_t), cudaMemcpyHostToDevice, m_readbackStream);
+    cudaMemcpyAsync(buildGrid.data, dataHost.data(),
+        static_cast<size_t>(m_totalCells) * m_entryStride * sizeof(float),
+        cudaMemcpyHostToDevice, m_readbackStream);
+    cudaMemcpyAsync(buildGrid.levelOffsetsDevice, m_levelOffsets.data(),
+        (m_numLevels + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, m_readbackStream);
+
+    // Build hash table for O(1) lookups on GPU (uploaded to build grid)
+    buildAndUploadHashTable(buildGrid.hashKeys, buildGrid.hashValues,
+                            buildGrid.hashTableSize, buildGrid.hashShift,
+                            buildGrid.hashAllocated, mortonHost, m_totalCells, m_readbackStream);
+
+    buildGrid.totalCells = m_totalCells;
+
+    // Record event after uploads so swapGrids can make the render stream wait.
+    // No CPU-side sync needed — the GPU handles ordering via events.
+    cudaEventRecord(m_readbackDoneEvent, m_readbackStream);
+
+    m_asyncState = AsyncState::Idle;
+    return true;
+}
+
+void PathGuideGrid::swapGrids(cudaStream_t renderStream) {
+    if (!m_asyncInitialized) return;
+
+    // Ensure the render stream waits for the build grid's H2D uploads to finish
+    // before it reads the new grid. GPU-side ordering only — no CPU stall.
+    if (renderStream && m_readbackDoneEvent) {
+        cudaStreamWaitEvent(renderStream, m_readbackDoneEvent, 0);
+    }
+
+    std::swap(m_renderGridIdx, m_buildGridIdx);
+
+    // Update the single-buffer pointers to reflect the new render grid
+    // (for compatibility with getDescriptor(), edge generation, etc.)
+    const GridBuffers& newRender = m_grids[m_renderGridIdx];
+    m_mortonCodes = newRender.mortonCodes;
+    m_data = newRender.data;
+    m_levelOffsetsDevice = newRender.levelOffsetsDevice;
+    m_totalCells = newRender.totalCells;
+    m_allocatedCells = newRender.allocatedCells;
+    m_hashKeys = newRender.hashKeys;
+    m_hashValues = newRender.hashValues;
+    m_hashTableSize = newRender.hashTableSize;
+    m_hashShift = newRender.hashShift;
+    m_hashAllocated = newRender.hashAllocated;
 }
 
 } // namespace spectra

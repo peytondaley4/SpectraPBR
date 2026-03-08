@@ -671,9 +671,12 @@ std::optional<LoadedModel> ModelLoader::loadOBJ(const std::filesystem::path& pat
             matData.baseColor = make_float4(1.0f, 1.0f, 1.0f, matData.baseColor.w);
         }
 
-        // Normal/bump map (map_Bump / bump)
+        // OBJ bump maps are grayscale height maps — flag them so the material
+        // manager converts them to tangent-space normal maps via gradient computation.
         if (!mat.bump_texname.empty()) {
             matData.normalTexPath = (basePath / mat.bump_texname).string();
+            matData.normalTexIsBumpMap = true;
+            matData.bumpStrength = 1.0f;
         }
 
         // Specular texture (map_Ks) - store as metallicRoughness for now
@@ -681,20 +684,49 @@ std::optional<LoadedModel> ModelLoader::loadOBJ(const std::filesystem::path& pat
             matData.metallicRoughnessTexPath = (basePath / mat.specular_texname).string();
         }
 
-        // Alpha
-        if (mat.dissolve < 1.0f) {
-            matData.alphaMode = ALPHA_MODE_BLEND;
-        }
-
-        // IOR
-        if (mat.ior > 0.0f) {
+        // IOR — only override the default (1.5) when the file sets a
+        // meaningful refractive index.  Ni 1.0 is air and is also the
+        // tinyobjloader default / bad-exporter default, so ignore it.
+        if (mat.ior > 1.01f) {
             matData.ior = mat.ior;
         }
 
-        // Transmission (Tf / Tr)
-        float avgTransmittance = (mat.transmittance[0] + mat.transmittance[1] + mat.transmittance[2]) / 3.0f;
-        if (avgTransmittance > 0.0f) {
-            matData.transmission = avgTransmittance;
+        // ── Glass / Transparency detection ──
+        // OBJ transparency properties and their reliability:
+        //
+        //   Tf (filter):  Transmission filter color.  Tf 1 1 1 is the default
+        //                 that most exporters write for ALL materials — ignore it.
+        //                 Tf significantly below 1.0 is the most reliable signal
+        //                 that a material is intentionally transmissive.
+        //
+        //   Ni (IOR):     Index of refraction.  Ni 1.0 is the exporter default
+        //                 for all materials — ignore it.  Ni > 1.0 combined with
+        //                 partial dissolve (d < 1) is a strong glass signal.
+        //
+        //   d (dissolve): Opacity.  d < 1.0 alone is alpha-blend transparency,
+        //                 not glass, unless combined with a glass IOR.
+        //
+        //   illum:        Illumination model.  illum 4-9 theoretically means
+        //                 refraction, but many exporters set illum 4 on EVERY
+        //                 material (e.g. fireplace_room.mtl).  NOT reliable.
+        //
+        bool isGlass = false;
+
+        // Primary signal: Tf significantly below 1.0
+        float avgTf = (mat.transmittance[0] + mat.transmittance[1] + mat.transmittance[2]) / 3.0f;
+        if (avgTf > 0.0f && avgTf < 0.99f) {
+            isGlass = true;
+        }
+
+        // Secondary signal: real IOR (> air) combined with partial dissolve
+        if (mat.ior > 1.01f && mat.dissolve < 0.99f) {
+            isGlass = true;
+        }
+
+        if (isGlass) {
+            matData.transmission = 1.0f;
+        } else if (mat.dissolve < 1.0f) {
+            matData.alphaMode = ALPHA_MODE_BLEND;
         }
 
         // OBJ format has no double-sided concept; default to double-sided
@@ -786,10 +818,11 @@ std::optional<LoadedModel> ModelLoader::loadOBJ(const std::filesystem::path& pat
                             vertex.normal = make_float3(0.0f, 0.0f, 0.0f);
                         }
 
-                        // Texcoord
+                        // Texcoord — OBJ convention has V=0 at bottom of image,
+                        // but stb_image loads row 0 at the top, so flip V.
                         if (hasTexcoords && idx.texcoord_index >= 0) {
                             vertex.u = attrib.texcoords[2 * idx.texcoord_index + 0];
-                            vertex.v = attrib.texcoords[2 * idx.texcoord_index + 1];
+                            vertex.v = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1];
                         } else {
                             vertex.u = 0.0f;
                             vertex.v = 0.0f;

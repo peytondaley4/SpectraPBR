@@ -93,7 +93,18 @@ MaterialHandle MaterialManager::addMaterial(const MaterialData& matData) {
     
     // Core textures
     loadTexture(matData.baseColorTexPath, true, gpuMat.baseColorTex);           // sRGB
-    loadTexture(matData.normalTexPath, false, gpuMat.normalTex);                 // Linear
+
+    // Normal map: OBJ bump maps are grayscale height maps and need gradient
+    // conversion; glTF normal maps are already tangent-space RGB.
+    if (matData.normalTexIsBumpMap && !matData.normalTexPath.empty() && m_textureManager) {
+        TextureHandle h = m_textureManager->loadBumpMapAsNormal(matData.normalTexPath, matData.bumpStrength);
+        if (h != INVALID_TEXTURE_HANDLE) {
+            gpuMat.normalTex = m_textureManager->getTextureObject(h);
+            texHandles.push_back(h);
+        }
+    } else {
+        loadTexture(matData.normalTexPath, false, gpuMat.normalTex);             // Linear
+    }
     loadTexture(matData.metallicRoughnessTexPath, false, gpuMat.metallicRoughnessTex); // Linear
     loadTexture(matData.emissiveTexPath, true, gpuMat.emissiveTex);              // sRGB
 

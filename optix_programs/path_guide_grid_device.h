@@ -22,7 +22,7 @@
 #define PATH_GUIDE_ENTRY_STRIDE        12  // vMF (6) + stats (6)
 #define PATH_GUIDE_MIX_WEIGHT_OFFSET   10  // offset of pi_0 within cell data
 
-// Sparse grid: per-level sorted Morton codes + data
+// Sparse grid: per-level sorted Morton codes + data, with hash table for O(1) lookup
 struct SparsePathGuideDescriptorDevice {
     const unsigned long long* morton_codes;  // uint64_t, sorted per level
     float* data;                             // entry_stride floats per cell
@@ -33,6 +33,13 @@ struct SparsePathGuideDescriptorDevice {
     float per_level_scale;
     float bounds_min[3];
     float bounds_max[3];
+    unsigned int level_resolutions[16];      // Precomputed floor(base_res * scale^level)
+
+    // Hash table for O(1) cell lookup (replaces binary search)
+    const unsigned long long* hash_keys;     // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF
+    const unsigned int* hash_values;         // flat cell index
+    unsigned int hash_table_size;            // power of 2
+    unsigned int hash_shift;                 // 64 - log2(hash_table_size)
 };
 
 // Staging: append (level, ix, iy, iz) for build
@@ -42,18 +49,12 @@ struct PathGuideStagingDevice {
     unsigned int capacity;
 };
 
-// Training: append (level, ix, iy, iz, dir_x, dir_y, dir_z, weight, frame) for vMF fit. 9 floats per entry.
-struct PathGuideTrainingStagingDevice {
-    float* buffer;   // 9 floats per entry
-    unsigned int* count;
-    unsigned int capacity;
-};
 
 __forceinline__ __device__ float sparseResolutionAtLevel(
     const SparsePathGuideDescriptorDevice& grid,
     unsigned int level)
 {
-    return (float)grid.base_resolution * powf(grid.per_level_scale, (float)level);
+    return (float)grid.level_resolutions[level < 16 ? level : 15];
 }
 
 __forceinline__ __device__ void worldToNormalized(
@@ -103,12 +104,38 @@ __forceinline__ __device__ unsigned long long mortonEncode64(unsigned int ix, un
     return mortonSpread3(ix) | (mortonSpread3(iy) << 1) | (mortonSpread3(iz) << 2);
 }
 
-// Binary search for Morton code in level; returns index into level's array or ~0u if not found
+// Hash table lookup: O(1) average, linear probing. Returns flat cell index or ~0u.
+__forceinline__ __device__ unsigned int sparseCellIndexHash(
+    const SparsePathGuideDescriptorDevice& grid,
+    unsigned int level,
+    unsigned long long morton)
+{
+    if (grid.hash_table_size == 0 || grid.hash_keys == nullptr) return 0xFFFFFFFFu;
+
+    unsigned long long key = ((unsigned long long)level << 48) | morton;
+    unsigned int mask = grid.hash_table_size - 1;
+    // Fibonacci hashing: multiply by golden ratio, take top bits
+    unsigned int slot = (unsigned int)((key * 0x9E3779B97F4A7C15ULL) >> grid.hash_shift) & mask;
+
+    for (unsigned int i = 0; i < 32; i++) {  // max 32 probes (generous for 50% load)
+        unsigned long long k = grid.hash_keys[slot];
+        if (k == key) return grid.hash_values[slot];
+        if (k == 0xFFFFFFFFFFFFFFFFULL) return 0xFFFFFFFFu;  // empty slot
+        slot = (slot + 1) & mask;
+    }
+    return 0xFFFFFFFFu;
+}
+
+// Binary search fallback (used only when hash table is not available)
 __forceinline__ __device__ unsigned int sparseCellIndex(
     const SparsePathGuideDescriptorDevice& grid,
     unsigned int level,
     unsigned long long morton)
 {
+    // Prefer hash table when available
+    if (grid.hash_keys != nullptr && grid.hash_table_size > 0) {
+        return sparseCellIndexHash(grid, level, morton);
+    }
     unsigned int start = grid.level_offsets[level];
     unsigned int end = grid.level_offsets[level + 1];
     while (start < end) {
@@ -221,27 +248,51 @@ __forceinline__ __device__ void pathGuideStagingAppend(
     slot[3] = (unsigned int)iz;
 }
 
-// Append (level, ix, iy, iz, dir_x, dir_y, dir_z, weight, frame) to training staging
-// 9 floats per entry to include frame index for coarsening decisions
-__forceinline__ __device__ void pathGuideTrainingAppend(
-    const PathGuideTrainingStagingDevice& staging,
-    unsigned int level, int ix, int iy, int iz,
+// Train a cell directly given its data pointer.  Caller is responsible for
+// the cell lookup — use this when the lookup was already done (e.g. cell
+// seeding shares the same lookup as training).
+__forceinline__ __device__ void pathGuideTrainCell(
+    float* cell,
     float dx, float dy, float dz, float weight,
     unsigned int frameIndex)
 {
-    if (staging.buffer == nullptr || staging.count == nullptr || staging.capacity == 0) return;
-    unsigned int idx = atomicAdd(staging.count, 1u);
-    if (idx >= staging.capacity) return;
-    float* slot = staging.buffer + idx * 9;
-    slot[0] = (float)level;
-    slot[1] = (float)ix;
-    slot[2] = (float)iy;
-    slot[3] = (float)iz;
-    slot[4] = dx;
-    slot[5] = dy;
-    slot[6] = dz;
-    slot[7] = weight;
-    slot[8] = (float)frameIndex;
+    // Reject non-finite or non-positive weights — atomicAdd of Inf/NaN
+    // permanently corrupts cell sums with no way to recover.
+    if (!(weight > 0.0f) || !isfinite(weight) ||
+        !isfinite(dx) || !isfinite(dy) || !isfinite(dz))
+        return;
+
+    atomicAdd(&cell[6], dx * weight);
+    atomicAdd(&cell[7], dy * weight);
+    atomicAdd(&cell[8], dz * weight);
+    atomicAdd(&cell[9], weight);
+
+    // atomicMax on lastHitFrame: positive floats have same ordering as ints
+    int frameAsInt = __float_as_int((float)frameIndex);
+    atomicMax((int*)&cell[11], frameAsInt);
+}
+
+// Atomic training: accumulate direction*weight into cell stats directly on GPU.
+// Every hit with non-zero luminance trains its cell — 100% training rate.
+// Writes to cell[6..9] (sumX, sumY, sumZ, sumW) via atomicAdd and
+// cell[11] (lastHitFrame) via atomicMax (positive floats sort like ints).
+__forceinline__ __device__ void pathGuideTrainAtomic(
+    const SparsePathGuideDescriptorDevice& grid,
+    float px, float py, float pz,
+    float dx, float dy, float dz, float weight,
+    unsigned int frameIndex,
+    unsigned int minLevel, unsigned int maxLevel)
+{
+    if (grid.data == nullptr) return;
+
+    unsigned int foundLevel = 0;
+    unsigned int cellIdx = hierarchicalCellLookup(grid, px, py, pz, maxLevel, minLevel, &foundLevel);
+    if (cellIdx == 0xFFFFFFFFu) return;
+
+    float* cell = sparseCellDataPtr(grid, cellIdx);
+    if (cell == nullptr) return;
+
+    pathGuideTrainCell(cell, dx, dy, dz, weight, frameIndex);
 }
 
 // Cell data: 6 floats = lobe0(theta, phi, kappa), lobe1(theta, phi, kappa). kappa<=0 means lobe inactive.
@@ -325,4 +376,148 @@ __forceinline__ __device__ float pathGuidePdfDirection(
     }
 
     return fmaxf(p, 1e-10f);
+}
+
+//------------------------------------------------------------------------------
+// Trilinear interpolation for smooth cell boundary transitions.
+// Eliminates visible grid squares on flat surfaces by blending between
+// neighboring cells' vMF distributions.
+//------------------------------------------------------------------------------
+
+struct TrilinearInfo {
+    unsigned int cellIdx[8];  // Global cell index per corner (0xFFFFFFFF if missing/invalid)
+    float weight[8];          // Trilinear weight per corner
+    float weightSum;          // Sum of valid weights
+};
+
+// Compute trilinear neighbors at a given level. Uses cell-centered interpolation
+// so a position at the center of a cell gets 100% of that cell. Includes ALL
+// existing cells (no lobe filtering). Use filterTrilinearByValidLobes() to get
+// a guiding-safe subset.
+__forceinline__ __device__ TrilinearInfo computeTrilinearNeighbors(
+    const SparsePathGuideDescriptorDevice& grid,
+    float px, float py, float pz,
+    unsigned int level)
+{
+    TrilinearInfo info;
+    for (int i = 0; i < 8; i++) {
+        info.cellIdx[i] = 0xFFFFFFFFu;
+        info.weight[i] = 0.0f;
+    }
+    info.weightSum = 0.0f;
+
+    float nx, ny, nz;
+    worldToNormalized(grid, px, py, pz, nx, ny, nz);
+    nx = fminf(fmaxf(nx, 0.0f), 0.9999999f);
+    ny = fminf(fmaxf(ny, 0.0f), 0.9999999f);
+    nz = fminf(fmaxf(nz, 0.0f), 0.9999999f);
+
+    float res = sparseResolutionAtLevel(grid, level);
+    int resU = (int)floorf(res);
+    if (resU < 1) resU = 1;
+
+    // Cell-centered: shift by -0.5 so cell centers map to integer coordinates.
+    // At cell center -> fx=0 -> 100% this cell. At boundary -> fx=0.5 -> 50/50.
+    float cxf = nx * (float)resU - 0.5f;
+    float cyf = ny * (float)resU - 0.5f;
+    float czf = nz * (float)resU - 0.5f;
+
+    int ix0 = (int)floorf(cxf);
+    int iy0 = (int)floorf(cyf);
+    int iz0 = (int)floorf(czf);
+    float fx = cxf - (float)ix0;
+    float fy = cyf - (float)iy0;
+    float fz = czf - (float)iz0;
+
+    float wx[2] = { 1.0f - fx, fx };
+    float wy[2] = { 1.0f - fy, fy };
+    float wz[2] = { 1.0f - fz, fz };
+
+    for (int dz = 0; dz < 2; dz++) {
+        for (int dy = 0; dy < 2; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+                int ci = dz * 4 + dy * 2 + dx;
+                int cx = ix0 + dx;
+                int cy = iy0 + dy;
+                int cz = iz0 + dz;
+                float w = wx[dx] * wy[dy] * wz[dz];
+
+                if (cx < 0 || cx >= resU || cy < 0 || cy >= resU || cz < 0 || cz >= resU)
+                    continue;
+
+                unsigned long long morton = mortonEncode64((unsigned int)cx, (unsigned int)cy, (unsigned int)cz);
+                unsigned int idx = sparseCellIndex(grid, level, morton);
+                if (idx == 0xFFFFFFFFu) continue;
+
+                info.cellIdx[ci] = idx;
+                info.weight[ci] = w;
+                info.weightSum += w;
+            }
+        }
+    }
+
+    return info;
+}
+
+// Filter trilinear info to only include cells with valid vMF lobes (kappa > 0).
+// Use this for guiding (sampling + PDF) — ensures we only sample from trained cells.
+__forceinline__ __device__ TrilinearInfo filterTrilinearByValidLobes(
+    const SparsePathGuideDescriptorDevice& grid,
+    const TrilinearInfo& all)
+{
+    TrilinearInfo filtered;
+    filtered.weightSum = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        filtered.cellIdx[i] = 0xFFFFFFFFu;
+        filtered.weight[i] = 0.0f;
+        if (all.cellIdx[i] != 0xFFFFFFFFu) {
+            float* cell = sparseCellDataPtr(grid, all.cellIdx[i]);
+            if (cell != nullptr && (cell[2] > 1e-6f || cell[5] > 1e-6f)) {
+                filtered.cellIdx[i] = all.cellIdx[i];
+                filtered.weight[i] = all.weight[i];
+                filtered.weightSum += all.weight[i];
+            }
+        }
+    }
+    return filtered;
+}
+
+// Stochastically select one cell from trilinear neighbors, weighted by
+// trilinear weights. Returns 0xFFFFFFFF if no valid neighbor exists.
+__forceinline__ __device__ unsigned int stochasticSelectCell(
+    const TrilinearInfo& info, float rand)
+{
+    if (info.weightSum <= 0.0f) return 0xFFFFFFFFu;
+
+    float target = rand * info.weightSum;
+    float cumulative = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        if (info.cellIdx[i] == 0xFFFFFFFFu) continue;
+        cumulative += info.weight[i];
+        if (target <= cumulative) return info.cellIdx[i];
+    }
+    // Fallback: return last valid cell
+    for (int i = 7; i >= 0; i--) {
+        if (info.cellIdx[i] != 0xFFFFFFFFu) return info.cellIdx[i];
+    }
+    return 0xFFFFFFFFu;
+}
+
+// Trilinear-weighted PDF for MIS. Computes the weighted average of all valid
+// neighbor cells' PDFs, matching the stochastic sampling distribution exactly.
+__forceinline__ __device__ float trilinearGuidePdf(
+    const SparsePathGuideDescriptorDevice& grid,
+    const TrilinearInfo& info,
+    float ox, float oy, float oz)
+{
+    if (info.weightSum <= 0.0f) return 0.07957747154f;  // 1/(4*pi) uniform
+
+    float pdfSum = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        if (info.cellIdx[i] == 0xFFFFFFFFu) continue;
+        float cellPdf = pathGuidePdfDirection(grid, info.cellIdx[i], ox, oy, oz);
+        pdfSum += info.weight[i] * cellPdf;
+    }
+
+    return fmaxf(pdfSum / info.weightSum, 1e-10f);
 }

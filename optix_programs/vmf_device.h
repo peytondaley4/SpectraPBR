@@ -27,12 +27,15 @@ __forceinline__ __device__ void vmfCartesianToSpherical(float mx, float my, floa
 }
 
 // vMF PDF in 3D: C3(kappa)*exp(kappa*cos_theta) where cos_theta = dot(mu, omega)
+// Numerically stable form: kappa/(2pi) * exp(kappa*(cos_theta-1)) / (1-exp(-2*kappa))
+// Since cos_theta-1 <= 0, the exp never overflows. For large kappa, denominator -> 1.
 __forceinline__ __device__ float vmfPdf(float kappa, float cos_theta) {
     if (kappa <= 1e-6f) return 0.07957747154f;  // 1/(4*pi)
-    float sinh_k = sinhf(kappa);
-    if (sinh_k < 1e-10f) return 0.07957747154f;
-    float C3 = kappa / (4.0f * 3.14159265f * sinh_k);
-    return C3 * expf(kappa * cos_theta);
+    float exp_neg2k = expf(-2.0f * kappa);
+    float denom = 1.0f - exp_neg2k;
+    if (denom < 1e-10f) denom = 1.0f;  // large kappa: exp(-2k) underflows to 0
+    float pdf = (kappa / 6.28318530718f) * expf(kappa * (cos_theta - 1.0f)) / denom;
+    return fmaxf(pdf, 0.0f);
 }
 
 // Sample direction from vMF(mu, kappa). Wood/Ulrich: w = 1 + ln(u1+(1-u1)*exp(-2κ))/κ, then omega = sqrt(1-w^2)*v + w*mu.

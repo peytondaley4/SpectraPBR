@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 
 namespace spectra {
 
@@ -35,6 +36,64 @@ TextureHandle TextureManager::loadFromFile(const std::string& path, bool isSRGB)
         m_pathToHandle[path] = handle;
     }
 
+    return handle;
+}
+
+TextureHandle TextureManager::loadBumpMapAsNormal(const std::string& path, float strength) {
+    // Check cache (keyed with ":bump" suffix so it doesn't collide with the
+    // same file loaded as a regular texture elsewhere).
+    std::string cacheKey = path + ":bump";
+    auto it = m_pathToHandle.find(cacheKey);
+    if (it != m_pathToHandle.end()) {
+        addRef(it->second);
+        return it->second;
+    }
+
+    int width, height, channels;
+    uint8_t* data = stbi_load(path.c_str(), &width, &height, &channels, 1);  // Force single channel
+    if (!data) {
+        std::cerr << "[TextureManager] Failed to load bump map: " << path
+                  << " - " << stbi_failure_reason() << "\n";
+        return INVALID_TEXTURE_HANDLE;
+    }
+
+    // Convert height map to tangent-space normal map via central differences.
+    // For each pixel, sample neighbours to get dH/dx and dH/dy, then:
+    //   normal = normalize(-dH/dx * strength, -dH/dy * strength, 1)
+    // Encoded as RGBA with (n*0.5+0.5)*255, A=255.
+    std::vector<uint8_t> normalData(width * height * 4);
+
+    auto sample = [&](int x, int y) -> float {
+        x = std::max(0, std::min(x, width - 1));
+        y = std::max(0, std::min(y, height - 1));
+        return data[y * width + x] / 255.0f;
+    };
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float dX = (sample(x + 1, y) - sample(x - 1, y)) * strength;
+            float dY = (sample(x, y + 1) - sample(x, y - 1)) * strength;
+            float nX = -dX;
+            float nY = -dY;
+            float nZ = 1.0f;
+            float len = std::sqrt(nX * nX + nY * nY + nZ * nZ);
+            nX /= len;
+            nY /= len;
+            nZ /= len;
+            uint32_t idx = (y * width + x) * 4;
+            normalData[idx + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, (nX * 0.5f + 0.5f) * 255.0f)));
+            normalData[idx + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, (nY * 0.5f + 0.5f) * 255.0f)));
+            normalData[idx + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, (nZ * 0.5f + 0.5f) * 255.0f)));
+            normalData[idx + 3] = 255;
+        }
+    }
+
+    stbi_image_free(data);
+
+    TextureHandle handle = createTextureInternal(normalData.data(), width, height, 4, false, path + " (bump→normal)");
+    if (handle != INVALID_TEXTURE_HANDLE) {
+        m_pathToHandle[cacheKey] = handle;
+    }
     return handle;
 }
 

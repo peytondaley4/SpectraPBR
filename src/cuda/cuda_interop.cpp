@@ -143,6 +143,7 @@ bool CudaInterop::registerPBOs(uint32_t pbo0, uint32_t pbo1, uint32_t pbo2, size
 
     m_pboSize = size;
     m_tripleBuffered = true;
+
     std::cout << "[CUDA] Registered triple-buffered PBOs " << pbo0 << "/" << pbo1 << "/" << pbo2
               << " (" << size / (1024 * 1024) << " MB each)\n";
 
@@ -184,6 +185,7 @@ void CudaInterop::unregisterPBOs() {
     }
     m_pboSize = 0;
     m_tripleBuffered = false;
+
     std::cout << "[CUDA] Unregistered all PBOs\n";
 }
 
@@ -303,7 +305,8 @@ float* CudaInterop::mapUIPBO() {
         return nullptr;
     }
 
-    cudaError_t err = cudaGraphicsMapResources(1, &m_uiPboResource, m_stream);
+    // Use UI stream — avoids blocking the render stream with GL-CUDA sync
+    cudaError_t err = cudaGraphicsMapResources(1, &m_uiPboResource, m_uiStream);
     if (err != cudaSuccess) {
         std::cerr << "[CUDA] Failed to map UI PBO: " << cudaGetErrorString(err) << "\n";
         return nullptr;
@@ -314,7 +317,7 @@ float* CudaInterop::mapUIPBO() {
     err = cudaGraphicsResourceGetMappedPointer(&devPtr, &mappedSize, m_uiPboResource);
     if (err != cudaSuccess) {
         std::cerr << "[CUDA] Failed to get UI mapped pointer: " << cudaGetErrorString(err) << "\n";
-        cudaGraphicsUnmapResources(1, &m_uiPboResource, m_stream);
+        cudaGraphicsUnmapResources(1, &m_uiPboResource, m_uiStream);
         return nullptr;
     }
 
@@ -327,7 +330,8 @@ void CudaInterop::unmapUIPBO() {
         return;
     }
 
-    CUDA_CHECK_NORETURN(cudaGraphicsUnmapResources(1, &m_uiPboResource, m_stream));
+    // Use UI stream to match mapUIPBO
+    CUDA_CHECK_NORETURN(cudaGraphicsUnmapResources(1, &m_uiPboResource, m_uiStream));
     m_uiPboMapped = false;
 }
 

@@ -4,6 +4,7 @@
 #include <glm/glm.hpp>
 #include <algorithm>
 #include <iostream>
+#include <chrono>
 #include <cstring>
 #include <cmath>
 
@@ -76,9 +77,28 @@ bool Application::init() {
     gridConfig.base_resolution = 16;
     gridConfig.per_level_scale = 2.0f;
     gridConfig.entry_stride = PATH_GUIDE_ENTRY_STRIDE_DEFAULT;
+
+    // Use actual scene bounds (with small padding) so the grid covers
+    // the entire scene.  Default [-10,10] is far too small for most models.
+    glm::vec3 extent = m_sceneMax - m_sceneMin;
+    float pad = glm::length(extent) * 0.05f;  // 5% padding
+    if (pad > 0.0f) {
+        gridConfig.bounds_min[0] = m_sceneMin.x - pad;
+        gridConfig.bounds_min[1] = m_sceneMin.y - pad;
+        gridConfig.bounds_min[2] = m_sceneMin.z - pad;
+        gridConfig.bounds_max[0] = m_sceneMax.x + pad;
+        gridConfig.bounds_max[1] = m_sceneMax.y + pad;
+        gridConfig.bounds_max[2] = m_sceneMax.z + pad;
+    }
+
     if (!m_pathGuideGrid->init(gridConfig)) {
         std::cerr << "[App] Path guide grid init failed (non-fatal)\n";
         m_pathGuideGrid.reset();
+    } else {
+        // Initialize async readback pipeline (double-buffered, non-blocking builds)
+        if (!m_pathGuideGrid->initAsync()) {
+            std::cerr << "[App] Path guide async init failed (falling back to sync)\n";
+        }
     }
 
     // Initialize wireframe renderer for grid debug visualization
@@ -329,15 +349,31 @@ bool Application::loadScene() {
                 m_materialManager->addMaterial(matData);
             }
 
-            // Accumulate bounding box from all mesh vertices
-            for (const auto& mesh : model->meshes) {
-                for (const auto& vert : mesh.vertices) {
-                    sceneMin.x = std::min(sceneMin.x, vert.position.x);
-                    sceneMin.y = std::min(sceneMin.y, vert.position.y);
-                    sceneMin.z = std::min(sceneMin.z, vert.position.z);
-                    sceneMax.x = std::max(sceneMax.x, vert.position.x);
-                    sceneMax.y = std::max(sceneMax.y, vert.position.y);
-                    sceneMax.z = std::max(sceneMax.z, vert.position.z);
+            // Compute per-mesh local AABBs, then transform by instance transforms
+            // to get correct world-space scene bounds (handles scale/rotation/translation).
+            std::vector<glm::vec3> meshMins(model->meshes.size(), glm::vec3(std::numeric_limits<float>::max()));
+            std::vector<glm::vec3> meshMaxs(model->meshes.size(), glm::vec3(std::numeric_limits<float>::lowest()));
+            for (size_t mi = 0; mi < model->meshes.size(); mi++) {
+                for (const auto& vert : model->meshes[mi].vertices) {
+                    glm::vec3 p(vert.position.x, vert.position.y, vert.position.z);
+                    meshMins[mi] = glm::min(meshMins[mi], p);
+                    meshMaxs[mi] = glm::max(meshMaxs[mi], p);
+                }
+            }
+            for (const auto& instance : model->instances) {
+                if (instance.meshIndex >= model->meshes.size()) continue;
+                const glm::vec3& mMin = meshMins[instance.meshIndex];
+                const glm::vec3& mMax = meshMaxs[instance.meshIndex];
+                const float* t = instance.transform;
+                for (int c = 0; c < 8; c++) {
+                    float cx = (c & 1) ? mMax.x : mMin.x;
+                    float cy = (c & 2) ? mMax.y : mMin.y;
+                    float cz = (c & 4) ? mMax.z : mMin.z;
+                    glm::vec3 w(t[0]*cx + t[1]*cy + t[2]*cz + t[3],
+                                t[4]*cx + t[5]*cy + t[6]*cz + t[7],
+                                t[8]*cx + t[9]*cy + t[10]*cz + t[11]);
+                    sceneMin = glm::min(sceneMin, w);
+                    sceneMax = glm::max(sceneMax, w);
                 }
             }
 
@@ -355,6 +391,71 @@ bool Application::loadScene() {
                         std::string name = "Instance " + std::to_string(globalInstanceId);
                         m_sceneHierarchy->addInstance(modelNodeIdx, instance.meshIndex, globalInstanceId, name);
                         globalInstanceId++;
+
+                        // Extract area light from emissive meshes
+                        const auto& srcMesh = model->meshes[instance.meshIndex];
+                        uint32_t origMatIdx = srcMesh.materialIndex;
+                        if (origMatIdx < model->materials.size()) {
+                            const float3& em = model->materials[origMatIdx].emissive;
+                            if (em.x + em.y + em.z > 0.01f) {
+                                const float* t = instance.transform;
+                                const auto& verts = srcMesh.vertices;
+                                const auto& idxs  = srcMesh.indices;
+
+                                // Accumulate centroid, area-weighted normal, and total area
+                                glm::vec3 centroid(0.0f);
+                                glm::vec3 weightedNormal(0.0f);
+                                float totalArea = 0.0f;
+
+                                for (size_t ti = 0; ti + 2 < idxs.size(); ti += 3) {
+                                    glm::vec3 lp[3];
+                                    for (int vi = 0; vi < 3; vi++) {
+                                        const float3& p = verts[idxs[ti + vi]].position;
+                                        // Transform to world space (3x4 row-major)
+                                        lp[vi] = glm::vec3(
+                                            t[0]*p.x + t[1]*p.y + t[2]*p.z  + t[3],
+                                            t[4]*p.x + t[5]*p.y + t[6]*p.z  + t[7],
+                                            t[8]*p.x + t[9]*p.y + t[10]*p.z + t[11]);
+                                    }
+                                    glm::vec3 e1 = lp[1] - lp[0];
+                                    glm::vec3 e2 = lp[2] - lp[0];
+                                    glm::vec3 cross = glm::cross(e1, e2);
+                                    float triArea = glm::length(cross) * 0.5f;
+                                    totalArea += triArea;
+                                    weightedNormal += cross; // length = 2*area, acts as area weight
+                                    centroid += (lp[0] + lp[1] + lp[2]) * triArea;
+                                }
+
+                                if (totalArea > 1e-8f) {
+                                    centroid /= (totalArea * 3.0f);
+                                    glm::vec3 avgNormal = glm::normalize(weightedNormal);
+
+                                    // Build tangent perpendicular to normal
+                                    glm::vec3 up = (std::abs(avgNormal.y) < 0.99f)
+                                        ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
+                                    glm::vec3 tangent = glm::normalize(glm::cross(up, avgNormal));
+
+                                    float sideLen = std::sqrt(totalArea);
+
+                                    GpuAreaLight light;
+                                    light.position = make_float3(centroid.x, centroid.y, centroid.z);
+                                    light.normal   = make_float3(avgNormal.x, avgNormal.y, avgNormal.z);
+                                    light.tangent  = make_float3(tangent.x, tangent.y, tangent.z);
+                                    light.emission = em;
+                                    light.area     = totalArea;
+                                    light.size     = make_float2(sideLen, sideLen);
+
+                                    uint32_t lightIdx = static_cast<uint32_t>(m_lightManager->getAreaLightCount());
+                                    m_lightManager->addAreaLight(light);
+                                    std::string lightName = "Emissive " + std::to_string(lightIdx);
+                                    m_sceneHierarchy->addAreaLight(lightIdx, lightName);
+
+                                    std::cout << "[App] Emissive mesh -> area light (emission: ["
+                                              << em.x << ", " << em.y << ", " << em.z
+                                              << "], area: " << totalArea << ")\n";
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -401,8 +502,16 @@ bool Application::loadScene() {
                 m_camera->setPosition(camPos);
                 m_camera->setYawPitch(yaw, 0.0f);
 
-                // Scale move speed to scene size
+                // Scale move speed and clip planes to scene size
                 m_camera->setMoveSpeed(maxExtent * 0.5f);
+                float sceneRadius = glm::length(extent) * 0.5f;
+                float nearPlane = std::max(0.001f, sceneRadius * 0.0001f);
+                float farPlane = std::max(1000.0f, sceneRadius * 20.0f);
+                m_camera->setClipPlanes(nearPlane, farPlane);
+
+                // Store scene bounds for path guide grid initialization
+                m_sceneMin = sceneMin;
+                m_sceneMax = sceneMax;
 
                 std::cout << "[App] Scene bounds: ("
                           << sceneMin.x << ", " << sceneMin.y << ", " << sceneMin.z << ") -> ("
@@ -608,10 +717,9 @@ void Application::run() {
             m_optixEngine->resetAccumulation();
             m_prevCameraParams = currentParams;
 
-            // Reset training accumulation on camera move (fresh samples for new view)
+            // Reset training frame count on camera move (fresh samples for new view)
             if (m_pathGuideMode == PathGuideMode::Running && m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
                 m_pathGuideTrainingFrameCount = 0;
-                m_pathGuideGrid->resetTrainingCount(m_cudaInterop ? m_cudaInterop->getStream() : nullptr);
             }
         }
         m_optixEngine->setCamera(currentParams);
@@ -634,7 +742,6 @@ void Application::resetPathGuideTraining() {
     if (m_pathGuideMode == PathGuideMode::Disabled) return;
 
     cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
-    m_pathGuideGrid->resetTrainingCount(stream);
     m_pathGuideGrid->clear(stream);  // Zero vMF lobes + stats (structure preserved)
     m_pathGuideTrainingFrameCount = 0;
 }
@@ -646,123 +753,83 @@ bool Application::cameraChanged(const CameraParams& a, const CameraParams& b) {
 }
 
 void Application::renderFrame() {
+    // ── Frame timing diagnostic (prints every 120 frames) ──
+    static uint64_t diagFrameCount = 0;
+    static double diagAccum[10] = {};
+    static const char* diagNames[10] = {
+        "buildChk", "syncRdr", "uiRender", "glDisp", "swapBuf",
+        "pgSetup", "mapBuf", "render", "unmapEvt", "asyncIO"
+    };
+    auto diagT = []{
+        return std::chrono::high_resolution_clock::now();
+    };
+    auto diagMs = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t0 = diagT();
+    auto tPrev = t0;
+
     m_displayIdx = (m_writeIdx + 1) % 3;
 
-    // Path guide automation: determine if we build this frame
-    m_buildThisFrame = false;
-    uint32_t savedSpp = 0;
-    if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
-        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+    // ═══ PHASE 1: BUILD THREAD CHECK (render stream is idle, safe for sync) ═══
+    // finishBuildFromReadback does hashing, sorting, vMF fitting (10-300ms CPU).
+    // Running it on a background thread lets the GPU render continuously.
 
-        // Always reset staging (for wireframe vis)
-        m_pathGuideGrid->resetStagingCount(stream);
+    // Step 1: Check if background build thread completed
+    if (m_buildThreadActive) {
+        if (m_buildFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            bool success = m_buildFuture.get();
+            m_buildThreadActive = false;
 
-        // Only reset training when paused/disabled or right after a build.
-        // When Running/StepOnce, training accumulates across the build interval.
-        if (m_pathGuideMode == PathGuideMode::Paused || m_pathGuideMode == PathGuideMode::Disabled) {
-            m_pathGuideGrid->resetTrainingCount(stream);
-        }
+            if (success) {
+                cudaStream_t renderStream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+                m_pathGuideGrid->swapGrids(renderStream);
+                m_pathGuideBuildInFlight = false;
+                m_pathGuideTotalBuilds++;
+                m_pathGuideTrainingFrameCount = 0;
 
-        // Determine if we should build this frame
-        if (m_pathGuideMode == PathGuideMode::Running &&
-            m_pathGuideTrainingFrameCount >= m_pathGuideAutoBuildInterval) {
-            m_buildThisFrame = true;
-        } else if (m_pathGuideMode == PathGuideMode::StepOnce) {
-            m_buildThisFrame = true;
-        }
+                if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
+                    auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
+                    m_wireframeRenderer->updateVertices(vertices);
+                }
+                if (m_uiManager) {
+                    auto d = m_pathGuideGrid->getDescriptor();
+                    m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
+                }
 
-        SparsePathGuideDescriptor sparseDesc = m_pathGuideGrid->getDescriptor();
-        PathGuideStagingDescriptor stagingDesc = m_pathGuideGrid->getStagingDescriptor();
-        PathGuideTrainingStagingDescriptor trainingDesc = m_pathGuideGrid->getTrainingStagingDescriptor();
-        m_optixEngine->setPathGuideGridDescriptor(&sparseDesc, &stagingDesc, &trainingDesc);
-        m_optixEngine->setPathGuideGridDebug(m_debugGridVisualize, m_debugGridLevel);
-        const auto& config = m_pathGuideGrid->getConfig();
-        m_optixEngine->setPathGuideLevelConfig(config.start_level, config.min_level, config.max_level);
-
-        // Compute stochastic training probability to stay within buffer capacity
-        // across the multi-frame accumulation window (Müller et al. 2017 §4.1).
-        // Set to 0 when disabled/paused to avoid wasted GPU atomics and buffer writes.
-        float trainingProb = 0.0f;
-        if (m_pathGuideMode == PathGuideMode::Running || m_pathGuideMode == PathGuideMode::StepOnce) {
-            float estimatedSamplesPerFrame = static_cast<float>(m_config.width) * static_cast<float>(m_config.height);
-            float totalEstimated = estimatedSamplesPerFrame * static_cast<float>(m_pathGuideAutoBuildInterval);
-            float trainingCapacity = static_cast<float>(trainingDesc.capacity);
-            trainingProb = (totalEstimated > 0.0f) ? fminf(1.0f, trainingCapacity / totalEstimated) : 1.0f;
-        }
-        m_optixEngine->setPathGuideTrainingProbability(trainingProb);
-
-        // Keep jitter enabled on build frames — staging uses world-space hit
-        // positions, so sub-pixel jitter doesn't affect cell occupancy and
-        // disabling it injects aliased frames into the accumulation buffer.
-        m_optixEngine->setPathGuideNoJitter(false);
-        if (m_buildThisFrame) {
-            savedSpp = m_optixEngine->getSamplesPerPixel();
-            m_optixEngine->setSamplesPerPixel(1);
-        }
-
-        // Increment training frame counter when actively training
-        if (m_pathGuideMode == PathGuideMode::Running || m_pathGuideMode == PathGuideMode::StepOnce) {
-            m_pathGuideTrainingFrameCount++;
-        }
-    } else {
-        m_optixEngine->setPathGuideGridDescriptor(nullptr, nullptr, nullptr);
-    }
-
-    // Render scene
-    float4* devicePtr = reinterpret_cast<float4*>(m_cudaInterop->mapBuffer(m_writeIdx));
-    if (!devicePtr) return;
-
-    m_optixEngine->render(devicePtr, m_cudaInterop->getStream());
-
-    // Restore SPP if we changed it for the build
-    if (savedSpp > 0) {
-        m_optixEngine->setSamplesPerPixel(savedSpp);
-    }
-
-    m_cudaInterop->recordRenderComplete(m_writeIdx);
-    m_cudaInterop->unmapBuffer(m_writeIdx);
-
-    // Build from staging after this frame's trace has written to it
-    if (m_buildThisFrame && m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
-        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
-        if (stream)
-            cudaStreamSynchronize(stream);
-        uint32_t currentFrame = m_optixEngine ? m_optixEngine->getFrameIndex() : 0;
-        if (m_pathGuideGrid->buildFromStaging(stream, currentFrame)) {
-            m_pathGuideTotalBuilds++;
-            m_pathGuideTrainingFrameCount = 0;
-
-            if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
-                auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
-                m_wireframeRenderer->updateVertices(vertices);
-            }
-            if (m_uiManager) {
-                auto d = m_pathGuideGrid->getDescriptor();
-                m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
-            }
-
-            // Run adaptive refinement every 5 builds
-            if (m_pathGuideTotalBuilds > 0 && m_pathGuideTotalBuilds % 5 == 0) {
-                if (m_pathGuideGrid->runRefinementPass(currentFrame, stream)) {
-                    if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
-                        auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
-                        m_wireframeRenderer->updateVertices(vertices);
-                    }
-                    if (m_uiManager) {
-                        auto d = m_pathGuideGrid->getDescriptor();
-                        m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
+                // Run adaptive refinement every 5 builds
+                uint32_t currentFrame = m_optixEngine ? m_optixEngine->getFrameIndex() : 0;
+                if (m_pathGuideTotalBuilds > 0 && m_pathGuideTotalBuilds % 5 == 0) {
+                    cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+                    if (m_pathGuideGrid->runRefinementPass(currentFrame, stream)) {
+                        if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
+                            auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
+                            m_wireframeRenderer->updateVertices(vertices);
+                        }
+                        if (m_uiManager) {
+                            auto d = m_pathGuideGrid->getDescriptor();
+                            m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
+                        }
                     }
                 }
+
+                // If StepOnce, transition to Paused after build
+                if (m_pathGuideMode == PathGuideMode::StepOnce) {
+                    m_pathGuideMode = PathGuideMode::Paused;
+                }
+            } else {
+                m_pathGuideBuildInFlight = false;
             }
         }
+    }
 
-        // If StepOnce, transition to Paused after build
-        if (m_pathGuideMode == PathGuideMode::StepOnce) {
-            m_pathGuideMode = PathGuideMode::Paused;
-        }
-
-        // Reset training buffer for next accumulation window
-        m_pathGuideGrid->resetTrainingCount(stream);
+    // Step 2: Poll readback and launch build thread (only if no thread running)
+    if (!m_buildThreadActive && m_pathGuideBuildInFlight &&
+        m_pathGuideGrid && m_pathGuideGrid->pollAsyncReadback()) {
+        m_buildFuture = std::async(std::launch::async, [this]() {
+            return m_pathGuideGrid->finishBuildFromReadback();
+        });
+        m_buildThreadActive = true;
     }
 
     // Update UI status and optionally print stats when running
@@ -786,15 +853,26 @@ void Application::renderFrame() {
         }
     }
 
-    if (m_framesPipelined >= 2) {
-        if (!m_cudaInterop->isRenderComplete(m_displayIdx)) {
-            m_cudaInterop->waitForRender(m_displayIdx);
-        }
-        m_glContext->updateTextureFromPBO(m_displayIdx);
-    }
+    // [DIAG] buildChk
+    { auto tNow = diagT(); diagAccum[0] += diagMs(tPrev, tNow); tPrev = tNow; }
 
-    m_writeIdx = (m_writeIdx + 1) % 3;
-    m_framesPipelined++;
+    // ═══ PHASE 2: DISPLAY PREVIOUS FRAME ═══
+    // On Windows WDDM, glTexSubImage2D on a CUDA-registered PBO triggers an
+    // implicit full-device sync. cudaStreamSynchronize is much faster because it
+    // returns as soon as the GPU finishes, without WDDM driver overhead.
+    // This wait IS the GPU render time — it's the minimum possible wait.
+    m_cudaInterop->synchronize();
+
+    // [DIAG] syncRdr (time spent waiting for previous frame's GPU render)
+    { auto tNow = diagT(); diagAccum[1] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    if (m_framesPipelined >= 2) {
+        m_glContext->updateTextureFromPBO(m_displayIdx);
+    } else if (m_framesPipelined == 1) {
+        int warmupIdx = (m_writeIdx + 2) % 3;
+        m_glContext->updateTextureFromPBO(warmupIdx);
+        m_displayIdx = warmupIdx;
+    }
 
     // Render UI
     m_uiManager->collectGeometry();
@@ -819,18 +897,18 @@ void Application::renderFrame() {
             m_glContext->getWidth(), m_glContext->getHeight(),
             m_cudaInterop->getUIStream());
 
-        if (rendered) m_cudaInterop->synchronizeUI();
+        // unmapUIPBO provides GPU-GPU sync via cudaGraphicsUnmapResources —
+        // OpenGL safely reads PBO after unmap, no explicit CPU sync needed
         m_cudaInterop->unmapUIPBO();
         if (rendered) m_glContext->updateUITextureFromPBO();
     }
 
-    // Display
-    if (m_framesPipelined >= 2) {
+    // [DIAG] uiRender
+    { auto tNow = diagT(); diagAccum[2] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    // GL display
+    if (m_framesPipelined >= 1) {
         m_glContext->renderFullscreenQuad(m_displayIdx);
-    } else {
-        m_cudaInterop->synchronize();
-        m_glContext->updateTextureFromPBO((m_writeIdx + 2) % 3);
-        m_glContext->renderFullscreenQuad((m_writeIdx + 2) % 3);
     }
 
     // Render grid wireframe overlay (same viewport and view/proj as scene)
@@ -851,7 +929,8 @@ void Application::renderFrame() {
         m_wireframeRenderer->render(viewProj, glm::vec3(0.2f, 0.8f, 1.0f));
     }
 
-    // Hemisphere visualization inset (bottom-right corner)
+    // Hemisphere visualization inset (top-right corner)
+    // Shows 3 hemispheres: combined mixture (large) + lobe 0 and lobe 1 (smaller, below)
     if (m_hemisphereVis && m_inspectedCell.valid) {
         uint32_t w = m_glContext->getWidth();
         uint32_t h = m_glContext->getHeight();
@@ -864,7 +943,107 @@ void Application::renderFrame() {
     // UI overlay drawn last so it's on top of wireframe and other overlays
     m_glContext->renderUIOverlay();
 
+    // [DIAG] glDisp
+    { auto tNow = diagT(); diagAccum[3] += diagMs(tPrev, tNow); tPrev = tNow; }
+
     m_glContext->swapBuffers();
+
+    // [DIAG] swapBuf
+    { auto tNow = diagT(); diagAccum[4] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    // ═══ PHASE 3: PATH GUIDE SETUP ═══
+    m_buildThisFrame = false;
+    uint32_t savedSpp = 0;
+    if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+        // Determine if we should build this frame (only if no build in flight)
+        if (!m_pathGuideBuildInFlight) {
+            if (m_pathGuideMode == PathGuideMode::Running &&
+                m_pathGuideTrainingFrameCount >= m_pathGuideAutoBuildInterval) {
+                m_buildThisFrame = true;
+            } else if (m_pathGuideMode == PathGuideMode::StepOnce) {
+                m_buildThisFrame = true;
+            }
+        }
+
+        // Use render descriptor (stable, not being mutated by build)
+        SparsePathGuideDescriptor sparseDesc = m_pathGuideGrid->getRenderDescriptor();
+        PathGuideStagingDescriptor stagingDesc = m_pathGuideGrid->getStagingDescriptor();
+        m_optixEngine->setPathGuideGridDescriptor(&sparseDesc, &stagingDesc);
+        m_optixEngine->setPathGuideGridDebug(m_debugGridVisualize, m_debugGridLevel);
+        const auto& config = m_pathGuideGrid->getConfig();
+        m_optixEngine->setPathGuideLevelConfig(config.start_level, config.min_level, config.max_level);
+
+        m_optixEngine->setPathGuideNoJitter(false);
+        if (m_buildThisFrame) {
+            savedSpp = m_optixEngine->getSamplesPerPixel();
+            m_optixEngine->setSamplesPerPixel(1);
+        }
+
+        // Increment training frame counter when actively training
+        if (m_pathGuideMode == PathGuideMode::Running || m_pathGuideMode == PathGuideMode::StepOnce) {
+            m_pathGuideTrainingFrameCount++;
+        }
+    } else {
+        m_optixEngine->setPathGuideGridDescriptor(nullptr, nullptr);
+    }
+
+    // [DIAG] pgSetup
+    { auto tNow = diagT(); diagAccum[5] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    // ═══ PHASE 4: RENDER SUBMISSION (async on GPU) ═══
+    // Map PBO first — render stream is idle from GL's perspective, near-instant
+    float4* devicePtr = reinterpret_cast<float4*>(m_cudaInterop->mapBuffer(m_writeIdx));
+    if (!devicePtr) return;
+
+    // [DIAG] mapBuf
+    { auto tNow = diagT(); diagAccum[6] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    m_optixEngine->render(devicePtr, m_cudaInterop->getStream());
+
+    // Restore SPP if we changed it for the build
+    if (savedSpp > 0) {
+        m_optixEngine->setSamplesPerPixel(savedSpp);
+    }
+
+    // [DIAG] render
+    { auto tNow = diagT(); diagAccum[7] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    // Record event + unmap: both stream-ordered, no CPU block
+    m_cudaInterop->recordRenderComplete(m_writeIdx);
+    m_cudaInterop->unmapBuffer(m_writeIdx);
+
+    // [DIAG] unmapEvt
+    { auto tNow = diagT(); diagAccum[8] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    // ═══ PHASE 5: ASYNC I/O + ADVANCE ═══
+    // Kick off async readback after this frame's trace has written to staging
+    if (m_buildThisFrame && m_pathGuideGrid && m_pathGuideGrid->isInitialized() && !m_pathGuideBuildInFlight) {
+        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+        uint32_t currentFrame = m_optixEngine ? m_optixEngine->getFrameIndex() : 0;
+        m_pathGuideGrid->beginAsyncReadback(stream, currentFrame);
+        m_pathGuideBuildInFlight = true;
+    }
+
+    m_writeIdx = (m_writeIdx + 1) % 3;
+    m_framesPipelined++;
+
+    // [DIAG] asyncIO
+    { auto tNow = diagT(); diagAccum[9] += diagMs(tPrev, tNow); tPrev = tNow; }
+
+    // Print timing every 120 frames
+    diagFrameCount++;
+    if (diagFrameCount % 120 == 0) {
+        double total = 0;
+        for (int i = 0; i < 10; i++) total += diagAccum[i];
+        std::cout << "[DIAG] avg ms/frame over 120 frames (total="
+                  << (total / 120.0) << "ms):\n";
+        for (int i = 0; i < 10; i++) {
+            std::cout << "  " << diagNames[i] << ": "
+                      << (diagAccum[i] / 120.0) << " ms ("
+                      << (100.0 * diagAccum[i] / total) << "%)\n";
+            diagAccum[i] = 0;
+        }
+    }
 }
 
 void Application::updateCamera(float deltaTime) {
@@ -881,6 +1060,12 @@ void Application::updateCamera(float deltaTime) {
 void Application::shutdown() {
     m_running = false;
     s_instance = nullptr;
+
+    // Wait for any in-flight build thread before destroying resources
+    if (m_buildThreadActive && m_buildFuture.valid()) {
+        m_buildFuture.wait();
+        m_buildThreadActive = false;
+    }
 
     if (m_hemisphereVis) m_hemisphereVis->shutdown();
     if (m_inputHandler) m_inputHandler->shutdown();

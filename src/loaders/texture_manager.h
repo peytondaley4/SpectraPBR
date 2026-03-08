@@ -37,6 +37,11 @@ public:
     // isSRGB: set to true for color textures (albedo), false for linear (normal, roughness)
     TextureHandle loadFromFile(const std::string& path, bool isSRGB = true);
 
+    // Load a grayscale height/bump map and convert to tangent-space normal map
+    // via central-difference gradients.  The resulting texture can be used
+    // directly as a normal map in the shader (unpackNormal → applyNormalMap).
+    TextureHandle loadBumpMapAsNormal(const std::string& path, float strength = 1.0f);
+
     // Create texture from raw data (RGBA8)
     TextureHandle createFromData(const uint8_t* data, uint32_t width, uint32_t height,
                                  uint32_t channels, bool isSRGB = true);

@@ -4,10 +4,6 @@
 namespace spectra {
 namespace ui {
 
-TreeNode::TreeNode() {
-    setSize(200.0f, ROW_HEIGHT);
-}
-
 TreeNode::TreeNode(const std::string& label)
     : m_label(label) {
     setSize(200.0f, ROW_HEIGHT);

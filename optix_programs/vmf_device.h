@@ -12,10 +12,12 @@
 #include <cuda_runtime.h>
 
 __forceinline__ __device__ void vmfSphericalToCartesian(float theta, float phi, float& mx, float& my, float& mz) {
-    float st = sinf(theta);
-    mx = st * cosf(phi);
-    my = cosf(theta);
-    mz = st * sinf(phi);
+    float sinTheta, cosTheta, sinPhi, cosPhi;
+    sincosf(theta, &sinTheta, &cosTheta);
+    sincosf(phi, &sinPhi, &cosPhi);
+    mx = sinTheta * cosPhi;
+    my = cosTheta;
+    mz = sinTheta * sinPhi;
 }
 
 __forceinline__ __device__ void vmfCartesianToSpherical(float mx, float my, float mz, float& theta, float& phi) {
@@ -74,7 +76,9 @@ __forceinline__ __device__ void vmfSample(
 
     float angle = 6.28318530718f * u2;
     float r = sqrtf(fmaxf(1.0f - w*w, 0.0f));
-    float vx = r * cosf(angle), vy = r * sinf(angle);
+    float sinA, cosA;
+    sincosf(angle, &sinA, &cosA);
+    float vx = r * cosA, vy = r * sinA;
     ox = vx*tx + vy*bx + w*mx;
     oy = vx*ty + vy*by + w*my;
     oz = vx*tz + vy*bz + w*mz;

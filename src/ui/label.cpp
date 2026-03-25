@@ -4,10 +4,6 @@
 namespace spectra {
 namespace ui {
 
-Label::Label() {
-    setSize(100.0f, 20.0f);
-}
-
 Label::Label(const std::string& text)
     : m_text(text) {
     setSize(100.0f, 20.0f);

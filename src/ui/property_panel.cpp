@@ -310,6 +310,25 @@ void PropertyPanel::updateMaterialFromSliders() {
     markDirty();
 }
 
+void PropertyPanel::getEditableWidgets(Widget* out[EDITABLE_WIDGET_COUNT]) const {
+    out[0]  = m_posXSlider.get();
+    out[1]  = m_posYSlider.get();
+    out[2]  = m_posZSlider.get();
+    out[3]  = m_colorPicker.get();
+    out[4]  = m_intensitySlider.get();
+    out[5]  = m_radiusSlider.get();
+    out[6]  = m_angularDiameterSlider.get();
+    out[7]  = m_sizeXSlider.get();
+    out[8]  = m_sizeYSlider.get();
+    out[9]  = m_dirAzimuthSlider.get();
+    out[10] = m_dirElevationSlider.get();
+    out[11] = m_baseColorPicker.get();
+    out[12] = m_metallicSlider.get();
+    out[13] = m_roughnessSlider.get();
+    out[14] = m_emissivePicker.get();
+    out[15] = m_emissiveIntensitySlider.get();
+}
+
 void PropertyPanel::updatePanelAndTheme() {
     Rect bounds = getAbsoluteBounds();
     const Theme* theme = getTheme();
@@ -326,14 +345,8 @@ void PropertyPanel::updatePanelAndTheme() {
     if (themeChanged) {
         if (m_panel) m_panel->setTheme(theme);
         // Set theme on all widgets
-        Widget* widgets[] = {
-            m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
-            m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
-            m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
-            m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
-            m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
-            m_emissivePicker.get(), m_emissiveIntensitySlider.get()
-        };
+        Widget* widgets[EDITABLE_WIDGET_COUNT];
+        getEditableWidgets(widgets);
         for (Widget* w : widgets) {
             if (w) w->setTheme(theme);
         }
@@ -766,14 +779,8 @@ bool PropertyPanel::onMouseDown(float2 pos, int button) {
     }
 
     // Forward to visible widgets
-    Widget* widgets[] = {
-        m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
-        m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
-        m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
-        m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
-        m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
-        m_emissivePicker.get(), m_emissiveIntensitySlider.get()
-    };
+    Widget* widgets[EDITABLE_WIDGET_COUNT];
+    getEditableWidgets(widgets);
     for (Widget* w : widgets) {
         if (w && w->isVisible() && w->onMouseDown(pos, button)) return true;
     }
@@ -805,14 +812,8 @@ bool PropertyPanel::onMouseUp(float2 pos, int button) {
     }
 
     // Forward to widgets
-    Widget* widgets[] = {
-        m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
-        m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
-        m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
-        m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
-        m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
-        m_emissivePicker.get(), m_emissiveIntensitySlider.get()
-    };
+    Widget* widgets[EDITABLE_WIDGET_COUNT];
+    getEditableWidgets(widgets);
     for (Widget* w : widgets) {
         if (w) consumed = w->onMouseUp(pos, button) || consumed;
     }
@@ -851,14 +852,8 @@ bool PropertyPanel::onMouseMove(float2 pos) {
     }
 
     // Forward to widgets
-    Widget* widgets[] = {
-        m_posXSlider.get(), m_posYSlider.get(), m_posZSlider.get(),
-        m_colorPicker.get(), m_intensitySlider.get(), m_radiusSlider.get(),
-        m_angularDiameterSlider.get(), m_sizeXSlider.get(), m_sizeYSlider.get(),
-        m_dirAzimuthSlider.get(), m_dirElevationSlider.get(),
-        m_baseColorPicker.get(), m_metallicSlider.get(), m_roughnessSlider.get(),
-        m_emissivePicker.get(), m_emissiveIntensitySlider.get()
-    };
+    Widget* widgets[EDITABLE_WIDGET_COUNT];
+    getEditableWidgets(widgets);
     for (Widget* w : widgets) {
         if (w) consumed = w->onMouseMove(pos) || consumed;
     }

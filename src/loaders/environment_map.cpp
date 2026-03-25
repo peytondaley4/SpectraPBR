@@ -1,4 +1,5 @@
 #include "environment_map.h"
+#include "cuda/cuda_texture_utils.h"
 #include <stb_image.h>
 #include <iostream>
 #include <cmath>
@@ -123,22 +124,10 @@ bool EnvironmentMap::createTexture(const float* rgbData) {
         return false;
     }
 
-    // Create texture object
-    cudaResourceDesc resDesc = {};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = m_textureArray;
-
-    cudaTextureDesc texDesc = {};
-    texDesc.addressMode[0] = cudaAddressModeWrap;   // Wrap horizontally
-    texDesc.addressMode[1] = cudaAddressModeClamp;  // Clamp vertically
-    texDesc.filterMode = cudaFilterModeLinear;
-    texDesc.readMode = cudaReadModeElementType;     // Return float directly
-    texDesc.normalizedCoords = 1;                   // Use [0,1] coordinates
-
-    err = cudaCreateTextureObject(&m_texture, &resDesc, &texDesc, nullptr);
-    if (err != cudaSuccess) {
-        std::cerr << "[EnvironmentMap] Failed to create texture object: " 
-                  << cudaGetErrorString(err) << "\n";
+    // Create texture object (wrap horizontal, clamp vertical, linear filter, HDR floats)
+    if (!createCudaTexture(m_texture, m_textureArray,
+            cudaAddressModeWrap, cudaAddressModeClamp,
+            cudaFilterModeLinear, cudaReadModeElementType)) {
         return false;
     }
 
@@ -242,21 +231,9 @@ bool EnvironmentMap::buildCDFs(const float* rgbData) {
             return false;
         }
 
-        cudaResourceDesc resDesc = {};
-        resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = m_conditionalCDFArray;
-
-        cudaTextureDesc texDesc = {};
-        texDesc.addressMode[0] = cudaAddressModeClamp;
-        texDesc.addressMode[1] = cudaAddressModeClamp;
-        texDesc.filterMode = cudaFilterModePoint;  // No interpolation for CDF lookup
-        texDesc.readMode = cudaReadModeElementType;
-        texDesc.normalizedCoords = 0;  // Use pixel coordinates for binary search
-
-        err = cudaCreateTextureObject(&m_conditionalCDF, &resDesc, &texDesc, nullptr);
-        if (err != cudaSuccess) {
-            std::cerr << "[EnvironmentMap] Failed to create conditional CDF texture: " 
-                      << cudaGetErrorString(err) << "\n";
+        if (!createCudaTexture(m_conditionalCDF, m_conditionalCDFArray,
+                cudaAddressModeClamp, cudaAddressModeClamp,
+                cudaFilterModePoint, cudaReadModeElementType, false)) {
             return false;
         }
     }
@@ -285,20 +262,9 @@ bool EnvironmentMap::buildCDFs(const float* rgbData) {
             return false;
         }
 
-        cudaResourceDesc resDesc = {};
-        resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = m_marginalCDFArray;
-
-        cudaTextureDesc texDesc = {};
-        texDesc.addressMode[0] = cudaAddressModeClamp;
-        texDesc.filterMode = cudaFilterModePoint;  // No interpolation for CDF lookup
-        texDesc.readMode = cudaReadModeElementType;
-        texDesc.normalizedCoords = 0;  // Use pixel coordinates
-
-        err = cudaCreateTextureObject(&m_marginalCDF, &resDesc, &texDesc, nullptr);
-        if (err != cudaSuccess) {
-            std::cerr << "[EnvironmentMap] Failed to create marginal CDF texture: " 
-                      << cudaGetErrorString(err) << "\n";
+        if (!createCudaTexture(m_marginalCDF, m_marginalCDFArray,
+                cudaAddressModeClamp, cudaAddressModeClamp,
+                cudaFilterModePoint, cudaReadModeElementType, false)) {
             return false;
         }
     }

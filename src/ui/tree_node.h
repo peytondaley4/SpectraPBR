@@ -14,8 +14,7 @@ namespace ui {
 //------------------------------------------------------------------------------
 class TreeNode : public Widget {
 public:
-    TreeNode();
-    explicit TreeNode(const std::string& label);
+    explicit TreeNode(const std::string& label = "");
     ~TreeNode() override = default;
 
     // Label

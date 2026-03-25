@@ -143,13 +143,7 @@ bool Widget::onMouseMove(float2 pos) {
     bool isOver = bounds.contains(pos);
     
     // Update hover state
-    bool wasHovered = m_hovered;
-    m_hovered = isOver;
-    
-    if (m_hovered != wasHovered) {
-        markDirty();
-        onHoverChanged();
-    }
+    updateHoverState(isOver);
     
     // If mouse isn't over this widget, no need to check children
     if (!isOver) {
@@ -250,6 +244,17 @@ bool Widget::onKeyUp(int key, int mods) {
         }
     }
 
+    return false;
+}
+
+bool Widget::updateHoverState(bool isOver) {
+    bool wasHovered = m_hovered;
+    m_hovered = isOver;
+    if (m_hovered != wasHovered) {
+        markDirty();
+        onHoverChanged();
+        return true;
+    }
     return false;
 }
 

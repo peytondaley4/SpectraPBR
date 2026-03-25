@@ -1,4 +1,5 @@
 #include "texture_preview_cache.h"
+#include "cuda/cuda_texture_utils.h"
 #include <iostream>
 
 namespace spectra {
@@ -60,22 +61,10 @@ bool TexturePreviewCache::init() {
             return false;
         }
         
-        // Create texture object for the cached array
-        cudaResourceDesc resDesc = {};
-        resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = m_cachedArrays[i];
-        
-        cudaTextureDesc texDesc = {};
-        texDesc.addressMode[0] = cudaAddressModeClamp;
-        texDesc.addressMode[1] = cudaAddressModeClamp;
-        texDesc.filterMode = cudaFilterModeLinear;
-        texDesc.readMode = cudaReadModeElementType;  // float4 stays as float4
-        texDesc.normalizedCoords = 1;
-        
-        err = cudaCreateTextureObject(&m_cachedTextures[i], &resDesc, &texDesc, nullptr);
-        if (err != cudaSuccess) {
-            std::cerr << "[TexturePreviewCache] Failed to create cache texture " << i << ": "
-                      << cudaGetErrorString(err) << "\n";
+        // Create texture object for the cached array (clamp, linear, float4 element type)
+        if (!createCudaTexture(m_cachedTextures[i], m_cachedArrays[i],
+                cudaAddressModeClamp, cudaAddressModeClamp,
+                cudaFilterModeLinear, cudaReadModeElementType)) {
             shutdown();
             return false;
         }

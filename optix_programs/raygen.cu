@@ -10,15 +10,15 @@ extern "C" __global__ void __raygen__simple() {
     unsigned int pixelY = params.pick_mode ? params.pick_y : idx.y;
     const unsigned int linear_idx = pixelY * params.width + pixelX;
 
-    const float tanHalfFovY = tanf(params.camera.fovY * 0.5f);
-    const float tanHalfFovX = tanHalfFovY * params.camera.aspectRatio;
+    const float tanHalfFovY = params.tan_half_fov_y;
+    const float tanHalfFovX = params.tan_half_fov_x;
 
     const unsigned int spp = max(1u, params.samples_per_pixel);
 
     float3 accumulatedColor = make_float3(0.0f, 0.0f, 0.0f);
     unsigned int lastInstanceId = 0xFFFFFFFFu;
 
-    unsigned int gridDim = (unsigned int)ceilf(sqrtf((float)spp));
+    unsigned int gridDim = params.stratified_grid_dim;
 
     for (unsigned int sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
         unsigned int seed = mixSeed(pixelX, pixelY, params.frame_index, sampleIdx);

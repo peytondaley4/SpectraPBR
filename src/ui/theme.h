@@ -61,112 +61,105 @@ struct Theme {
 // Predefined Themes
 //------------------------------------------------------------------------------
 
-// Dark theme (default)
-inline Theme createDarkTheme() {
-    Theme theme;
+// Color palette — only the values that differ between themes
+struct ThemePalette {
+    float panelBg;          // Base panel background brightness
+    float panelBgAlt;       // Alternate background brightness
+    float panelBorder;      // Border brightness
+    float buttonNormal;     // Button normal brightness
+    float buttonHover;      // Button hover brightness
+    float buttonActive;     // Button active brightness
+    float buttonDisabled;   // Button disabled brightness
+    float textPrimary;      // Primary text brightness
+    float textSecondary;    // Secondary text brightness
+    float textDisabled;     // Disabled text brightness
+    float treeHover;        // Tree hover brightness
+    float treeExpander;     // Tree expander brightness
+    float scrollTrack;      // Scrollbar track brightness
+    float scrollThumb;      // Scrollbar thumb brightness
+    float scrollThumbHover; // Scrollbar thumb hover brightness
+    float scrollThumbActive;// Scrollbar thumb active brightness
+    float separator;        // Separator brightness
+    float sliderTrack;      // Slider track brightness
+    float sliderThumb;      // Slider thumb brightness
+    float sliderThumbHover; // Slider thumb hover brightness
+    float propHeader;       // Property header brightness
+    float propValue;        // Property value brightness
+    float propSeparator;    // Property separator brightness
+    float propLabel;        // Property label brightness
+    float treeSelectedA;    // Tree selected alpha
+};
 
-    // Panel colors - dark gray backgrounds
-    theme.panelBackground    = make_float4(0.15f, 0.15f, 0.15f, 1.0f);
-    theme.panelBackgroundAlt = make_float4(0.12f, 0.12f, 0.12f, 1.0f);
-    theme.panelBorder        = make_float4(0.25f, 0.25f, 0.25f, 1.0f);
+inline float4 gray(float v, float a = 1.0f) { return make_float4(v, v, v, a); }
 
-    // Button colors
-    theme.buttonNormal   = make_float4(0.25f, 0.25f, 0.25f, 1.0f);
-    theme.buttonHover    = make_float4(0.35f, 0.35f, 0.35f, 1.0f);
-    theme.buttonActive   = make_float4(0.20f, 0.20f, 0.20f, 1.0f);
-    theme.buttonDisabled = make_float4(0.18f, 0.18f, 0.18f, 0.5f);
+inline Theme createThemeFromPalette(const ThemePalette& p) {
+    Theme t;
+    t.panelBackground    = gray(p.panelBg);
+    t.panelBackgroundAlt = gray(p.panelBgAlt);
+    t.panelBorder        = gray(p.panelBorder);
 
-    // Text colors
-    theme.textPrimary   = make_float4(0.95f, 0.95f, 0.95f, 1.0f);
-    theme.textSecondary = make_float4(0.70f, 0.70f, 0.70f, 1.0f);
-    theme.textDisabled  = make_float4(0.45f, 0.45f, 0.45f, 1.0f);
+    t.buttonNormal   = gray(p.buttonNormal);
+    t.buttonHover    = gray(p.buttonHover);
+    t.buttonActive   = gray(p.buttonActive);
+    t.buttonDisabled = gray(p.buttonDisabled, 0.5f);
 
-    // Tree/List colors
-    theme.treeSelected = make_float4(0.20f, 0.40f, 0.70f, 1.0f);
-    theme.treeHover    = make_float4(0.30f, 0.30f, 0.30f, 1.0f);
-    theme.treeExpander = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
+    t.textPrimary   = gray(p.textPrimary);
+    t.textSecondary = gray(p.textSecondary);
+    t.textDisabled  = gray(p.textDisabled);
 
-    // Highlight/accent - blue accent
-    theme.highlight     = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
-    theme.highlightText = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+    t.treeSelected = make_float4(0.20f, 0.40f, 0.70f, p.treeSelectedA);
+    t.treeHover    = gray(p.treeHover);
+    t.treeExpander = gray(p.treeExpander);
 
-    // Scrollbar
-    theme.scrollbarTrack       = make_float4(0.10f, 0.10f, 0.10f, 0.5f);
-    theme.scrollbarThumb       = make_float4(0.40f, 0.40f, 0.40f, 0.8f);
-    theme.scrollbarThumbHover  = make_float4(0.50f, 0.50f, 0.50f, 0.9f);
-    theme.scrollbarThumbActive = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
+    // Shared accent color
+    t.highlight     = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
+    t.highlightText = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
 
-    // Separator
-    theme.separator = make_float4(0.30f, 0.30f, 0.30f, 1.0f);
+    t.scrollbarTrack       = gray(p.scrollTrack, 0.5f);
+    t.scrollbarThumb       = gray(p.scrollThumb, 0.8f);
+    t.scrollbarThumbHover  = gray(p.scrollThumbHover, 0.9f);
+    t.scrollbarThumbActive = gray(p.scrollThumbActive, 1.0f);
 
-    // Slider colors
-    theme.sliderTrack       = make_float4(0.20f, 0.20f, 0.20f, 1.0f);
-    theme.sliderTrackFilled = make_float4(0.26f, 0.59f, 0.98f, 1.0f);  // Blue highlight
-    theme.sliderThumb       = make_float4(0.50f, 0.50f, 0.50f, 1.0f);
-    theme.sliderThumbHover  = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
-    theme.sliderThumbActive = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
+    t.separator = gray(p.separator);
 
-    // Property panel colors
-    theme.propertyHeader    = make_float4(0.18f, 0.18f, 0.18f, 1.0f);
-    theme.propertyValue     = make_float4(0.85f, 0.85f, 0.85f, 1.0f);
-    theme.propertySeparator = make_float4(0.25f, 0.25f, 0.25f, 1.0f);
-    theme.propertyLabel     = make_float4(0.60f, 0.60f, 0.60f, 1.0f);
+    t.sliderTrack       = gray(p.sliderTrack);
+    t.sliderTrackFilled = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
+    t.sliderThumb       = gray(p.sliderThumb);
+    t.sliderThumbHover  = gray(p.sliderThumbHover);
+    t.sliderThumbActive = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
 
-    return theme;
+    t.propertyHeader    = gray(p.propHeader);
+    t.propertyValue     = gray(p.propValue);
+    t.propertySeparator = gray(p.propSeparator);
+    t.propertyLabel     = gray(p.propLabel);
+
+    return t;
 }
 
-// Light theme
+inline Theme createDarkTheme() {
+    ThemePalette p;
+    p.panelBg = 0.15f;  p.panelBgAlt = 0.12f;  p.panelBorder = 0.25f;
+    p.buttonNormal = 0.25f;  p.buttonHover = 0.35f;  p.buttonActive = 0.20f;  p.buttonDisabled = 0.18f;
+    p.textPrimary = 0.95f;  p.textSecondary = 0.70f;  p.textDisabled = 0.45f;
+    p.treeHover = 0.30f;  p.treeExpander = 0.60f;  p.treeSelectedA = 1.0f;
+    p.scrollTrack = 0.10f;  p.scrollThumb = 0.40f;  p.scrollThumbHover = 0.50f;  p.scrollThumbActive = 0.60f;
+    p.separator = 0.30f;
+    p.sliderTrack = 0.20f;  p.sliderThumb = 0.50f;  p.sliderThumbHover = 0.60f;
+    p.propHeader = 0.18f;  p.propValue = 0.85f;  p.propSeparator = 0.25f;  p.propLabel = 0.60f;
+    return createThemeFromPalette(p);
+}
+
 inline Theme createLightTheme() {
-    Theme theme;
-
-    // Panel colors - light gray backgrounds
-    theme.panelBackground    = make_float4(0.94f, 0.94f, 0.94f, 1.0f);
-    theme.panelBackgroundAlt = make_float4(0.88f, 0.88f, 0.88f, 1.0f);
-    theme.panelBorder        = make_float4(0.70f, 0.70f, 0.70f, 1.0f);
-
-    // Button colors
-    theme.buttonNormal   = make_float4(0.85f, 0.85f, 0.85f, 1.0f);
-    theme.buttonHover    = make_float4(0.75f, 0.75f, 0.75f, 1.0f);
-    theme.buttonActive   = make_float4(0.90f, 0.90f, 0.90f, 1.0f);
-    theme.buttonDisabled = make_float4(0.80f, 0.80f, 0.80f, 0.5f);
-
-    // Text colors
-    theme.textPrimary   = make_float4(0.10f, 0.10f, 0.10f, 1.0f);
-    theme.textSecondary = make_float4(0.35f, 0.35f, 0.35f, 1.0f);
-    theme.textDisabled  = make_float4(0.55f, 0.55f, 0.55f, 1.0f);
-
-    // Tree/List colors
-    theme.treeSelected = make_float4(0.26f, 0.59f, 0.98f, 0.8f);
-    theme.treeHover    = make_float4(0.80f, 0.80f, 0.80f, 1.0f);
-    theme.treeExpander = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
-
-    // Highlight/accent - blue accent
-    theme.highlight     = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
-    theme.highlightText = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-
-    // Scrollbar
-    theme.scrollbarTrack       = make_float4(0.85f, 0.85f, 0.85f, 0.5f);
-    theme.scrollbarThumb       = make_float4(0.60f, 0.60f, 0.60f, 0.8f);
-    theme.scrollbarThumbHover  = make_float4(0.50f, 0.50f, 0.50f, 0.9f);
-    theme.scrollbarThumbActive = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
-
-    // Separator
-    theme.separator = make_float4(0.70f, 0.70f, 0.70f, 1.0f);
-
-    // Slider colors
-    theme.sliderTrack       = make_float4(0.75f, 0.75f, 0.75f, 1.0f);
-    theme.sliderTrackFilled = make_float4(0.26f, 0.59f, 0.98f, 1.0f);  // Blue highlight
-    theme.sliderThumb       = make_float4(0.50f, 0.50f, 0.50f, 1.0f);
-    theme.sliderThumbHover  = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
-    theme.sliderThumbActive = make_float4(0.26f, 0.59f, 0.98f, 1.0f);
-
-    // Property panel colors
-    theme.propertyHeader    = make_float4(0.85f, 0.85f, 0.85f, 1.0f);
-    theme.propertyValue     = make_float4(0.15f, 0.15f, 0.15f, 1.0f);
-    theme.propertySeparator = make_float4(0.75f, 0.75f, 0.75f, 1.0f);
-    theme.propertyLabel     = make_float4(0.40f, 0.40f, 0.40f, 1.0f);
-
-    return theme;
+    ThemePalette p;
+    p.panelBg = 0.94f;  p.panelBgAlt = 0.88f;  p.panelBorder = 0.70f;
+    p.buttonNormal = 0.85f;  p.buttonHover = 0.75f;  p.buttonActive = 0.90f;  p.buttonDisabled = 0.80f;
+    p.textPrimary = 0.10f;  p.textSecondary = 0.35f;  p.textDisabled = 0.55f;
+    p.treeHover = 0.80f;  p.treeExpander = 0.40f;  p.treeSelectedA = 0.8f;
+    p.scrollTrack = 0.85f;  p.scrollThumb = 0.60f;  p.scrollThumbHover = 0.50f;  p.scrollThumbActive = 0.40f;
+    p.separator = 0.70f;
+    p.sliderTrack = 0.75f;  p.sliderThumb = 0.50f;  p.sliderThumbHover = 0.40f;
+    p.propHeader = 0.85f;  p.propValue = 0.15f;  p.propSeparator = 0.75f;  p.propLabel = 0.40f;
+    return createThemeFromPalette(p);
 }
 
 // Global theme instances

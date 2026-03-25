@@ -268,6 +268,12 @@ struct GpuLaunchParams {
     unsigned int path_guide_debug_enabled; // 1 = collect debug stats
 
     unsigned int max_bounce_depth;      // Max recursive bounces for glass/transmission
+
+    // Precomputed per-frame constants (avoid transcendentals on GPU)
+    float tan_half_fov_y;               // tanf(camera.fovY * 0.5f)
+    float tan_half_fov_x;               // tan_half_fov_y * camera.aspectRatio
+    float pixel_world_size;             // (2 * tan_half_fov_y) / height
+    unsigned int stratified_grid_dim;   // ceil(sqrt(samples_per_pixel))
 };
 
 //------------------------------------------------------------------------------

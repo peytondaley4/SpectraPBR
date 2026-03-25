@@ -14,6 +14,7 @@ void SceneHierarchy::clear() {
     m_dirLightCount = 0;
     m_areaLightCount = 0;
     m_pointLightCount = 0;
+    m_instanceIdToNode.clear();
 }
 
 void SceneHierarchy::initialize() {
@@ -55,8 +56,9 @@ void SceneHierarchy::addInstance(uint32_t modelIndex, uint32_t meshIndex,
                                   uint32_t instanceId, const std::string& name) {
     if (modelIndex >= m_nodes.size()) return;
 
-    addNode(name, SceneNodeType::Instance, instanceId, modelIndex);
+    uint32_t nodeIndex = addNode(name, SceneNodeType::Instance, instanceId, modelIndex);
     m_instanceCount++;
+    m_instanceIdToNode[instanceId] = nodeIndex;
 }
 
 void SceneHierarchy::addDirectionalLight(uint32_t index, const std::string& name) {
@@ -96,13 +98,8 @@ bool SceneHierarchy::isExpanded(uint32_t nodeIndex) const {
 }
 
 uint32_t SceneHierarchy::findInstanceNode(uint32_t instanceId) const {
-    for (size_t i = 0; i < m_nodes.size(); i++) {
-        const auto& node = m_nodes[i];
-        if (node.type == SceneNodeType::Instance && node.dataIndex == instanceId) {
-            return static_cast<uint32_t>(i);
-        }
-    }
-    return UINT32_MAX;
+    auto it = m_instanceIdToNode.find(instanceId);
+    return (it != m_instanceIdToNode.end()) ? it->second : UINT32_MAX;
 }
 
 } // namespace spectra

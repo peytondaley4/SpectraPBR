@@ -1,4 +1,5 @@
 #include "font_atlas.h"
+#include "cuda/cuda_texture_utils.h"
 #include <iostream>
 #include <fstream>
 #include <cmath>
@@ -293,22 +294,8 @@ bool FontAtlas::uploadToGPU() {
         return false;
     }
 
-    // Create texture object
-    cudaResourceDesc resDesc = {};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = m_atlasArray;
-
-    cudaTextureDesc texDesc = {};
-    texDesc.addressMode[0] = cudaAddressModeClamp;
-    texDesc.addressMode[1] = cudaAddressModeClamp;
-    texDesc.filterMode = cudaFilterModeLinear;  // Linear filtering for smooth SDF
-    texDesc.readMode = cudaReadModeNormalizedFloat;  // Read as [0,1] float
-    texDesc.normalizedCoords = 1;  // Use normalized [0,1] coordinates
-
-    err = cudaCreateTextureObject(&m_atlasTexture, &resDesc, &texDesc, nullptr);
-    if (err != cudaSuccess) {
-        std::cerr << "[FontAtlas] cudaCreateTextureObject failed: "
-                  << cudaGetErrorString(err) << "\n";
+    // Create texture object (clamp, linear filter for smooth SDF, normalized [0,1])
+    if (!createCudaTexture(m_atlasTexture, m_atlasArray)) {
         return false;
     }
 

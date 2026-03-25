@@ -148,6 +148,9 @@ protected:
     virtual void onActiveChanged() {}
     virtual void onFocusChanged() {}
 
+    // Update hover state and fire callbacks if changed. Returns true if state changed.
+    bool updateHoverState(bool isOver);
+
     // Helper to get effective depth (considering parent)
     float getEffectiveDepth() const;
 

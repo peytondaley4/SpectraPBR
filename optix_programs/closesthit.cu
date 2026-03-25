@@ -39,9 +39,7 @@ __forceinline__ __device__ bool traceShadowRay(
 }
 
 __forceinline__ __device__ float calculateTextureLOD(float rayDistance) {
-    float tanHalfFov = tanf(params.camera.fovY * 0.5f);
-    float pixelWorldSize = (2.0f * tanHalfFov) / static_cast<float>(params.height);
-    float footprint = rayDistance * pixelWorldSize;
+    float footprint = rayDistance * params.pixel_world_size;
     float lod = log2f(fmaxf(1.0f, footprint));
     return fminf(fmaxf(lod, 0.0f), 12.0f);
 }
@@ -207,18 +205,7 @@ __forceinline__ __device__ float3 computeStandardDirectLighting(
             if (visible) {
                 float3 envRadiance = sampleEnvironmentRadiance(L, params.environment_map, params.environment_intensity);
 
-                float3 brdf;
-                if (params.quality_mode == QUALITY_FAST) {
-                    brdf = evaluateLambertian(baseColor);
-                } else if (clearcoat > 0.0f && params.quality_mode >= QUALITY_HIGH) {
-                    brdf = evaluateBRDF_Clearcoat(V, L, shadingNormal, baseColor, metallic, roughness, clearcoat, clearcoatRoughness);
-                } else {
-                    brdf = evaluateGGX_BRDF(V, L, shadingNormal, baseColor, metallic, roughness);
-                }
-
-                if (sheenColor.x > 0.0f || sheenColor.y > 0.0f || sheenColor.z > 0.0f) {
-                    brdf = brdf + evaluateSheen(V, L, shadingNormal, sheenColor, sheenRoughness);
-                }
+                float3 brdf = evalBRDF(L, V, shadingNormal, baseColor, metallic, roughness, clearcoat, clearcoatRoughness, sheenColor, sheenRoughness);
 
                 float3 contrib = brdf * envRadiance * NdotL / envPdf;
                 Lo = Lo + contrib;
@@ -287,7 +274,9 @@ __forceinline__ __device__ float3 sampleGGXDirection(
     float sinTheta = sqrtf(1.0f - cosTheta * cosTheta);
 
     // Microfacet normal in tangent space
-    float3 H_local = make_float3(sinTheta * cosf(phi), sinTheta * sinf(phi), cosTheta);
+    float sinPhi, cosPhi;
+    sincosf(phi, &sinPhi, &cosPhi);
+    float3 H_local = make_float3(sinTheta * cosPhi, sinTheta * sinPhi, cosTheta);
 
     // Transform to world space
     float3 H = T * H_local.x + B * H_local.y + N * H_local.z;
@@ -299,7 +288,8 @@ __forceinline__ __device__ float3 sampleGGXDirection(
     return normalize(L);
 }
 
-// Build grid descriptor from launch params (called once per hit, shared by guiding + training)
+// Build lightweight grid descriptor from launch params. Pointers only — no array copy.
+// Level resolutions are read directly from __constant__ params by sparseResolutionAtLevel().
 __forceinline__ __device__ SparsePathGuideDescriptorDevice buildGridDescriptor() {
     SparsePathGuideDescriptorDevice grid = {};
     grid.morton_codes = params.path_guide_morton_codes;
@@ -307,16 +297,12 @@ __forceinline__ __device__ SparsePathGuideDescriptorDevice buildGridDescriptor()
     grid.level_offsets = params.path_guide_level_offsets;
     grid.num_levels = params.path_guide_num_levels;
     grid.entry_stride = params.path_guide_entry_stride;
-    grid.base_resolution = params.path_guide_base_resolution;
-    grid.per_level_scale = params.path_guide_per_level_scale;
     grid.bounds_min[0] = params.path_guide_bounds_min[0];
     grid.bounds_min[1] = params.path_guide_bounds_min[1];
     grid.bounds_min[2] = params.path_guide_bounds_min[2];
     grid.bounds_max[0] = params.path_guide_bounds_max[0];
     grid.bounds_max[1] = params.path_guide_bounds_max[1];
     grid.bounds_max[2] = params.path_guide_bounds_max[2];
-    for (int i = 0; i < 16; i++)
-        grid.level_resolutions[i] = params.path_guide_level_resolutions[i];
     grid.hash_keys = params.path_guide_hash_keys;
     grid.hash_values = params.path_guide_hash_values;
     grid.hash_table_size = params.path_guide_hash_table_size;
@@ -615,7 +601,8 @@ extern "C" __global__ void __closesthit__radiance() {
         geomNormal = -geomNormal;
     }
 
-    float3 V = normalize(params.camera.position - hitPos);
+    // V = incoming ray direction reversed (correct for both primary and bounce rays)
+    float3 V = -normalize(rayDir);
 
     float clearcoat = material.clearcoat;
     float clearcoatRoughness = material.clearcoatRoughness;
@@ -673,6 +660,7 @@ extern "C" __global__ void __closesthit__radiance() {
                 }
             }
 
+            // Glass bounces use lightweight indirect shader to avoid full path guide overhead
             float3 origin = hitPos + (reflected ? gN : -gN) * 0.001f;
             unsigned int gp0, gp1, gp2, gp3, gp4, gp5;
             gp0 = gp1 = gp2 = __float_as_uint(0.0f);
@@ -682,7 +670,7 @@ extern "C" __global__ void __closesthit__radiance() {
 
             optixTrace(params.scene_handle, origin, normalize(newDir),
                        0.001f, 10000.0f, 0.0f, 0xFF, OPTIX_RAY_FLAG_NONE,
-                       RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
+                       RAY_TYPE_INDIRECT, RAY_TYPE_COUNT, RAY_TYPE_INDIRECT,
                        gp0, gp1, gp2, gp3, gp4, gp5);
 
             float3 result = make_float3(
@@ -934,7 +922,8 @@ extern "C" __global__ void __closesthit__radiance_bounce() {
         geomNormal = -geomNormal;
     }
 
-    float3 V = normalize(params.camera.position - hitPos);
+    // V = incoming ray direction reversed (correct for bounce rays)
+    float3 V = -normalize(rayDir);
     float3 baseColorRGB = make_float3(baseColor.x, baseColor.y, baseColor.z);
 
     // Generate seed for random sampling (moved before glass block)
@@ -970,6 +959,7 @@ extern "C" __global__ void __closesthit__radiance_bounce() {
                 }
             }
 
+            // Glass bounces stay on lightweight indirect path
             float3 origin = hitPos + (reflected ? gN : -gN) * 0.001f;
             unsigned int gp0, gp1, gp2, gp3, gp4, gp5;
             gp0 = gp1 = gp2 = __float_as_uint(0.0f);
@@ -979,7 +969,7 @@ extern "C" __global__ void __closesthit__radiance_bounce() {
 
             optixTrace(params.scene_handle, origin, normalize(newDir),
                        0.001f, 10000.0f, 0.0f, 0xFF, OPTIX_RAY_FLAG_NONE,
-                       RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
+                       RAY_TYPE_INDIRECT, RAY_TYPE_COUNT, RAY_TYPE_INDIRECT,
                        gp0, gp1, gp2, gp3, gp4, gp5);
 
             float3 result = make_float3(

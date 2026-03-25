@@ -10,8 +10,7 @@ namespace ui {
 //------------------------------------------------------------------------------
 class Label : public Widget {
 public:
-    Label();
-    explicit Label(const std::string& text);
+    explicit Label(const std::string& text = "");
     ~Label() override = default;
 
     // Text content

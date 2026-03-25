@@ -194,13 +194,7 @@ bool Panel::onMouseMove(float2 pos) {
     bool isOver = bounds.contains(pos);
 
     // Update hover state for this widget
-    bool wasHovered = m_hovered;
-    m_hovered = isOver;
-
-    if (m_hovered != wasHovered) {
-        markDirty();
-        onHoverChanged();
-    }
+    updateHoverState(isOver);
 
     // Update close button hover state
     if (m_showHeader && m_closeable) {

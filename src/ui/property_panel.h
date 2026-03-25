@@ -158,6 +158,10 @@ private:
     // Add spacing
     void addSpacing(float amount) { m_contentY += amount; }
 
+    // Get all editable widgets for input forwarding
+    static constexpr size_t EDITABLE_WIDGET_COUNT = 16;
+    void getEditableWidgets(Widget* out[EDITABLE_WIDGET_COUNT]) const;
+
     // Section rendering helpers
     void drawHeader(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout,
                     const std::string& title, const Theme* theme, float depth);

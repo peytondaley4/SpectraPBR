@@ -22,18 +22,17 @@
 #define PATH_GUIDE_ENTRY_STRIDE        12  // vMF (6) + stats (6)
 #define PATH_GUIDE_MIX_WEIGHT_OFFSET   10  // offset of pi_0 within cell data
 
-// Sparse grid: per-level sorted Morton codes + data, with hash table for O(1) lookup
+// Sparse grid: lightweight descriptor with pointers into __constant__ params.
+// Does NOT copy level_resolutions[16] — reads directly from params to avoid
+// 64 bytes of register pressure / local memory spill per hit.
 struct SparsePathGuideDescriptorDevice {
     const unsigned long long* morton_codes;  // uint64_t, sorted per level
     float* data;                             // entry_stride floats per cell
     const unsigned int* level_offsets;       // [0 .. num_levels]
     unsigned int num_levels;
     unsigned int entry_stride;
-    unsigned int base_resolution;
-    float per_level_scale;
     float bounds_min[3];
     float bounds_max[3];
-    unsigned int level_resolutions[16];      // Precomputed floor(base_res * scale^level)
 
     // Hash table for O(1) cell lookup (replaces binary search)
     const unsigned long long* hash_keys;     // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF
@@ -50,11 +49,13 @@ struct PathGuideStagingDevice {
 };
 
 
+// Reads level resolution directly from __constant__ params to avoid copying
+// the 16-element array into each thread's local storage.
 __forceinline__ __device__ float sparseResolutionAtLevel(
     const SparsePathGuideDescriptorDevice& grid,
     unsigned int level)
 {
-    return (float)grid.level_resolutions[level < 16 ? level : 15];
+    return (float)params.path_guide_level_resolutions[level < 16 ? level : 15];
 }
 
 __forceinline__ __device__ void worldToNormalized(

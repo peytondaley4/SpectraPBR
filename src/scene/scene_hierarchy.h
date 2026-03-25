@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <unordered_map>
 
 namespace spectra {
 
@@ -103,6 +104,8 @@ private:
     uint32_t m_dirLightCount = 0;
     uint32_t m_areaLightCount = 0;
     uint32_t m_pointLightCount = 0;
+
+    std::unordered_map<uint32_t, uint32_t> m_instanceIdToNode;
 };
 
 } // namespace spectra

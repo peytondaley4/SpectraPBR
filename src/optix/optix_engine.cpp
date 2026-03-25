@@ -207,12 +207,19 @@ bool OptixEngine::createPipeline(const std::filesystem::path& ptxDir) {
 
     // Link pipeline
     OptixPipelineLinkOptions linkOptions = {};
-    linkOptions.maxTraceDepth = 12;  // max_bounce_depth(8) + 3 (opaque indirect + bounce shadow) + 1 margin
+    // Glass now uses RAY_TYPE_INDIRECT (lightweight shader), so the heavy radiance
+    // shader only recurses 1 deep. Trace depth: radiance(1) + indirect/glass chain
+    // within bounce shader (max_bounce_depth=8 + shadow from bounce=1) + shadow(1) = 11.
+    // The key win is that continuation stack per level is much smaller since most
+    // levels use the lightweight bounce shader instead of the full radiance shader.
+    linkOptions.maxTraceDepth = 11;
 
+    // Note: alpha hit groups (m_hitgroupAlphaPG, etc.) are created but excluded
+    // from the pipeline link because buildSBT() never assigns them to SBT records.
+    // Including unused program groups inflates compilation time and stack allocation.
     OptixProgramGroup programGroups[] = {
         m_raygenPG, m_missPG, m_missShadowPG, m_missBouncePG,
-        m_hitgroupPG, m_hitgroupShadowPG, m_hitgroupBouncePG,
-        m_hitgroupAlphaPG, m_hitgroupShadowAlphaPG, m_hitgroupBounceAlphaPG
+        m_hitgroupPG, m_hitgroupShadowPG, m_hitgroupBouncePG
     };
 
     char log[2048];
@@ -842,6 +849,13 @@ void OptixEngine::render(float4* outputBuffer, cudaStream_t stream) {
     m_launchParams.height = m_height;
     m_launchParams.frame_index = m_frameIndex;
     m_launchParams.random_seed = m_frameIndex * 17 + 31;  // Simple per-frame seed
+
+    // Precompute per-frame constants to avoid transcendentals on GPU
+    m_launchParams.tan_half_fov_y = std::tan(m_launchParams.camera.fovY * 0.5f);
+    m_launchParams.tan_half_fov_x = m_launchParams.tan_half_fov_y * m_launchParams.camera.aspectRatio;
+    m_launchParams.pixel_world_size = (2.0f * m_launchParams.tan_half_fov_y) / static_cast<float>(m_height);
+    uint32_t spp = m_launchParams.samples_per_pixel > 0 ? m_launchParams.samples_per_pixel : 1;
+    m_launchParams.stratified_grid_dim = static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<float>(spp))));
     // Note: accumulated_frames is managed by caller via resetAccumulation()
 
     // Copy to pinned staging buffer, then async DMA to device.

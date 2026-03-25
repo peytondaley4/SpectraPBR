@@ -215,8 +215,10 @@ __forceinline__ __device__ float3 sampleGGXVNDF(
     // Parameterization of the projected area
     float r = sqrtf(u1);
     float phi = 2.0f * M_PI * u2;
-    float t1 = r * cosf(phi);
-    float t2 = r * sinf(phi);
+    float sinPhi, cosPhi;
+    sincosf(phi, &sinPhi, &cosPhi);
+    float t1 = r * cosPhi;
+    float t2 = r * sinPhi;
     float s = 0.5f * (1.0f + Vh.z);
     t2 = (1.0f - s) * sqrtf(1.0f - t1 * t1) + s * t2;
 
@@ -239,7 +241,9 @@ __forceinline__ __device__ float pdfGGXVNDF(float D, float G1, float NdotV) {
 __forceinline__ __device__ float3 sampleCosineHemisphere(float u1, float u2) {
     float r = sqrtf(u1);
     float phi = 2.0f * M_PI * u2;
-    return make_float3(r * cosf(phi), r * sinf(phi), sqrtf(1.0f - u1));
+    float sinPhi, cosPhi;
+    sincosf(phi, &sinPhi, &cosPhi);
+    return make_float3(r * cosPhi, r * sinPhi, sqrtf(1.0f - u1));
 }
 
 __forceinline__ __device__ float pdfCosineHemisphere(float cosTheta) {
@@ -429,14 +433,15 @@ __forceinline__ __device__ float2 directionToEquirectangular(const float3& dir) 
 __forceinline__ __device__ float3 equirectangularToDirection(float u, float v) {
     // phi: azimuthal angle around Y axis
     float phi = (u - 0.5f) * 2.0f * M_PI;
-    
+
     // theta: polar angle from +Y axis (0 = up, PI = down)
     float theta = v * M_PI;
-    
-    float sinTheta = sinf(theta);
-    float cosTheta = cosf(theta);
-    
-    return make_float3(sinTheta * cosf(phi), cosTheta, sinTheta * sinf(phi));
+
+    float sinTheta, cosTheta, sinPhi, cosPhi;
+    sincosf(theta, &sinTheta, &cosTheta);
+    sincosf(phi, &sinPhi, &cosPhi);
+
+    return make_float3(sinTheta * cosPhi, cosTheta, sinTheta * sinPhi);
 }
 
 //------------------------------------------------------------------------------

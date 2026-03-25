@@ -161,6 +161,20 @@ const GpuMaterial* MaterialManager::get(MaterialHandle handle) const {
     return &m_materials[handle];
 }
 
+bool MaterialManager::updateMaterial(MaterialHandle handle, const GpuMaterial& updated) {
+    if (handle >= m_materials.size()) return false;
+
+    GpuMaterial& mat = m_materials[handle];
+    // Update scalar properties only — preserve existing texture handles
+    mat.baseColor = updated.baseColor;
+    mat.metallic = updated.metallic;
+    mat.roughness = updated.roughness;
+    mat.emissive = updated.emissive;
+    // Preserve all texture objects, alpha settings, and extension properties
+    // that were loaded from the model file.
+    return true;
+}
+
 void MaterialManager::clear() {
     // Release texture references
     if (m_textureManager) {

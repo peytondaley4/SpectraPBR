@@ -30,6 +30,11 @@ public:
     // Get GpuMaterial for a handle
     const GpuMaterial* get(MaterialHandle handle) const;
 
+    // Update material properties at runtime (preserves texture handles)
+    // Only updates scalar properties (baseColor, metallic, roughness, emissive, etc.)
+    // Caller must rebuild SBT after this call for changes to reach the GPU.
+    bool updateMaterial(MaterialHandle handle, const GpuMaterial& updated);
+
     // Get all GPU materials (for SBT)
     const std::vector<GpuMaterial>& getAllMaterials() const { return m_materials; }
 

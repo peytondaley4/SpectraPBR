@@ -602,6 +602,26 @@ void Application::wireUICallbacks() {
         resetPathGuideTraining();
     });
 
+    m_uiManager->setOnMaterialEdit([this](uint32_t instanceId, const GpuMaterial& material) {
+        // Find which material this instance uses
+        MaterialHandle matHandle = m_sceneManager->getMaterialHandle(instanceId);
+        if (matHandle == INVALID_MATERIAL_HANDLE) return;
+
+        // Update the material's scalar properties (preserves texture handles)
+        m_materialManager->updateMaterial(matHandle, material);
+
+        // Synchronize render stream before SBT rebuild — updateSBT frees and
+        // reallocates GPU memory, which is unsafe while optixLaunch is in flight.
+        m_cudaInterop->synchronize();
+
+        // Rebuild SBT so the GPU sees the new material values
+        m_sceneManager->updateSBT();
+
+        // Reset accumulation so the new material is immediately visible
+        m_optixEngine->resetAccumulation();
+        resetPathGuideTraining();
+    });
+
     m_uiManager->setLightInfoRequestCallback([this](SceneNodeType type, uint32_t index) -> ui::LightInfo {
         switch (type) {
             case SceneNodeType::DirectionalLight:
@@ -674,6 +694,10 @@ void Application::setupCallbacks() {
     });
 
     m_glContext->setResizeCallback([this](uint32_t width, uint32_t height) {
+        // Skip resize if window is minimized (0x0) — no valid buffers to create,
+        // and division by zero would occur in aspect ratio / pixel_world_size.
+        if (width == 0 || height == 0) return;
+
         glFinish();
 
         m_cudaInterop->registerPBOs(
@@ -682,7 +706,7 @@ void Application::setupCallbacks() {
         m_cudaInterop->registerUIPBO(m_glContext->getUIPBO(), m_glContext->getBufferSize());
 
         if (m_accumulationBuffer) cudaFree(m_accumulationBuffer);
-        size_t bufferSize = width * height * sizeof(float4);
+        size_t bufferSize = static_cast<size_t>(width) * height * sizeof(float4);
         cudaMalloc(reinterpret_cast<void**>(&m_accumulationBuffer), bufferSize);
         cudaMemset(m_accumulationBuffer, 0, bufferSize);
         m_optixEngine->setAccumulationBuffer(m_accumulationBuffer);

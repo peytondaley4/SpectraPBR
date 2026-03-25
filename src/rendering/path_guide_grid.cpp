@@ -368,29 +368,45 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
                     dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = 1.0f;
                     cellsWithData++;
 
-                    // Two-lobe fitting: if interval sums point in a significantly
-                    // different direction from cumulative, fit a second lobe.
-                    // This captures bimodal distributions where indirect light
-                    // arrives from multiple paths (e.g., two windows in a room).
+                    // Two-lobe detection: kappa-aware bimodality test.
+                    //
+                    // If the cumulative kappa is low (wide distribution), the data
+                    // may be bimodal — e.g., indirect light from two windows. We
+                    // test whether the interval mean direction diverges enough from
+                    // the cumulative mean to warrant a second lobe.
+                    //
+                    // Threshold: angular divergence must exceed the cumulative lobe's
+                    // effective width (~1/sqrt(kappa) radians). A low-kappa (wide)
+                    // lobe requires more divergence to be meaningfully bimodal; a
+                    // high-kappa (tight) lobe splits more readily.
+                    //
+                    // Note: online aggregate sums are sufficient statistics for a
+                    // SINGLE vMF, but not for a mixture. For proper two-lobe EM,
+                    // per-sample data is needed (see vmf_fitting::fitTwoLobes).
+                    // This heuristic is the best we can do with aggregate sums.
                     float iLen = std::sqrt(iSumX*iSumX + iSumY*iSumY + iSumZ*iSumZ);
-                    if (iSumW >= 2.0f && iLen > 1e-6f) {
+                    if (iSumW >= 2.0f && iLen > 1e-6f && kappa0 > 0.5f) {
                         float iNx = iSumX / iLen, iNy = iSumY / iLen, iNz = iSumZ / iLen;
-                        // Cumulative mean direction
                         float cumLen = std::sqrt(cumSumX*cumSumX + cumSumY*cumSumY + cumSumZ*cumSumZ);
                         if (cumLen > 1e-6f) {
                             float cNx = cumSumX / cumLen, cNy = cumSumY / cumLen, cNz = cumSumZ / cumLen;
                             float cosAngle = iNx*cNx + iNy*cNy + iNz*cNz;
-                            // If interval direction diverges >45° from cumulative, fit lobe 1
-                            if (cosAngle < 0.707f) {
+                            // Kappa-dependent threshold: the cumulative lobe has
+                            // effective half-angle ~1/sqrt(kappa). We require the
+                            // interval direction to be at least 2x that width away.
+                            // cos(2/sqrt(k)) approximated via Taylor for large k.
+                            float effectiveWidth = 2.0f / std::sqrt(kappa0);
+                            float cosThreshold = std::cos(std::min(effectiveWidth, 1.5f));
+                            if (cosAngle < cosThreshold) {
                                 float theta1, phi1, kappa1;
                                 if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
                                     dataHost[base + 3] = theta1;
                                     dataHost[base + 4] = phi1;
                                     dataHost[base + 5] = kappa1;
-                                    // Mixture weight: ratio of cumulative to total,
-                                    // scaled by effective sample count
+                                    // Mixture weight from relative sample counts,
+                                    // scaled so interval matches cumulative timescale
                                     float effCum = cumSumW;
-                                    float effInt = iSumW / (1.0f - EMA_DECAY);  // Scale interval to match cumulative timescale
+                                    float effInt = iSumW / (1.0f - EMA_DECAY);
                                     float pi0 = effCum / (effCum + effInt);
                                     pi0 = std::max(0.1f, std::min(0.9f, pi0));
                                     dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = pi0;
@@ -905,19 +921,26 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
             diagCellsWithData++;
         }
 
-        // Subdivision: need sufficient samples and high directional variance
+        // Subdivision: need sufficient samples and high directional variance.
+        // We check BOTH the lifetime cumulative sums AND the fitted lobe's kappa.
+        // The kappa from the last build reflects recent data (EMA-weighted) and
+        // reacts faster to distribution changes than the raw cumulative sums.
         if (cellLevel < maxLevel && sumW >= subdivideThreshold) {
-            // Compute mean direction
+            // Variance from cumulative direction sums: 1 - R̄
             float meanX = sumX / sumW;
             float meanY = sumY / sumW;
             float meanZ = sumZ / sumW;
             float meanLen = sqrtf(meanX * meanX + meanY * meanY + meanZ * meanZ);
-
-            // Directional variance: 1 - R̄ (where R̄ is mean resultant length)
-            // Low R̄ = high variance (directions spread out), High R̄ = low variance (directions clustered)
             float variance = fmaxf(0.0f, 1.0f - meanLen);
 
-            if (variance > varianceThreshold) {
+            // Also check fitted lobe kappa: low kappa = wide distribution = high variance.
+            // kappa < ~5 corresponds to a very broad lobe (>~50° half-width).
+            const float* vMF = dataHost.data() + g * m_entryStride;
+            float kappa0 = vMF[2];
+            bool lobeIsWide = (kappa0 > 0.0f && kappa0 < 5.0f);
+
+            // Subdivide if either metric indicates high variance
+            if (variance > varianceThreshold || (lobeIsWide && sumW >= subdivideThreshold * 2.0f)) {
                 // Subdivide: create 8 children at next finer level
                 uint64_t parentMorton = m_mortonCodesHost[g];
                 uint32_t parentIx, parentIy, parentIz;

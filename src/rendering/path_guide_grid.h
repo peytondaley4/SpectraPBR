@@ -3,26 +3,51 @@
 //------------------------------------------------------------------------------
 // Sparse Multi-Resolution Path Guide Grid (collision-free, GPU-friendly)
 //
-// Per-level sorted arrays of (Morton code, data). Only occupied cells exist;
-// lookup is binary search by Morton code. No hash, no collisions.
+// === Architecture ===
+//
+// Spatial: sparse voxel grid with Morton-coded cells and O(1) hash lookup.
+// Directional: 2-lobe von Mises–Fisher (vMF) mixture per cell.
+// Training: online via GPU atomicAdd of importance-weighted (Li/p) deposits.
+// Fitting: CPU-side single-lobe fitFromSums + kappa-aware bimodal detection.
+// Refinement: adaptive subdivision (high variance) / coarsening (unused cells).
+//
+// === Training Pipeline ===
+//
+// GPU (per frame):
+//   1. Closest-hit (primary + bounce) atomically accumulates (dir*weight, weight)
+//      into cell interval stats [6-9] via pathGuideTrainCell().
+//   2. New-cell seeding appends (level, ix, iy, iz) to staging buffer.
+//
+// CPU (periodic, async):
+//   1. Read back staging + cell data from GPU
+//   2. Merge new cells from staging into sparse grid (cumulative)
+//   3. EMA-decay lifetime sums, add interval sums → fit vMF lobes
+//   4. Zero interval stats, upload fitted lobes + hash table to GPU
+//   5. Adaptive refinement: subdivide high-variance, coarsen stale cells
+//
+// === Two-lobe Limitation ===
+//
+// Online aggregate sums (sumX/Y/Z/W) are sufficient statistics for a SINGLE
+// vMF lobe, but NOT for a mixture. Proper EM mixture fitting (see
+// vmf_fitting::fitTwoLobes) requires per-sample data, which is not available
+// in the online setting. The current heuristic uses kappa-aware divergence
+// between interval and cumulative mean directions to detect bimodality.
+//
 // References:
 //   - Müller et al., "Practical Path Guiding for Efficient Light-Transport
-//     Simulation", EGSR 2017 (Computer Graphics Forum). SD-tree / directional
-//     guiding; we use a sparse voxel grid + vMF mixture per cell.
+//     Simulation", EGSR 2017 (Computer Graphics Forum).
 //   - Yalçıner & Akyüz, "Path Guiding for Wavefront Path Tracing with Sparse
 //     Voxel Octree", arXiv 2405.06997.
-//   - von Mises–Fisher (vMF) distribution: C3(κ) exp(κ μ·ω); sampling via
-//     Wood/Ulrich (w = 1 + ln(ξ+(1-ξ)e^{-2κ})/κ, then orthonormal tangent + circle).
+//   - Heitz, "Sampling the GGX Distribution of Visible Normals", JCGT 2018.
+//   - von Mises–Fisher (vMF): C3(κ) exp(κ μ·ω); Wood/Ulrich sampling.
 //
-// Layout:
-//   - level_offsets[0 .. num_levels]: level l's cells at indices [level_offsets[l], level_offsets[l+1])
-//   - morton_codes[]: sorted by Morton within each level (device)
-//   - data[]: 6 floats per cell (2 vMF lobes × 3), same order (device)
+// === Cell Data Layout (12 floats) ===
 //
-// Occupancy is collected via a staging buffer: closest-hit appends (level, ix, iy, iz).
-// Build (CPU): read back staging, sort/unique by (level, Morton), upload sparse arrays.
-//
-// PDF: each cell stores 2 vMF lobes (theta, phi, kappa) × 3 floats = 6 floats.
+//   [0-2]: lobe 0 (theta, phi, kappa)   — primary fitted lobe
+//   [3-5]: lobe 1 (theta, phi, kappa)   — secondary (kappa=0 if inactive)
+//   [6-9]: interval stats (sumX, sumY, sumZ, sumW)  — zeroed after each build
+//   [10]:  pi_0 (mixture weight for lobe 0, 1.0 if single-lobe)
+//   [11]:  lastHitFrame (for coarsening decisions)
 //------------------------------------------------------------------------------
 
 #include <cstdint>

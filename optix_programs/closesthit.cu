@@ -222,10 +222,32 @@ __forceinline__ __device__ float3 computeStandardDirectLighting(
 // Path-Guided Indirect Lighting with One-Sample MIS
 // Reference: Müller et al., "Practical Path Guiding", EGSR 2017
 //
-// Implements proper one-sample MIS:
+// === Design Philosophy ===
+//
+// Guiding distribution: We learn the incident radiance field Li(x, ω), NOT the
+// full rendering integrand Li * f * cosθ ("product guiding"). Li-only guiding
+// is correct for all BSDF types and naturally extends to additional sampling
+// dimensions (wavelength, lens position) since the BSDF's spectral/spatial
+// variation is handled separately via MIS. For rough/diffuse surfaces the BSDF
+// is broad and Li-only is near-optimal; for glossy surfaces the VNDF BSDF
+// sampling leg compensates via MIS.
+//
+// Training signal: Each hit deposits (direction, Li/p(ω)) — importance-weighted
+// incident luminance. The 1/p(ω) factor makes deposits unbiased regardless of
+// which sampling strategy produced the direction, preventing self-reinforcing
+// feedback loops (Müller 2017 §4.2). Both primary and bounce hits train.
+//
+// Below-hemisphere: vMF covers the full sphere; directions with NdotL ≤ 0 are
+// rejected (zero contribution). This is inherent to sphere-domain guiding and
+// is correctly handled by the MIS weight (combinedPdf accounts for the guide's
+// full-sphere PDF). The VNDF BSDF leg never wastes samples below the horizon,
+// making it a natural complement.
+//
+// One-sample MIS (balance heuristic):
 // 1. With probability alpha, sample from path guide (vMF)
-// 2. With probability (1-alpha), sample from BSDF (GGX)
-// 3. Weight using balance heuristic: w = p_chosen / (alpha*p_guide + (1-alpha)*p_bsdf)
+// 2. With probability (1-alpha), sample from BSDF (VNDF)
+// 3. Combined PDF = alpha*p_guide + (1-alpha)*p_bsdf
+// 4. Estimator: f(L) * Li(L) * NdotL / combinedPdf
 //------------------------------------------------------------------------------
 
 // Debug stat indices
@@ -243,42 +265,47 @@ __forceinline__ __device__ void incrementGuideStat(unsigned int statIdx) {
     }
 }
 
-// Compute BRDF PDF for GGX importance sampling
-__forceinline__ __device__ float computeGGXPdf(
+// VNDF PDF for reflected direction L.
+// Uses Heitz 2018 visible normal distribution: p(L) = D(H) * G1(V) / (4 * NdotV).
+// This matches sampleBSDFDirection below — sampler and PDF must always agree.
+__forceinline__ __device__ float computeBSDFPdf(
     const float3& V, const float3& L, const float3& N, float roughness)
 {
     float3 H = normalize(V + L);
-    float NdotH = fmaxf(dot(N, H), 0.001f);
-    float VdotH = fmaxf(dot(V, H), 0.001f);
+    float NdotH = fmaxf(dot(N, H), 0.0f);
+    float NdotV = fmaxf(dot(N, V), BRDF_EPSILON);
+
     float alpha = roughness * roughness;
-    float alpha2 = alpha * alpha;
-    float denom = NdotH * NdotH * (alpha2 - 1.0f) + 1.0f;
-    float D = alpha2 / (3.14159265f * denom * denom);
-    return D * NdotH / (4.0f * VdotH);
+    alpha = fmaxf(alpha, 0.001f);
+
+    float D = D_GGX(NdotH, alpha);
+    float G1 = G1_GGX(NdotV, alpha);
+
+    return pdfGGXVNDF(D, G1, NdotV);
 }
 
-// Sample direction from GGX distribution (VNDF sampling)
-__forceinline__ __device__ float3 sampleGGXDirection(
+// Sample direction from GGX VNDF (Heitz 2018).
+// Samples only visible microfacet normals → no below-hemisphere waste from BSDF leg,
+// lower variance for glossy materials, and naturally complements vMF guiding in MIS.
+__forceinline__ __device__ float3 sampleBSDFDirection(
     const float3& V, const float3& N, float roughness,
     float u1, float u2)
 {
+    float alpha = roughness * roughness;
+    alpha = fmaxf(alpha, 0.001f);
+
     // Build tangent frame
     float3 up = (fabsf(N.y) < 0.999f) ? make_float3(0.0f, 1.0f, 0.0f) : make_float3(1.0f, 0.0f, 0.0f);
     float3 T = normalize(cross(up, N));
     float3 B = cross(N, T);
 
-    // GGX importance sampling (simplified, samples microfacet normal)
-    float alpha = roughness * roughness;
-    float phi = 2.0f * 3.14159265f * u1;
-    float cosTheta = sqrtf((1.0f - u2) / (1.0f + (alpha * alpha - 1.0f) * u2));
-    float sinTheta = sqrtf(1.0f - cosTheta * cosTheta);
+    // Transform V to tangent space for VNDF sampling
+    float3 Ve = make_float3(dot(V, T), dot(V, B), dot(V, N));
 
-    // Microfacet normal in tangent space
-    float sinPhi, cosPhi;
-    sincosf(phi, &sinPhi, &cosPhi);
-    float3 H_local = make_float3(sinTheta * cosPhi, sinTheta * sinPhi, cosTheta);
+    // Sample visible microfacet normal in tangent space
+    float3 H_local = sampleGGXVNDF(Ve, alpha, u1, u2);
 
-    // Transform to world space
+    // Transform H back to world space
     float3 H = T * H_local.x + B * H_local.y + N * H_local.z;
 
     // Reflect V around H to get L
@@ -353,11 +380,11 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
     if (!hasValidGuide) {
         float u1 = randomFloat(seed);
         float u2 = randomFloat(seed);
-        float3 L = sampleGGXDirection(V, shadingNormal, roughness, u1, u2);
+        float3 L = sampleBSDFDirection(V, shadingNormal, roughness, u1, u2);
         float NdotL = dot(shadingNormal, L);
         if (NdotL <= 0.0f) return make_float3(0.0f, 0.0f, 0.0f);
 
-        float brdfPdf = computeGGXPdf(V, L, shadingNormal, roughness);
+        float brdfPdf = computeBSDFPdf(V, L, shadingNormal, roughness);
         if (brdfPdf <= 1e-8f) return make_float3(0.0f, 0.0f, 0.0f);
 
         const float rayEps = 0.001f;
@@ -422,7 +449,7 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
 
         L = make_float3(guideX, guideY, guideZ);
         guidePdf = trilinearGuidePdf(grid, trilinear, guideX, guideY, guideZ);
-        brdfPdf = computeGGXPdf(V, L, shadingNormal, roughness);
+        brdfPdf = computeBSDFPdf(V, L, shadingNormal, roughness);
 
     } else {
         // Sample from BSDF (GGX distribution)
@@ -430,8 +457,8 @@ __forceinline__ __device__ float3 computeGuidedIndirectLighting(
         float u1 = randomFloat(seed);
         float u2 = randomFloat(seed);
 
-        L = sampleGGXDirection(V, shadingNormal, roughness, u1, u2);
-        brdfPdf = computeGGXPdf(V, L, shadingNormal, roughness);
+        L = sampleBSDFDirection(V, shadingNormal, roughness, u1, u2);
+        brdfPdf = computeBSDFPdf(V, L, shadingNormal, roughness);
         guidePdf = trilinearGuidePdf(grid, trilinear, L.x, L.y, L.z);
     }
 
@@ -989,15 +1016,34 @@ extern "C" __global__ void __closesthit__radiance_bounce() {
         // depth exceeded → fall through to opaque shading
     }
 
-    // Direct lighting only (no indirect bounce, no path guiding)
+    // Direct lighting only (no indirect bounce from here — avoids recursion)
+    float3 lightDir = make_float3(0.0f, 0.0f, 0.0f);
+    float contribLuminance = 0.0f;
     float3 Lo = computeStandardDirectLighting(
         hitPos, geomNormal, shadingNormal, V,
         baseColorRGB, metallic, roughness,
         material.clearcoat, material.clearcoatRoughness,
-        material.sheenColor, material.sheenRoughness, seed);
+        material.sheenColor, material.sheenRoughness, seed,
+        &lightDir, &contribLuminance);
 
     Lo = Lo + emissive;
     Lo = clamp(Lo, 0.0f, 1000.0f);
+
+    // Train path guide at bounce hits too — multi-bounce light transport paths
+    // contribute to the guiding distribution, improving convergence for complex
+    // indirect lighting (Müller 2017: every path vertex should train the guide).
+    if (params.path_guide_num_levels > 0 && contribLuminance > 1e-6f) {
+        SparsePathGuideDescriptorDevice grid = buildGridDescriptor();
+        // Incoming ray direction = outgoing light direction for training
+        float3 inRay = -normalize(rayDir);
+        float blen = length(inRay);
+        if (blen > 1e-6f) {
+            pathGuideTrainAtomic(grid, hitPos.x, hitPos.y, hitPos.z,
+                inRay.x, inRay.y, inRay.z, contribLuminance,
+                params.frame_index,
+                params.path_guide_min_level, params.path_guide_max_level);
+        }
+    }
 
     setPayloadColor(Lo);
     setPayloadHitDistance(optixGetRayTmax());

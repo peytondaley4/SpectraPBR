@@ -229,9 +229,11 @@ __forceinline__ __device__ float3 sampleGGXVNDF(
     return normalize(make_float3(alpha * Nh.x, alpha * Nh.y, fmaxf(0.0f, Nh.z)));
 }
 
-// PDF for VNDF sampling
+// PDF for VNDF sampling of reflected direction L.
+// Derivation: p(L) = D_v(H) / (4*VdotH) = G1*VdotH*D / (NdotV*4*VdotH) = G1*D / (4*NdotV)
+// Reference: Heitz, "Sampling the GGX Distribution of Visible Normals", JCGT 2018.
 __forceinline__ __device__ float pdfGGXVNDF(float D, float G1, float NdotV) {
-    return D * G1 * NdotV / (4.0f * NdotV + BRDF_EPSILON);
+    return D * G1 / (4.0f * NdotV + BRDF_EPSILON);
 }
 
 //------------------------------------------------------------------------------

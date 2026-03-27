@@ -56,20 +56,29 @@
 
 namespace spectra {
 
-constexpr uint32_t PATH_GUIDE_VMF_FLOATS_PER_LOBE = 3;
-constexpr uint32_t PATH_GUIDE_LOBES_PER_SLOT = 2;
-constexpr uint32_t PATH_GUIDE_VMF_FLOATS = PATH_GUIDE_VMF_FLOATS_PER_LOBE * PATH_GUIDE_LOBES_PER_SLOT;  // 6 floats
+// ─── Named cell data offsets (must match path_guide_grid_device.h exactly) ──
+constexpr uint32_t PG_FLOATS_PER_LOBE   = 3;
+constexpr uint32_t PG_NUM_LOBES         = 2;
+constexpr uint32_t PG_LOBE0_THETA       = 0;
+constexpr uint32_t PG_LOBE0_PHI         = 1;
+constexpr uint32_t PG_LOBE0_KAPPA       = 2;
+constexpr uint32_t PG_LOBE1_THETA       = 3;
+constexpr uint32_t PG_LOBE1_PHI         = 4;
+constexpr uint32_t PG_LOBE1_KAPPA       = 5;
+constexpr uint32_t PG_STAT_SUM_X        = 6;
+constexpr uint32_t PG_STAT_SUM_Y        = 7;
+constexpr uint32_t PG_STAT_SUM_Z        = 8;
+constexpr uint32_t PG_STAT_SUM_W        = 9;
+constexpr uint32_t PG_MIX_WEIGHT        = 10;
+constexpr uint32_t PG_LAST_HIT_FRAME    = 11;
+constexpr uint32_t PG_ENTRY_STRIDE      = 12;
 
-// Per-cell statistics for adaptive refinement
-// Layout: [sumX, sumY, sumZ, sumW, pi_0 (mixture weight), lastHitFrame] = 6 floats
-constexpr uint32_t PATH_GUIDE_STATS_FLOATS = 6;
-
-// Offset within cell data for the mixture weight pi_0 (lobe 0 weight)
-constexpr uint32_t PATH_GUIDE_MIX_WEIGHT_OFFSET = 10;
-
-// Total entry stride: vMF lobes (6) + refinement stats (6) = 12 floats per cell
-constexpr uint32_t PATH_GUIDE_ENTRY_STRIDE_DEFAULT =
-    PATH_GUIDE_VMF_FLOATS + PATH_GUIDE_STATS_FLOATS;  // 12 floats per cell
+// Legacy aliases for existing code
+constexpr uint32_t PATH_GUIDE_VMF_FLOATS_PER_LOBE = PG_FLOATS_PER_LOBE;
+constexpr uint32_t PATH_GUIDE_LOBES_PER_SLOT = PG_NUM_LOBES;
+constexpr uint32_t PATH_GUIDE_VMF_FLOATS = PG_NUM_LOBES * PG_FLOATS_PER_LOBE;
+constexpr uint32_t PATH_GUIDE_MIX_WEIGHT_OFFSET = PG_MIX_WEIGHT;
+constexpr uint32_t PATH_GUIDE_ENTRY_STRIDE_DEFAULT = PG_ENTRY_STRIDE;
 
 //------------------------------------------------------------------------------
 // Configuration

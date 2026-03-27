@@ -15,12 +15,53 @@
 #include <cuda_runtime.h>
 #include "vmf_device.h"
 
-#define PATH_GUIDE_VMF_FLOATS_PER_LOBE 3
-#define PATH_GUIDE_LOBES_PER_SLOT      2
-#define PATH_GUIDE_VMF_FLOATS          6   // 2 lobes * 3 floats
-#define PATH_GUIDE_STATS_FLOATS        6   // sumX, sumY, sumZ, sumW, pi_0 (mixture weight), lastHitFrame
-#define PATH_GUIDE_ENTRY_STRIDE        12  // vMF (6) + stats (6)
-#define PATH_GUIDE_MIX_WEIGHT_OFFSET   10  // offset of pi_0 within cell data
+// ─── Cell data layout (named offsets) ───────────────────────────────────────
+// Every field access uses a named constant — no magic numbers.
+//
+//  [0-2]:  lobe 0 (theta, phi, kappa)
+//  [3-5]:  lobe 1 (theta, phi, kappa)     kappa ≤ 0 → lobe inactive
+//  [6]:    mixture weight pi_0 (lobe 0 weight; 1-pi_0 = lobe 1 weight)
+//  [7-10]: interval stats (sumX, sumY, sumZ, sumW)  — zeroed after each build
+//  [11]:   lastHitFrame
+//
+//  Total: 12 floats per cell (unchanged from previous layout)
+//  Ready for 4-lobe extension: would expand lobes [0-11], weights [12-15],
+//  stats [16-19], meta [20-21] = 22 floats.
+// ────────────────────────────────────────────────────────────────────────────
+
+// Per-lobe field count
+#define PG_FLOATS_PER_LOBE   3
+
+// Lobe 0: theta, phi, kappa
+#define PG_LOBE0_THETA       0
+#define PG_LOBE0_PHI         1
+#define PG_LOBE0_KAPPA       2
+
+// Lobe 1: theta, phi, kappa
+#define PG_LOBE1_THETA       3
+#define PG_LOBE1_PHI         4
+#define PG_LOBE1_KAPPA       5
+
+// Interval statistics (accumulated via atomicAdd on GPU, consumed by CPU build)
+#define PG_STAT_SUM_X        6
+#define PG_STAT_SUM_Y        7
+#define PG_STAT_SUM_Z        8
+#define PG_STAT_SUM_W        9
+
+// Mixture weight and metadata
+#define PG_MIX_WEIGHT        10
+#define PG_LAST_HIT_FRAME    11
+
+// Aggregate constants
+#define PG_NUM_LOBES               2
+#define PG_VMF_FLOATS              6    // PG_NUM_LOBES * PG_FLOATS_PER_LOBE
+#define PG_ENTRY_STRIDE            12
+// Legacy aliases for compatibility with CPU-side constants
+#define PATH_GUIDE_VMF_FLOATS_PER_LOBE  PG_FLOATS_PER_LOBE
+#define PATH_GUIDE_LOBES_PER_SLOT       PG_NUM_LOBES
+#define PATH_GUIDE_VMF_FLOATS           PG_VMF_FLOATS
+#define PATH_GUIDE_ENTRY_STRIDE         PG_ENTRY_STRIDE
+#define PATH_GUIDE_MIX_WEIGHT_OFFSET    PG_MIX_WEIGHT
 
 // Sparse grid: lightweight descriptor with pointers into __constant__ params.
 // Does NOT copy level_resolutions[16] — reads directly from params to avoid
@@ -263,14 +304,14 @@ __forceinline__ __device__ void pathGuideTrainCell(
         !isfinite(dx) || !isfinite(dy) || !isfinite(dz))
         return;
 
-    atomicAdd(&cell[6], dx * weight);
-    atomicAdd(&cell[7], dy * weight);
-    atomicAdd(&cell[8], dz * weight);
-    atomicAdd(&cell[9], weight);
+    atomicAdd(&cell[PG_STAT_SUM_X], dx * weight);
+    atomicAdd(&cell[PG_STAT_SUM_Y], dy * weight);
+    atomicAdd(&cell[PG_STAT_SUM_Z], dz * weight);
+    atomicAdd(&cell[PG_STAT_SUM_W], weight);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);
-    atomicMax((int*)&cell[11], frameAsInt);
+    atomicMax((int*)&cell[PG_LAST_HIT_FRAME], frameAsInt);
 }
 
 // Atomic training: accumulate direction*weight into cell stats directly on GPU.
@@ -306,32 +347,32 @@ __forceinline__ __device__ bool pathGuideSampleDirection(
 {
     float* cell = sparseCellDataPtr(grid, global_index);
     if (cell == nullptr) return false;
-    float k0 = cell[2], k1 = cell[5];
+    float k0 = cell[PG_LOBE0_KAPPA], k1 = cell[PG_LOBE1_KAPPA];
     bool use0 = (k0 > 1e-6f);
     bool use1 = (k1 > 1e-6f);
     if (!use0 && !use1) return false;
 
     if (use0 && !use1) {
         float mx, my, mz;
-        vmfSphericalToCartesian(cell[0], cell[1], mx, my, mz);
+        vmfSphericalToCartesian(cell[PG_LOBE0_THETA], cell[PG_LOBE0_PHI], mx, my, mz);
         vmfSample(mx, my, mz, k0, u1, u2, ox, oy, oz);
         return true;
     }
     if (!use0 && use1) {
         float mx, my, mz;
-        vmfSphericalToCartesian(cell[3], cell[4], mx, my, mz);
+        vmfSphericalToCartesian(cell[PG_LOBE1_THETA], cell[PG_LOBE1_PHI], mx, my, mz);
         vmfSample(mx, my, mz, k1, u1, u2, ox, oy, oz);
         return true;
     }
-    float pi0 = cell[PATH_GUIDE_MIX_WEIGHT_OFFSET];
+    float pi0 = cell[PG_MIX_WEIGHT];
     if (pi0 <= 0.0f || pi0 >= 1.0f) pi0 = 0.5f;  // safety fallback
     if (u_lobe < pi0) {
         float mx, my, mz;
-        vmfSphericalToCartesian(cell[0], cell[1], mx, my, mz);
+        vmfSphericalToCartesian(cell[PG_LOBE0_THETA], cell[PG_LOBE0_PHI], mx, my, mz);
         vmfSample(mx, my, mz, k0, u1, u2, ox, oy, oz);
     } else {
         float mx, my, mz;
-        vmfSphericalToCartesian(cell[3], cell[4], mx, my, mz);
+        vmfSphericalToCartesian(cell[PG_LOBE1_THETA], cell[PG_LOBE1_PHI], mx, my, mz);
         vmfSample(mx, my, mz, k1, u1, u2, ox, oy, oz);
     }
     return true;
@@ -347,7 +388,7 @@ __forceinline__ __device__ float pathGuidePdfDirection(
 {
     float* cell = sparseCellDataPtr(grid, global_index);
     if (cell == nullptr) return 0.07957747154f;  // 1/(4π) uniform
-    float k0 = cell[2], k1 = cell[5];
+    float k0 = cell[PG_LOBE0_KAPPA], k1 = cell[PG_LOBE1_KAPPA];
     bool use0 = (k0 > 1e-6f);
     bool use1 = (k1 > 1e-6f);
     if (!use0 && !use1) return 0.07957747154f;
@@ -355,19 +396,19 @@ __forceinline__ __device__ float pathGuidePdfDirection(
     float p0 = 0.0f, p1 = 0.0f;
     if (use0) {
         float mx, my, mz;
-        vmfSphericalToCartesian(cell[0], cell[1], mx, my, mz);
+        vmfSphericalToCartesian(cell[PG_LOBE0_THETA], cell[PG_LOBE0_PHI], mx, my, mz);
         p0 = vmfPdf(k0, mx*ox + my*oy + mz*oz);
     }
     if (use1) {
         float mx, my, mz;
-        vmfSphericalToCartesian(cell[3], cell[4], mx, my, mz);
+        vmfSphericalToCartesian(cell[PG_LOBE1_THETA], cell[PG_LOBE1_PHI], mx, my, mz);
         p1 = vmfPdf(k1, mx*ox + my*oy + mz*oz);
     }
 
     // Match sampling: both active → use fitted mixture weight; one active → weight 1.0
     float p;
     if (use0 && use1) {
-        float pi0 = cell[PATH_GUIDE_MIX_WEIGHT_OFFSET];
+        float pi0 = cell[PG_MIX_WEIGHT];
         if (pi0 <= 0.0f || pi0 >= 1.0f) pi0 = 0.5f;  // safety fallback
         p = pi0 * p0 + (1.0f - pi0) * p1;
     } else if (use0) {
@@ -473,7 +514,7 @@ __forceinline__ __device__ TrilinearInfo filterTrilinearByValidLobes(
         filtered.weight[i] = 0.0f;
         if (all.cellIdx[i] != 0xFFFFFFFFu) {
             float* cell = sparseCellDataPtr(grid, all.cellIdx[i]);
-            if (cell != nullptr && (cell[2] > 1e-6f || cell[5] > 1e-6f)) {
+            if (cell != nullptr && (cell[PG_LOBE0_KAPPA] > 1e-6f || cell[PG_LOBE1_KAPPA] > 1e-6f)) {
                 filtered.cellIdx[i] = all.cellIdx[i];
                 filtered.weight[i] = all.weight[i];
                 filtered.weightSum += all.weight[i];

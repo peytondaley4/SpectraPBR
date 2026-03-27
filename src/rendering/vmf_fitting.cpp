@@ -132,5 +132,67 @@ bool fitTwoLobes(
     return true;
 }
 
+float logLikelihoodSingleLobe(float sumX, float sumY, float sumZ, float sumW)
+{
+    if (sumW < 1e-9f) return 0.0f;
+    float R = std::sqrt(sumX*sumX + sumY*sumY + sumZ*sumZ);
+    float Rbar = R / sumW;
+    Rbar = std::min(Rbar, 0.9999f);
+
+    // Estimate kappa from R_bar (Sra 2012)
+    float denom = std::max(1.0f - Rbar*Rbar, 0.01f);
+    float kappa = (Rbar * (3.0f - Rbar*Rbar)) / denom;
+    kappa = std::min(kappa, 300.0f);
+
+    // C3(kappa) = kappa / (4*pi*sinh(kappa))
+    // log(C3) = log(kappa) - log(4*pi) - log(sinh(kappa))
+    // For numerical stability: log(sinh(kappa)) = kappa + log(1 - exp(-2*kappa)) - log(2)
+    // For large kappa: log(sinh(kappa)) ≈ kappa - log(2)
+    float logC3;
+    if (kappa > 20.0f) {
+        logC3 = std::log(kappa) - std::log(4.0f * PI) - kappa + std::log(2.0f);
+    } else if (kappa > 1e-6f) {
+        logC3 = std::log(kappa) - std::log(4.0f * PI) - std::log(std::sinh(kappa));
+    } else {
+        logC3 = std::log(INV_4PI);  // uniform: C3 → 1/(4π)
+    }
+
+    // LL = N * log(C3(kappa)) + kappa * R
+    return sumW * logC3 + kappa * R;
+}
+
+float computeBIC(float logLikelihood, uint32_t numParams, float effectiveSampleCount)
+{
+    if (effectiveSampleCount < 1.0f) return 1e30f;
+    return -2.0f * logLikelihood + static_cast<float>(numParams) * std::log(effectiveSampleCount);
+}
+
+bool shouldSplitLobe(
+    float cumSumX, float cumSumY, float cumSumZ, float cumSumW,
+    float intSumX, float intSumY, float intSumZ, float intSumW)
+{
+    // Total data under single lobe
+    float totalSumX = cumSumX + intSumX;
+    float totalSumY = cumSumY + intSumY;
+    float totalSumZ = cumSumZ + intSumZ;
+    float totalSumW = cumSumW + intSumW;
+
+    if (totalSumW < 2.0f || intSumW < 1.0f) return false;
+
+    // BIC for 1 lobe (3 params: theta, phi, kappa)
+    float LL_1 = logLikelihoodSingleLobe(totalSumX, totalSumY, totalSumZ, totalSumW);
+    float BIC_1 = computeBIC(LL_1, 3, totalSumW);
+
+    // BIC for 2 lobes (7 params: 2*(theta, phi, kappa) + 1 mixture weight)
+    // Approximate: each lobe fits its own subset of data
+    float LL_lobe0 = logLikelihoodSingleLobe(cumSumX, cumSumY, cumSumZ, cumSumW);
+    float LL_lobe1 = logLikelihoodSingleLobe(intSumX, intSumY, intSumZ, intSumW);
+    float LL_2 = LL_lobe0 + LL_lobe1;
+    float BIC_2 = computeBIC(LL_2, 7, totalSumW);
+
+    // 2 lobes justified when BIC improves (lower is better)
+    return BIC_2 < BIC_1;
+}
+
 } // namespace vmf_fitting
 } // namespace spectra

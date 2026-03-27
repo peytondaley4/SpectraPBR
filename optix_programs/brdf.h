@@ -256,7 +256,33 @@ __forceinline__ __device__ float pdfCosineHemisphere(float cosTheta) {
 // Full BRDF Evaluation
 //------------------------------------------------------------------------------
 
-// Evaluate standard GGX BRDF (metallic-roughness workflow)
+//------------------------------------------------------------------------------
+// F0 → Conductor IOR Derivation
+//
+// The metallic-roughness PBR workflow provides F0 (normal-incidence reflectance)
+// but not the complex IOR (n, k) needed for exact conductor Fresnel. We derive
+// approximate (n, k) from F0 with n=1 and solve for k from the normal-incidence
+// constraint: F0 = k² / (4 + k²), giving k = 2√(F0 / (1-F0)).
+//
+// This exactly reproduces F0 at normal incidence and gives a physically plausible
+// conductor S-curve at grazing angles. For exact metals, the spectral rendering
+// extension (Phase 4) will use measured per-wavelength (n, k) tables.
+//------------------------------------------------------------------------------
+__forceinline__ __device__ void F0ToConductorIOR(const float3& F0, float3& eta, float3& k) {
+    // With n=1: F0 = k²/(4+k²), so k² = 4·F0/(1-F0)
+    float3 r = clamp(F0, 0.02f, 0.99f);
+    eta = make_float3(1.0f, 1.0f, 1.0f);
+    k = make_float3(
+        2.0f * sqrtf(r.x / (1.0f - r.x)),
+        2.0f * sqrtf(r.y / (1.0f - r.y)),
+        2.0f * sqrtf(r.z / (1.0f - r.z))
+    );
+}
+
+// Evaluate GGX BRDF with exact Fresnel equations.
+// Uses exact dielectric Fresnel for non-metals (IOR 1.5) and exact conductor
+// Fresnel with F0-derived (n, k) for metals. More physically correct than
+// Schlick at intermediate and grazing angles.
 __forceinline__ __device__ float3 evaluateGGX_BRDF(
     const float3& V,        // View direction (toward camera)
     const float3& L,        // Light direction (toward light)
@@ -274,15 +300,31 @@ __forceinline__ __device__ float3 evaluateGGX_BRDF(
 
     // Roughness remapping (Disney/UE4 convention)
     float alpha = roughness * roughness;
-    alpha = fmaxf(alpha, 0.001f); // Prevent div by zero
+    alpha = fmaxf(alpha, 0.001f);
 
-    // F0 (reflectance at normal incidence)
-    // Dielectrics: 0.04 (approximately 4% reflectance)
-    // Metals: base color IS the F0
-    float3 F0 = lerp(make_float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
-
-    // Fresnel term
-    float3 F = fresnelSchlick(VdotH, F0);
+    // Fresnel: exact equations for both dielectric and conductor components.
+    // Fast paths for the common pure-dielectric and pure-metal cases avoid
+    // computing both Fresnel types. The blend zone is narrow (5% each side)
+    // since real materials rarely have intermediate metallic values.
+    float3 F;
+    if (metallic < 0.05f) {
+        // Pure dielectric (vast majority of materials): IOR 1.5
+        float Fd = fresnelDielectric(VdotH, 1.5f);
+        F = make_float3(Fd, Fd, Fd);
+    } else if (metallic > 0.95f) {
+        // Pure metal: conductor Fresnel with (n, k) derived from baseColor = F0
+        float3 eta, k;
+        F0ToConductorIOR(baseColor, eta, k);
+        F = fresnelConductor(VdotH, eta, k);
+    } else {
+        // Rare blend zone: interpolate between dielectric and conductor
+        float Fd = fresnelDielectric(VdotH, 1.5f);
+        float3 F_dielectric = make_float3(Fd, Fd, Fd);
+        float3 eta, k;
+        F0ToConductorIOR(baseColor, eta, k);
+        float3 F_conductor = fresnelConductor(VdotH, eta, k);
+        F = lerp(F_dielectric, F_conductor, metallic);
+    }
 
     // Distribution term
     float D = D_GGX(NdotH, alpha);
@@ -290,12 +332,11 @@ __forceinline__ __device__ float3 evaluateGGX_BRDF(
     // Geometry term (height-correlated Smith)
     float G = G_SmithGGX(NdotV, NdotL, alpha);
 
-    // Specular BRDF: D * G * F (denominator is baked into G_SmithGGX)
+    // Specular BRDF: D * G * F (denominator baked into G_SmithGGX)
     float3 specular = D * G * F;
 
     // Diffuse BRDF (energy conserving)
-    // kD = (1 - F) * (1 - metallic)
-    // Metals have no diffuse component
+    // kD = (1 - F) * (1 - metallic). Metals have no diffuse component.
     float3 kD = (make_float3(1.0f, 1.0f, 1.0f) - F) * (1.0f - metallic);
     float3 diffuse = kD * baseColor / M_PI;
 
@@ -330,8 +371,8 @@ __forceinline__ __device__ float3 evaluateBRDF_Clearcoat(
     float ccAlpha = clearcoatRoughness * clearcoatRoughness;
     ccAlpha = fmaxf(ccAlpha, 0.001f);
 
-    // Clearcoat uses fixed F0 of 0.04 (IOR 1.5)
-    float F_cc = 0.04f + 0.96f * powf(1.0f - VdotH, 5.0f);
+    // Clearcoat: exact dielectric Fresnel with IOR 1.5
+    float F_cc = fresnelDielectric(VdotH, 1.5f);
     float D_cc = D_GGX(NdotH, ccAlpha);
     float G_cc = G_SmithGGX(NdotV, NdotL, ccAlpha);
 

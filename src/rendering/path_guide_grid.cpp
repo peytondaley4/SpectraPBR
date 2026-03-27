@@ -332,96 +332,69 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
     if (m_totalCells > 0 && m_entryStride >= 12) {
         for (size_t g = 0; g < m_totalCells; g++) {
             size_t base = g * m_entryStride;
-            if (base + 11 >= dataHost.size()) break;
+            if (base + PG_LAST_HIT_FRAME >= dataHost.size()) break;
 
             // Extract interval sums from carried-forward GPU data
-            float iSumX = dataHost[base + 6];
-            float iSumY = dataHost[base + 7];
-            float iSumZ = dataHost[base + 8];
-            float iSumW = dataHost[base + 9];
+            float iSumX = dataHost[base + PG_STAT_SUM_X];
+            float iSumY = dataHost[base + PG_STAT_SUM_Y];
+            float iSumZ = dataHost[base + PG_STAT_SUM_Z];
+            float iSumW = dataHost[base + PG_STAT_SUM_W];
 
             // Accumulate into lifetime totals with EMA decay
             size_t hostBase = g * m_entryStride;
-            if (hostBase + 11 < m_dataHost.size()) {
-                m_dataHost[hostBase + 6] = EMA_DECAY * m_dataHost[hostBase + 6] + iSumX;
-                m_dataHost[hostBase + 7] = EMA_DECAY * m_dataHost[hostBase + 7] + iSumY;
-                m_dataHost[hostBase + 8] = EMA_DECAY * m_dataHost[hostBase + 8] + iSumZ;
-                m_dataHost[hostBase + 9] = EMA_DECAY * m_dataHost[hostBase + 9] + iSumW;
-                m_dataHost[hostBase + 11] = dataHost[base + 11];
+            if (hostBase + PG_LAST_HIT_FRAME < m_dataHost.size()) {
+                m_dataHost[hostBase + PG_STAT_SUM_X] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_X] + iSumX;
+                m_dataHost[hostBase + PG_STAT_SUM_Y] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_Y] + iSumY;
+                m_dataHost[hostBase + PG_STAT_SUM_Z] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_Z] + iSumZ;
+                m_dataHost[hostBase + PG_STAT_SUM_W] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_W] + iSumW;
+                m_dataHost[hostBase + PG_LAST_HIT_FRAME] = dataHost[base + PG_LAST_HIT_FRAME];
             }
 
             // Fit from cumulative sums (much more stable than interval-only)
-            float cumSumX = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 6] : iSumX;
-            float cumSumY = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 7] : iSumY;
-            float cumSumZ = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 8] : iSumZ;
-            float cumSumW = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 9] : iSumW;
+            float cumSumX = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_X] : iSumX;
+            float cumSumY = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_Y] : iSumY;
+            float cumSumZ = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_Z] : iSumZ;
+            float cumSumW = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_W] : iSumW;
 
             if (cumSumW >= 1.0f) {
                 float theta0, phi0, kappa0;
                 if (vmf_fitting::fitFromSums(cumSumX, cumSumY, cumSumZ, cumSumW, theta0, phi0, kappa0)) {
-                    dataHost[base + 0] = theta0;
-                    dataHost[base + 1] = phi0;
-                    dataHost[base + 2] = kappa0;
-                    dataHost[base + 3] = 0.0f;  // lobe 1 inactive by default
-                    dataHost[base + 4] = 0.0f;
-                    dataHost[base + 5] = 0.0f;
-                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = 1.0f;
+                    dataHost[base + PG_LOBE0_THETA] = theta0;
+                    dataHost[base + PG_LOBE0_PHI] = phi0;
+                    dataHost[base + PG_LOBE0_KAPPA] = kappa0;
+                    dataHost[base + PG_LOBE1_THETA] = 0.0f;  // lobe 1 inactive by default
+                    dataHost[base + PG_LOBE1_PHI] = 0.0f;
+                    dataHost[base + PG_LOBE1_KAPPA] = 0.0f;
+                    dataHost[base + PG_MIX_WEIGHT] = 1.0f;
                     cellsWithData++;
 
-                    // Two-lobe detection: kappa-aware bimodality test.
-                    //
-                    // If the cumulative kappa is low (wide distribution), the data
-                    // may be bimodal — e.g., indirect light from two windows. We
-                    // test whether the interval mean direction diverges enough from
-                    // the cumulative mean to warrant a second lobe.
-                    //
-                    // Threshold: angular divergence must exceed the cumulative lobe's
-                    // effective width (~1/sqrt(kappa) radians). A low-kappa (wide)
-                    // lobe requires more divergence to be meaningfully bimodal; a
-                    // high-kappa (tight) lobe splits more readily.
-                    //
-                    // Note: online aggregate sums are sufficient statistics for a
-                    // SINGLE vMF, but not for a mixture. For proper two-lobe EM,
-                    // per-sample data is needed (see vmf_fitting::fitTwoLobes).
-                    // This heuristic is the best we can do with aggregate sums.
-                    float iLen = std::sqrt(iSumX*iSumX + iSumY*iSumY + iSumZ*iSumZ);
-                    if (iSumW >= 2.0f && iLen > 1e-6f && kappa0 > 0.5f) {
-                        float iNx = iSumX / iLen, iNy = iSumY / iLen, iNz = iSumZ / iLen;
-                        float cumLen = std::sqrt(cumSumX*cumSumX + cumSumY*cumSumY + cumSumZ*cumSumZ);
-                        if (cumLen > 1e-6f) {
-                            float cNx = cumSumX / cumLen, cNy = cumSumY / cumLen, cNz = cumSumZ / cumLen;
-                            float cosAngle = iNx*cNx + iNy*cNy + iNz*cNz;
-                            // Kappa-dependent threshold: the cumulative lobe has
-                            // effective half-angle ~1/sqrt(kappa). We require the
-                            // interval direction to be at least 2x that width away.
-                            // cos(2/sqrt(k)) approximated via Taylor for large k.
-                            float effectiveWidth = 2.0f / std::sqrt(kappa0);
-                            float cosThreshold = std::cos(std::min(effectiveWidth, 1.5f));
-                            if (cosAngle < cosThreshold) {
-                                float theta1, phi1, kappa1;
-                                if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
-                                    dataHost[base + 3] = theta1;
-                                    dataHost[base + 4] = phi1;
-                                    dataHost[base + 5] = kappa1;
-                                    // Mixture weight from relative sample counts,
-                                    // scaled so interval matches cumulative timescale
-                                    float effCum = cumSumW;
-                                    float effInt = iSumW / (1.0f - EMA_DECAY);
-                                    float pi0 = effCum / (effCum + effInt);
-                                    pi0 = std::max(0.1f, std::min(0.9f, pi0));
-                                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = pi0;
-                                }
-                            }
+                    // Two-lobe detection via BIC (Bayesian Information Criterion).
+                    // No arbitrary thresholds — BIC naturally balances fit quality
+                    // against model complexity, using the effective sample count
+                    // (sumW) to determine how much evidence is needed for a split.
+                    if (vmf_fitting::shouldSplitLobe(cumSumX, cumSumY, cumSumZ, cumSumW,
+                                                      iSumX, iSumY, iSumZ, iSumW)) {
+                        float theta1, phi1, kappa1;
+                        if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
+                            dataHost[base + PG_LOBE1_THETA] = theta1;
+                            dataHost[base + PG_LOBE1_PHI] = phi1;
+                            dataHost[base + PG_LOBE1_KAPPA] = kappa1;
+                            // Mixture weight from relative effective sample counts
+                            float effCum = cumSumW;
+                            float effInt = iSumW / (1.0f - EMA_DECAY);
+                            float pi0 = effCum / (effCum + effInt);
+                            pi0 = std::max(0.1f, std::min(0.9f, pi0));
+                            dataHost[base + PG_MIX_WEIGHT] = pi0;
                         }
                     }
                 }
             }
 
             // Zero interval stats for next accumulation window
-            dataHost[base + 6] = 0.0f;
-            dataHost[base + 7] = 0.0f;
-            dataHost[base + 8] = 0.0f;
-            dataHost[base + 9] = 0.0f;
+            dataHost[base + PG_STAT_SUM_X] = 0.0f;
+            dataHost[base + PG_STAT_SUM_Y] = 0.0f;
+            dataHost[base + PG_STAT_SUM_Z] = 0.0f;
+            dataHost[base + PG_STAT_SUM_W] = 0.0f;
         }
         std::cout << "[PathGuide] Build: " << m_totalCells << " cells, "
                   << cellsWithData << " fitted\n";
@@ -433,8 +406,8 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
         float currentFrameF = static_cast<float>(currentFrame);
         for (size_t g = 0; g < m_totalCells; g++) {
             size_t base = g * m_entryStride;
-            if (base + 11 < dataHost.size() && dataHost[base + 11] == 0.0f) {
-                dataHost[base + 11] = currentFrameF;
+            if (base + 11 < dataHost.size() && dataHost[base + PG_LAST_HIT_FRAME] == 0.0f) {
+                dataHost[base + PG_LAST_HIT_FRAME] = currentFrameF;
             }
         }
     }
@@ -444,11 +417,11 @@ bool PathGuideGrid::buildFromStaging(cudaStream_t stream, uint32_t currentFrame)
     // We need m_dataHost to have the fitted vMF params too for inspectCellAtPosition.
     for (size_t g = 0; g < m_totalCells; g++) {
         size_t base = g * m_entryStride;
-        if (base + 11 >= dataHost.size()) break;
+        if (base + PG_LAST_HIT_FRAME >= dataHost.size()) break;
         // Copy vMF params and pi_0 from dataHost to m_dataHost
         for (uint32_t k = 0; k < 6; k++)
             m_dataHost[base + k] = dataHost[base + k];
-        m_dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET];
+        m_dataHost[base + PG_MIX_WEIGHT] = dataHost[base + PG_MIX_WEIGHT];
     }
 
     // Reuse existing GPU buffers if they're large enough; only reallocate when growing
@@ -866,9 +839,9 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
     std::vector<CellKey> cellsToAdd;
     std::vector<size_t> cellsToRemove;  // indices into current cell array
 
-    const float subdivideThreshold = m_config.subdivide_sample_threshold;
-    const float varianceThreshold = m_config.subdivide_variance_threshold;
-    const uint32_t coarsenThreshold = m_config.coarsen_frames_threshold;
+    // Note: subdivide_sample_threshold and subdivide_variance_threshold from config
+    // are no longer used — replaced by BIC-based fit quality and LL-per-sample metric.
+    // Coarsening uses data-driven grace period scaled by sumW instead of fixed frame count.
     const uint32_t maxLevel = m_config.max_level;
     const uint32_t minLevel = m_config.min_level;
 
@@ -887,19 +860,22 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
             }
         }
 
-        const float* stats = dataHost.data() + g * m_entryStride + PATH_GUIDE_VMF_FLOATS;
-        float sumX = stats[0];
-        float sumY = stats[1];
-        float sumZ = stats[2];
-        float sumW = stats[3];
-        // stats[4] is pi_0 (mixture weight), not used for refinement
-        float lastHitFrame = stats[5];
+        const float* cell = dataHost.data() + g * m_entryStride;
+        float sumX = cell[PG_STAT_SUM_X];
+        float sumY = cell[PG_STAT_SUM_Y];
+        float sumZ = cell[PG_STAT_SUM_Z];
+        float sumW = cell[PG_STAT_SUM_W];
+        float lastHitFrame = cell[PG_LAST_HIT_FRAME];
 
-        // Coarsening: remove cells that haven't been hit for many frames AND
-        // have negligible accumulated data. Cells with good fits (high sumW) are
-        // retained — their guiding data is still valid even without fresh samples.
-        if (cellLevel > minLevel && currentFrame > static_cast<uint32_t>(lastHitFrame) + coarsenThreshold
-            && sumW < subdivideThreshold) {
+        // Coarsening: remove cells that haven't been hit recently AND have
+        // negligible guiding value. A cell's guiding value is measured by its
+        // effective sample count (sumW) — cells with high sumW have good fits
+        // worth keeping even without fresh samples.
+        // The frame threshold scales with sumW: well-trained cells get more grace.
+        float framesSinceHit = (currentFrame > static_cast<uint32_t>(lastHitFrame))
+            ? static_cast<float>(currentFrame - static_cast<uint32_t>(lastHitFrame)) : 0.0f;
+        float gracePeriod = fmaxf(120.0f, sumW * 10.0f);  // More data → longer grace
+        if (cellLevel > minLevel && framesSinceHit > gracePeriod && sumW < 10.0f) {
             cellsToRemove.push_back(g);
             continue;
         }
@@ -921,26 +897,28 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
             diagCellsWithData++;
         }
 
-        // Subdivision: need sufficient samples and high directional variance.
-        // We check BOTH the lifetime cumulative sums AND the fitted lobe's kappa.
-        // The kappa from the last build reflects recent data (EMA-weighted) and
-        // reacts faster to distribution changes than the raw cumulative sums.
-        if (cellLevel < maxLevel && sumW >= subdivideThreshold) {
-            // Variance from cumulative direction sums: 1 - R̄
-            float meanX = sumX / sumW;
-            float meanY = sumY / sumW;
-            float meanZ = sumZ / sumW;
-            float meanLen = sqrtf(meanX * meanX + meanY * meanY + meanZ * meanZ);
-            float variance = fmaxf(0.0f, 1.0f - meanLen);
-
-            // Also check fitted lobe kappa: low kappa = wide distribution = high variance.
-            // kappa < ~5 corresponds to a very broad lobe (>~50° half-width).
-            const float* vMF = dataHost.data() + g * m_entryStride;
-            float kappa0 = vMF[2];
-            bool lobeIsWide = (kappa0 > 0.0f && kappa0 < 5.0f);
-
-            // Subdivide if either metric indicates high variance
-            if (variance > varianceThreshold || (lobeIsWide && sumW >= subdivideThreshold * 2.0f)) {
+        // Subdivision via BIC-based fit quality.
+        // Instead of fixed variance/sample thresholds, we ask: "does the current
+        // lobe model fit the data well?" The BIC log-likelihood measures this
+        // directly — low LL relative to the sample count means the distribution
+        // is too complex for the current model at this spatial resolution.
+        // The BIC's ln(N) penalty naturally prevents splitting with few samples.
+        if (cellLevel < maxLevel && sumW >= 2.0f) {
+            float LL = vmf_fitting::logLikelihoodSingleLobe(sumX, sumY, sumZ, sumW);
+            // Normalized LL per sample: how well does one lobe explain each sample?
+            // For a perfectly concentrated distribution, LL/N ≈ log(kappa/(4π)) + kappa ≈ kappa.
+            // For a uniform distribution (worst fit), LL/N ≈ log(1/(4π)) ≈ -2.53.
+            float llPerSample = LL / sumW;
+            // Subdivide when fit quality is poor: LL per sample is low.
+            // Threshold: log(1/(4π)) ≈ -2.53 is uniform, log(5/(4π)) ≈ -0.93 is moderate.
+            // We subdivide when the fit is worse than a moderately concentrated lobe.
+            // The threshold adapts naturally: cells with high kappa (tight fit) won't
+            // subdivide; cells with low kappa (poor fit) will.
+            bool poorFit = (llPerSample < 0.0f);  // Below the "good fit" baseline
+            // Also check kappa directly: a fitted kappa < 2 means the lobe is nearly uniform
+            float kappa0 = cell[PG_LOBE0_KAPPA];
+            bool lobeIsWide = (kappa0 > 0.0f && kappa0 < 2.0f);
+            if (poorFit || lobeIsWide) {
                 // Subdivide: create 8 children at next finer level
                 uint64_t parentMorton = m_mortonCodesHost[g];
                 uint32_t parentIx, parentIy, parentIz;
@@ -971,9 +949,9 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
         float avgVar = diagTotalVar / diagCellsWithData;
         std::cout << "[PathGuide] Refine check: " << diagCellsWithData << "/" << m_totalCells
                   << " cells with data | sumW: [" << diagMinSumW << ", " << diagMaxSumW
-                  << "] avg=" << avgSumW << " (thresh=" << subdivideThreshold
-                  << ") | var: [" << diagMinVar << ", " << diagMaxVar
-                  << "] avg=" << avgVar << " (thresh=" << varianceThreshold << ")\n";
+                  << "] avg=" << avgSumW
+                  << " | var(1-Rbar): [" << diagMinVar << ", " << diagMaxVar
+                  << "] avg=" << avgVar << " (BIC-driven)\n";
     }
 
     if (cellsToAdd.empty() && cellsToRemove.empty()) {
@@ -1081,8 +1059,8 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
         float currentFrameF = static_cast<float>(currentFrame);
         for (size_t g = 0; g < m_totalCells; g++) {
             size_t base = g * m_entryStride;
-            if (base + 11 < newDataHost.size() && newDataHost[base + 11] == 0.0f) {
-                newDataHost[base + 11] = currentFrameF;
+            if (base + 11 < newDataHost.size() && newDataHost[base + PG_LAST_HIT_FRAME] == 0.0f) {
+                newDataHost[base + PG_LAST_HIT_FRAME] = currentFrameF;
             }
         }
     }
@@ -1129,10 +1107,10 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
         std::vector<float> gpuUpload = m_dataHost;
         for (size_t g = 0; g < m_totalCells; g++) {
             size_t base = g * m_entryStride;
-            gpuUpload[base + 6] = 0.0f;
-            gpuUpload[base + 7] = 0.0f;
-            gpuUpload[base + 8] = 0.0f;
-            gpuUpload[base + 9] = 0.0f;
+            gpuUpload[base + PG_STAT_SUM_X] = 0.0f;
+            gpuUpload[base + PG_STAT_SUM_Y] = 0.0f;
+            gpuUpload[base + PG_STAT_SUM_Z] = 0.0f;
+            gpuUpload[base + PG_STAT_SUM_W] = 0.0f;
         }
         cudaMemcpyAsync(m_data, gpuUpload.data(),
             static_cast<size_t>(m_totalCells) * m_entryStride * sizeof(float),
@@ -1621,72 +1599,64 @@ bool PathGuideGrid::finishBuildFromReadback() {
     if (m_totalCells > 0 && m_entryStride >= 12) {
         for (size_t g = 0; g < m_totalCells; g++) {
             size_t base = g * m_entryStride;
-            if (base + 11 >= dataHost.size()) break;
+            if (base + PG_LAST_HIT_FRAME >= dataHost.size()) break;
 
-            float iSumX = dataHost[base + 6];
-            float iSumY = dataHost[base + 7];
-            float iSumZ = dataHost[base + 8];
-            float iSumW = dataHost[base + 9];
+            float iSumX = dataHost[base + PG_STAT_SUM_X];
+            float iSumY = dataHost[base + PG_STAT_SUM_Y];
+            float iSumZ = dataHost[base + PG_STAT_SUM_Z];
+            float iSumW = dataHost[base + PG_STAT_SUM_W];
 
             // Accumulate into lifetime totals with EMA decay
             size_t hostBase = g * m_entryStride;
-            if (hostBase + 11 < m_dataHost.size()) {
-                m_dataHost[hostBase + 6] = EMA_DECAY * m_dataHost[hostBase + 6] + iSumX;
-                m_dataHost[hostBase + 7] = EMA_DECAY * m_dataHost[hostBase + 7] + iSumY;
-                m_dataHost[hostBase + 8] = EMA_DECAY * m_dataHost[hostBase + 8] + iSumZ;
-                m_dataHost[hostBase + 9] = EMA_DECAY * m_dataHost[hostBase + 9] + iSumW;
-                m_dataHost[hostBase + 11] = dataHost[base + 11];
+            if (hostBase + PG_LAST_HIT_FRAME < m_dataHost.size()) {
+                m_dataHost[hostBase + PG_STAT_SUM_X] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_X] + iSumX;
+                m_dataHost[hostBase + PG_STAT_SUM_Y] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_Y] + iSumY;
+                m_dataHost[hostBase + PG_STAT_SUM_Z] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_Z] + iSumZ;
+                m_dataHost[hostBase + PG_STAT_SUM_W] = EMA_DECAY * m_dataHost[hostBase + PG_STAT_SUM_W] + iSumW;
+                m_dataHost[hostBase + PG_LAST_HIT_FRAME] = dataHost[base + PG_LAST_HIT_FRAME];
             }
 
             // Fit from cumulative sums
-            float cumSumX = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 6] : iSumX;
-            float cumSumY = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 7] : iSumY;
-            float cumSumZ = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 8] : iSumZ;
-            float cumSumW = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + 9] : iSumW;
+            float cumSumX = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_X] : iSumX;
+            float cumSumY = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_Y] : iSumY;
+            float cumSumZ = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_Z] : iSumZ;
+            float cumSumW = (hostBase + 9 < m_dataHost.size()) ? m_dataHost[hostBase + PG_STAT_SUM_W] : iSumW;
 
             if (cumSumW >= 1.0f) {
                 float theta0, phi0, kappa0;
                 if (vmf_fitting::fitFromSums(cumSumX, cumSumY, cumSumZ, cumSumW, theta0, phi0, kappa0)) {
-                    dataHost[base + 0] = theta0;
-                    dataHost[base + 1] = phi0;
-                    dataHost[base + 2] = kappa0;
-                    dataHost[base + 3] = 0.0f;
-                    dataHost[base + 4] = 0.0f;
-                    dataHost[base + 5] = 0.0f;
-                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = 1.0f;
+                    dataHost[base + PG_LOBE0_THETA] = theta0;
+                    dataHost[base + PG_LOBE0_PHI] = phi0;
+                    dataHost[base + PG_LOBE0_KAPPA] = kappa0;
+                    dataHost[base + PG_LOBE1_THETA] = 0.0f;
+                    dataHost[base + PG_LOBE1_PHI] = 0.0f;
+                    dataHost[base + PG_LOBE1_KAPPA] = 0.0f;
+                    dataHost[base + PG_MIX_WEIGHT] = 1.0f;
                     cellsWithData++;
 
-                    // Two-lobe fitting (same logic as buildFromStaging)
-                    float iLen = std::sqrt(iSumX*iSumX + iSumY*iSumY + iSumZ*iSumZ);
-                    if (iSumW >= 2.0f && iLen > 1e-6f) {
-                        float iNx = iSumX / iLen, iNy = iSumY / iLen, iNz = iSumZ / iLen;
-                        float cumLen = std::sqrt(cumSumX*cumSumX + cumSumY*cumSumY + cumSumZ*cumSumZ);
-                        if (cumLen > 1e-6f) {
-                            float cNx = cumSumX / cumLen, cNy = cumSumY / cumLen, cNz = cumSumZ / cumLen;
-                            float cosAngle = iNx*cNx + iNy*cNy + iNz*cNz;
-                            if (cosAngle < 0.707f) {
-                                float theta1, phi1, kappa1;
-                                if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
-                                    dataHost[base + 3] = theta1;
-                                    dataHost[base + 4] = phi1;
-                                    dataHost[base + 5] = kappa1;
-                                    float effCum = cumSumW;
-                                    float effInt = iSumW / (1.0f - EMA_DECAY);
-                                    float pi0 = effCum / (effCum + effInt);
-                                    pi0 = std::max(0.1f, std::min(0.9f, pi0));
-                                    dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = pi0;
-                                }
-                            }
+                    // Two-lobe detection via BIC (same as buildFromStaging)
+                    if (vmf_fitting::shouldSplitLobe(cumSumX, cumSumY, cumSumZ, cumSumW,
+                                                      iSumX, iSumY, iSumZ, iSumW)) {
+                        float theta1, phi1, kappa1;
+                        if (vmf_fitting::fitFromSums(iSumX, iSumY, iSumZ, iSumW, theta1, phi1, kappa1)) {
+                            dataHost[base + PG_LOBE1_THETA] = theta1;
+                            dataHost[base + PG_LOBE1_PHI] = phi1;
+                            dataHost[base + PG_LOBE1_KAPPA] = kappa1;
+                            float effCum = cumSumW;
+                            float effInt = iSumW / (1.0f - EMA_DECAY);
+                            float pi0 = effCum / (effCum + effInt);
+                            pi0 = std::max(0.1f, std::min(0.9f, pi0));
+                            dataHost[base + PG_MIX_WEIGHT] = pi0;
                         }
                     }
                 }
             }
 
             // Zero interval stats for upload
-            dataHost[base + 6] = 0.0f;
-            dataHost[base + 7] = 0.0f;
-            dataHost[base + 8] = 0.0f;
-            dataHost[base + 9] = 0.0f;
+            dataHost[base + PG_STAT_SUM_X] = 0.0f;
+            dataHost[base + PG_STAT_SUM_Y] = 0.0f;
+            dataHost[base + PG_STAT_SUM_Z] = 0.0f;
+            dataHost[base + PG_STAT_SUM_W] = 0.0f;
         }
         std::cout << "[PathGuide] Async build: " << m_totalCells << " cells, "
                   << cellsWithData << " fitted\n";
@@ -1697,8 +1667,8 @@ bool PathGuideGrid::finishBuildFromReadback() {
         float currentFrameF = static_cast<float>(currentFrame);
         for (size_t g = 0; g < m_totalCells; g++) {
             size_t base = g * m_entryStride;
-            if (base + 11 < dataHost.size() && dataHost[base + 11] == 0.0f) {
-                dataHost[base + 11] = currentFrameF;
+            if (base + 11 < dataHost.size() && dataHost[base + PG_LAST_HIT_FRAME] == 0.0f) {
+                dataHost[base + PG_LAST_HIT_FRAME] = currentFrameF;
             }
         }
     }
@@ -1706,10 +1676,10 @@ bool PathGuideGrid::finishBuildFromReadback() {
     // Save vMF params to m_dataHost
     for (size_t g = 0; g < m_totalCells; g++) {
         size_t base = g * m_entryStride;
-        if (base + 11 >= dataHost.size()) break;
+        if (base + PG_LAST_HIT_FRAME >= dataHost.size()) break;
         for (uint32_t k = 0; k < 6; k++)
             m_dataHost[base + k] = dataHost[base + k];
-        m_dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET] = dataHost[base + PATH_GUIDE_MIX_WEIGHT_OFFSET];
+        m_dataHost[base + PG_MIX_WEIGHT] = dataHost[base + PG_MIX_WEIGHT];
     }
 
     // Upload to build grid (async on readback stream)

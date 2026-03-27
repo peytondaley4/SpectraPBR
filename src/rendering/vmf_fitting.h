@@ -36,5 +36,22 @@ bool fitTwoLobes(
     const float* weights, uint32_t count,
     TwoLobeFitResult& out);
 
+// Compute log-likelihood of data under a single vMF lobe fitted from aggregate sums.
+// Uses: LL = N * log(C3(kappa)) + kappa * R, where R = ||(sumX, sumY, sumZ)||.
+float logLikelihoodSingleLobe(float sumX, float sumY, float sumZ, float sumW);
+
+// Bayesian Information Criterion for model selection.
+// BIC = -2 * LL + numParams * ln(N).
+// Lower BIC = better model (accounting for complexity).
+// For vMF: 1 lobe = 3 params, 2 lobes = 7 params (3+3+1 weight).
+float computeBIC(float logLikelihood, uint32_t numParams, float effectiveSampleCount);
+
+// Compare 1-lobe vs 2-lobe fit using BIC.
+// Returns true if 2-lobe fit is justified by the data.
+// cumSum = cumulative (lifetime) aggregates, intSum = current interval aggregates.
+bool shouldSplitLobe(
+    float cumSumX, float cumSumY, float cumSumZ, float cumSumW,
+    float intSumX, float intSumY, float intSumZ, float intSumW);
+
 } // namespace vmf_fitting
 } // namespace spectra

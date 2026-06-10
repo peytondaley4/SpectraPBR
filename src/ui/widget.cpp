@@ -137,23 +137,29 @@ void Widget::markDirty() {
 bool Widget::onMouseMove(float2 pos) {
     if (!m_visible || !m_enabled) return false;
 
-    // Early bounds check - if mouse isn't over this widget, 
+    // Early bounds check - if mouse isn't over this widget,
     // just clear hover state and skip children
     Rect bounds = getAbsoluteBounds();
     bool isOver = bounds.contains(pos);
-    
+
     // Update hover state
     updateHoverState(isOver);
-    
-    // If mouse isn't over this widget, no need to check children
+
+    // If mouse isn't over this widget, forward only to children that still
+    // need the event: previously hovered ones (to clear their hover) and
+    // ACTIVE ones (mid-drag widgets like sliders track the pointer even
+    // outside their bounds — dropping these events froze drags the moment
+    // the cursor left the container).
     if (!isOver) {
-        // But we still need to clear hover on children that were previously hovered
+        bool activeConsumed = false;
         for (auto& child : m_children) {
-            if (child->isHovered()) {
+            if (child->isActive()) {
+                activeConsumed = child->onMouseMove(pos) || activeConsumed;
+            } else if (child->isHovered()) {
                 child->onMouseMove(pos);  // Let child clear its hover state
             }
         }
-        return false;
+        return activeConsumed;
     }
 
     // Mouse is over this widget - check children (front to back)
@@ -245,6 +251,17 @@ bool Widget::onKeyUp(int key, int mods) {
     }
 
     return false;
+}
+
+void Widget::clearHoverRecursive() {
+    if (m_hovered) {
+        m_hovered = false;
+        markDirty();
+        onHoverChanged();
+    }
+    for (auto& child : m_children) {
+        child->clearHoverRecursive();
+    }
 }
 
 bool Widget::updateHoverState(bool isOver) {

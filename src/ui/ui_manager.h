@@ -202,6 +202,17 @@ private:
     void clearTreeSelection(Widget* widget, TreeNode* except);
     void buildTreeNodeRecursive(uint32_t nodeIndex, int indentLevel, float& yOffset);
 
+    // Raise a root widget to the top of the stack (just below the pinned top
+    // bar) and reassign root depths to match the new order.
+    void bringToFront(Widget* widget);
+    // Derive each root widget's render depth from its position in
+    // m_rootWidgets so draw order and input order always agree. Called
+    // whenever the root list changes.
+    void updateRootDepths();
+    // Keep a root widget reachable: clamp its position so part of it stays on
+    // screen (used during drags and after window resizes).
+    void clampRootToScreen(Widget* widget);
+
     text::FontAtlas* m_fontAtlas = nullptr;
     text::TextLayout m_textLayout;
 
@@ -221,9 +232,17 @@ public:
     
 private:
 
-    // All root-level widgets in draw/input order. Last element is top bar (on top).
-    // Order: scene panel, property panel, (grid debug panel), custom widgets..., top bar.
+    // All root-level widgets in draw/input order. Last element is the pinned
+    // top bar; clicking any other root raises it to just below the top bar
+    // (bringToFront), and updateRootDepths keeps quad depths in sync with
+    // this order so the panel that draws on top is also the one that gets
+    // input first.
     std::vector<std::unique_ptr<Widget>> m_rootWidgets;
+    // Mouse capture: the root widget that consumed the last mouse-down
+    // receives ALL moves until mouse-up, so drags don't stall when the cursor
+    // crosses other panels.
+    Widget* m_mouseCaptureWidget = nullptr;
+    Button* m_sceneToggleBtn = nullptr;   // top-bar toggle, synced with panel close
     Panel* m_topBar = nullptr;
     Panel* m_scenePanel = nullptr;
     PropertyPanel* m_propertyPanel = nullptr;

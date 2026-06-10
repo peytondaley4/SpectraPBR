@@ -90,6 +90,7 @@ bool ScrollView::onMouseDown(float2 pos, int button) {
         Rect scrollbarRect = getScrollbarRect();
         if (scrollbarRect.contains(pos)) {
             m_scrollbarDragging = true;
+            m_active = true;  // keeps drag events flowing when the cursor leaves
             m_dragStartOffset = m_scrollOffset;
             m_dragStartY = pos.y;
             return true;
@@ -129,10 +130,11 @@ bool ScrollView::onMouseDown(float2 pos, int button) {
 
 bool ScrollView::onMouseUp(float2 pos, int button) {
     if (!m_visible || !m_enabled) return false;
-    
+
     bool wasScrollbarDragging = m_scrollbarDragging;
     m_scrollbarDragging = false;
-    
+    m_active = false;
+
     if (wasScrollbarDragging) {
         return true;
     }
@@ -181,23 +183,28 @@ bool ScrollView::onMouseMove(float2 pos) {
     
     if (inBounds) {
         float2 adjustedPos = make_float2(pos.x, pos.y + m_scrollOffset);
-        
+
         for (auto it = m_children.rbegin(); it != m_children.rend(); ++it) {
             if ((*it)->isVisible()) {
                 (*it)->onMouseMove(adjustedPos);
             }
         }
-    } else {
-        // Mouse left scroll view - clear hover on any previously hovered children
-        for (auto& child : m_children) {
-            if (child->isVisible() && child->isHovered()) {
-                // Pass position outside bounds to clear hover
-                child->onMouseMove(pos);
-            }
+        return containsPoint(pos);
+    }
+
+    // Mouse left the scroll view: active children keep receiving drag events
+    // (with the scroll offset applied); hovered children clear their hover.
+    bool activeConsumed = false;
+    float2 adjustedPos = make_float2(pos.x, pos.y + m_scrollOffset);
+    for (auto& child : m_children) {
+        if (!child->isVisible()) continue;
+        if (child->isActive()) {
+            activeConsumed = child->onMouseMove(adjustedPos) || activeConsumed;
+        } else if (child->isHovered()) {
+            child->onMouseMove(pos);  // out-of-bounds position clears hover
         }
     }
-    
-    return containsPoint(pos);
+    return activeConsumed;
 }
 
 void ScrollView::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout) {

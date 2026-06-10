@@ -1,6 +1,7 @@
 #include "application.h"
 #include "hemisphere_vis.h"
 #include "model_loader.h"
+#include "log.h"
 #include <glm/glm.hpp>
 #include <algorithm>
 #include <iostream>
@@ -766,11 +767,17 @@ void Application::wireUICallbacks() {
 }
 
 void Application::setupCallbacks() {
+    // The Application is the SINGLE owner of the GLFW user pointer and all
+    // GLFW callbacks. (Previously GLContext and InputHandler also registered
+    // callbacks; GLFW keeps only the last registration and one user pointer,
+    // so GLContext's framebuffer callback ended up casting the Application
+    // pointer to GLContext* — the window-resize crash.)
     glfwSetWindowUserPointer(m_glContext->getWindow(), this);
     glfwSetKeyCallback(m_glContext->getWindow(), keyCallback);
     glfwSetCursorPosCallback(m_glContext->getWindow(), cursorPosCallback);
     glfwSetMouseButtonCallback(m_glContext->getWindow(), mouseButtonCallback);
     glfwSetScrollCallback(m_glContext->getWindow(), scrollCallback);
+    glfwSetFramebufferSizeCallback(m_glContext->getWindow(), framebufferSizeCallback);
 
     m_glContext->setPreResizeCallback([this]() {
         cudaDeviceSynchronize();
@@ -1147,19 +1154,22 @@ void Application::renderFrame() {
     // [DIAG] asyncIO
     { auto tNow = diagT(); diagAccum[9] += diagMs(tPrev, tNow); tPrev = tNow; }
 
-    // Print timing every 120 frames
+    // Phase timing report every 120 frames — only when verbose logging is on
+    // (F6). The accumulators reset either way so the window stays aligned.
     diagFrameCount++;
     if (diagFrameCount % 120 == 0) {
-        double total = 0;
-        for (int i = 0; i < 10; i++) total += diagAccum[i];
-        std::cout << "[DIAG] avg ms/frame over 120 frames (total="
-                  << (total / 120.0) << "ms):\n";
-        for (int i = 0; i < 10; i++) {
-            std::cout << "  " << diagNames[i] << ": "
-                      << (diagAccum[i] / 120.0) << " ms ("
-                      << (100.0 * diagAccum[i] / total) << "%)\n";
-            diagAccum[i] = 0;
+        if (verboseLogging()) {
+            double total = 0;
+            for (int i = 0; i < 10; i++) total += diagAccum[i];
+            std::cout << "[DIAG] avg ms/frame over 120 frames (total="
+                      << (total / 120.0) << "ms):\n";
+            for (int i = 0; i < 10; i++) {
+                std::cout << "  " << diagNames[i] << ": "
+                          << (diagAccum[i] / 120.0) << " ms ("
+                          << (100.0 * diagAccum[i] / total) << "%)\n";
+            }
         }
+        for (int i = 0; i < 10; i++) diagAccum[i] = 0;
     }
 }
 
@@ -1215,6 +1225,7 @@ void Application::printControls() {
     std::cout << "  F        - Toggle Fullscreen\n";
     std::cout << "  T        - Print frame timing\n";
     std::cout << "  F5       - Toggle continuous timing display\n";
+    std::cout << "  F6       - Toggle verbose logging (default off)\n";
     std::cout << "  1-4      - Resolution presets\n";
     std::cout << "  F1-F4    - Quality modes\n";
     std::cout << "  [ ]      - Decrease/Increase SPP\n";
@@ -1334,6 +1345,13 @@ void Application::keyCallback(GLFWwindow* window, int key, int scancode, int act
             std::cout << "[Timing] Continuous display: " << (app->m_diagEnabled ? "ON" : "OFF") << "\n";
             break;
 
+        case GLFW_KEY_F6: {
+            bool verbose = !verboseLogging();
+            g_verboseLogging.store(verbose, std::memory_order_relaxed);
+            std::cout << "[Log] Verbose logging: " << (verbose ? "ON" : "OFF") << "\n";
+            break;
+        }
+
         case GLFW_KEY_H:
             app->m_uiManager->toggleScenePanel();
             break;
@@ -1369,7 +1387,15 @@ void Application::cursorPosCallback(GLFWwindow* window, double xpos, double ypos
     float2 pos = make_float2(static_cast<float>(xpos), static_cast<float>(ypos));
 
     if (!app->m_mouseCaptured && app->m_uiManager) {
-        app->m_uiManager->handleMouseMove(pos);
+        bool consumed = app->m_uiManager->handleMouseMove(pos);
+        // Feed the UI-consumption state to the input handler so run() can
+        // gate keyboard camera movement (the handler no longer has its own
+        // GLFW callbacks — they were being silently overridden anyway).
+        if (app->m_inputHandler) {
+            app->m_inputHandler->setMouseConsumed(consumed);
+        }
+    } else if (app->m_inputHandler) {
+        app->m_inputHandler->setMouseConsumed(false);
     }
 
     if (app->m_mouseCaptured && app->m_camera) {
@@ -1510,6 +1536,13 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                 glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
             }
         }
+    }
+}
+
+void Application::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
+    auto* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
+    if (app && app->m_glContext) {
+        app->m_glContext->onFramebufferResized(width, height);
     }
 }
 

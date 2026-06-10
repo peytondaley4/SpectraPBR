@@ -127,6 +127,12 @@ public:
     virtual bool onKeyDown(int key, int mods);
     virtual bool onKeyUp(int key, int mods);
 
+    // Clear hover state on this widget and all descendants. The UI manager
+    // calls this on widgets occluded by whichever top-level widget consumed
+    // the mouse move — without it, hover highlights persist on panels
+    // UNDERNEATH the one the cursor is actually over.
+    virtual void clearHoverRecursive();
+
     // Check if point is inside widget bounds
     bool containsPoint(float2 pos) const;
 

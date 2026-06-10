@@ -1,5 +1,6 @@
 #include "gl_context.h"
 #include "shader_utils.h"
+#include "log.h"
 #include <iostream>
 
 namespace spectra {
@@ -38,10 +39,9 @@ bool GLContext::init(uint32_t width, uint32_t height, const char* title) {
 
     glfwMakeContextCurrent(m_window);
 
-    // Store this pointer for callbacks
-    glfwSetWindowUserPointer(m_window, this);
-    glfwSetFramebufferSizeCallback(m_window, framebufferSizeCallback);
-    glfwSetKeyCallback(m_window, keyCallback);
+    // No GLFW callbacks or user pointer here: the Application owns all GLFW
+    // callbacks (it sets the window user pointer to itself and forwards
+    // framebuffer resizes to onFramebufferResized).
 
     // Load OpenGL functions
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
@@ -310,25 +310,14 @@ void GLContext::setResolution(uint32_t width, uint32_t height) {
     }
 
     if (!m_fullscreen) {
-        // In windowed mode, just set the window size.
-        // This will trigger framebufferSizeCallback which handles everything:
-        // pre-resize callback, buffer recreation, and post-resize callback.
+        // In windowed mode, just set the window size. The Application's GLFW
+        // framebuffer-size callback forwards to onFramebufferResized, which
+        // handles pre-resize, buffer recreation, and post-resize.
         glfwSetWindowSize(m_window, width, height);
     } else {
         // In fullscreen mode, glfwSetWindowSize doesn't trigger the callback,
-        // so we need to handle everything manually here.
-        if (m_preResizeCallback) {
-            m_preResizeCallback();
-        }
-
-        m_width = width;
-        m_height = height;
-        glViewport(0, 0, width, height);
-        recreateBuffers();
-
-        if (m_resizeCallback) {
-            m_resizeCallback(width, height);
-        }
+        // so run the resize sequence directly.
+        onFramebufferResized(static_cast<int>(width), static_cast<int>(height));
     }
 }
 
@@ -380,79 +369,32 @@ void GLContext::recreateBuffers() {
     glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height
-              << " (PBOs " << m_pbos[0] << "/" << m_pbos[1] << "/" << m_pbos[2]
-              << ", UI PBO " << m_uiPbo << ", " << getBufferSize() / (1024 * 1024) << " MB each)\n";
-}
-
-void GLContext::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
-    auto* ctx = static_cast<GLContext*>(glfwGetWindowUserPointer(window));
-    if (ctx && width > 0 && height > 0) {
-        // Notify pre-resize callback BEFORE recreating buffers
-        // This allows CUDA to unregister resources before the PBO is invalidated
-        if (ctx->m_preResizeCallback) {
-            ctx->m_preResizeCallback();
-        }
-
-        ctx->m_width = width;
-        ctx->m_height = height;
-        glViewport(0, 0, width, height);
-        ctx->recreateBuffers();
-
-        if (ctx->m_resizeCallback) {
-            ctx->m_resizeCallback(width, height);
-        }
+    // Fires on every tick of an interactive resize drag — verbose only
+    if (verboseLogging()) {
+        std::cout << "[GL] Buffers resized: " << m_width << "x" << m_height
+                  << " (PBOs " << m_pbos[0] << "/" << m_pbos[1] << "/" << m_pbos[2]
+                  << ", UI PBO " << m_uiPbo << ", " << getBufferSize() / (1024 * 1024) << " MB each)\n";
     }
 }
 
-void GLContext::keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    (void)scancode;
-    (void)mods;
+void GLContext::onFramebufferResized(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    if (static_cast<uint32_t>(width) == m_width &&
+        static_cast<uint32_t>(height) == m_height) return;
 
-    if (action != GLFW_PRESS) {
-        return;
+    // Notify pre-resize callback BEFORE recreating buffers — CUDA must
+    // unregister its graphics resources before the PBOs are deleted.
+    if (m_preResizeCallback) {
+        m_preResizeCallback();
     }
 
-    auto* ctx = static_cast<GLContext*>(glfwGetWindowUserPointer(window));
-    if (!ctx) {
-        return;
-    }
+    m_width = static_cast<uint32_t>(width);
+    m_height = static_cast<uint32_t>(height);
+    glViewport(0, 0, width, height);
+    recreateBuffers();
 
-    switch (key) {
-        case GLFW_KEY_ESCAPE:
-            glfwSetWindowShouldClose(window, GLFW_TRUE);
-            break;
-
-        case GLFW_KEY_V:
-            ctx->setVSync(!ctx->isVSyncEnabled());
-            break;
-
-        case GLFW_KEY_F:
-            ctx->toggleFullscreen();
-            break;
-
-        case GLFW_KEY_1:
-            ctx->setResolution(RESOLUTION_720P.width, RESOLUTION_720P.height);
-            std::cout << "[GL] Resolution: " << RESOLUTION_720P.name << "\n";
-            break;
-
-        case GLFW_KEY_2:
-            ctx->setResolution(RESOLUTION_1080P.width, RESOLUTION_1080P.height);
-            std::cout << "[GL] Resolution: " << RESOLUTION_1080P.name << "\n";
-            break;
-
-        case GLFW_KEY_3:
-            ctx->setResolution(RESOLUTION_1440P.width, RESOLUTION_1440P.height);
-            std::cout << "[GL] Resolution: " << RESOLUTION_1440P.name << "\n";
-            break;
-
-        case GLFW_KEY_4:
-            ctx->setResolution(RESOLUTION_4K.width, RESOLUTION_4K.height);
-            std::cout << "[GL] Resolution: " << RESOLUTION_4K.name << "\n";
-            break;
-
-        default:
-            break;
+    if (m_resizeCallback) {
+        m_resizeCallback(m_width, m_height);
     }
 }
 

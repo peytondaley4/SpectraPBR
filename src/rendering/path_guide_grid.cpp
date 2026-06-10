@@ -1,6 +1,7 @@
 #include "path_guide_grid.h"
 #include "path_guide_kernels.h"
 #include "vmf_fitting.h"
+#include "log.h"
 #include <cstring>
 #include <iostream>
 #include <cmath>
@@ -846,8 +847,10 @@ bool PathGuideGrid::finishBuildFromReadback() {
     cudaEventRecord(m_readbackDoneEvent, m_readbackStream);
     m_pendingGatherCount = static_cast<uint32_t>(mortonHost.size());
 
-    std::cout << "[PathGuide] Structure build: " << prevTotalCells << " -> "
-              << m_totalCells << " cells\n";
+    if (verboseLogging()) {
+        std::cout << "[PathGuide] Structure build: " << prevTotalCells << " -> "
+                  << m_totalCells << " cells\n";
+    }
     return true;
 }
 
@@ -978,8 +981,10 @@ bool PathGuideGrid::runRefinementPass(uint32_t currentFrame, cudaStream_t stream
     std::sort(newCells.begin(), newCells.end());
     newCells.erase(std::unique(newCells.begin(), newCells.end()), newCells.end());
 
-    std::cout << "[PathGuide] Refine: +" << (numSubdivided * 8)
-              << " -" << (numSubdivided + numCoarsened) << " cells\n";
+    if (verboseLogging()) {
+        std::cout << "[PathGuide] Refine: +" << (numSubdivided * 8)
+                  << " -" << (numSubdivided + numCoarsened) << " cells\n";
+    }
 
     std::vector<uint64_t> prevMorton = m_mortonCodesHost;
     std::vector<uint32_t> prevOffsets = m_levelOffsets;

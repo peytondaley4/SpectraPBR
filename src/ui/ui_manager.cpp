@@ -3,6 +3,7 @@
 #include "scene_manager.h"
 #include "material_manager.h"
 #include "slider.h"
+#include <algorithm>
 #include <iostream>
 #include <cstdio>
 #include <cmath>
@@ -73,7 +74,7 @@ void UIManager::toggleTheme() {
 
 void UIManager::setScreenSize(uint32_t width, uint32_t height) {
     if (m_screenWidth == width && m_screenHeight == height) return;
-    
+
     m_screenWidth = width;
     m_screenHeight = height;
     m_geometryDirty = true;
@@ -81,6 +82,12 @@ void UIManager::setScreenSize(uint32_t width, uint32_t height) {
     // Update top bar width
     if (m_topBar) {
         m_topBar->setSize(static_cast<float>(width), 40.0f);
+    }
+
+    // Pull panels back into reach — after shrinking the window, panels
+    // positioned for the old size could end up entirely off screen.
+    for (auto& widget : m_rootWidgets) {
+        clampRootToScreen(widget.get());
     }
 }
 
@@ -113,22 +120,103 @@ void UIManager::collectGeometry() {
             widget->collectGeometry(m_quads, &m_textLayout);
         }
     }
-    std::sort(m_quads.begin(), m_quads.end(),
+    // stable_sort: quads with equal depth (e.g. a widget's own layers) keep
+    // emission order. Plain sort reorders equal keys arbitrarily per call,
+    // which made overlapping same-depth geometry flicker between frames.
+    std::stable_sort(m_quads.begin(), m_quads.end(),
         [](const UIQuad& a, const UIQuad& b) { return a.depth < b.depth; });
 }
 
-bool UIManager::handleMouseMove(float2 pos) {
-    for (auto it = m_rootWidgets.rbegin(); it != m_rootWidgets.rend(); ++it) {
-        if ((*it)->isVisible() && (*it)->onMouseMove(pos)) {
-            return true;
+void UIManager::updateRootDepths() {
+    // Depth from stack order, so quad sorting reproduces the input order.
+    // Spacing of 10 dwarfs the small intra-widget offsets (+0.001 .. +0.02).
+    // The top bar (last) is pinned far above everything.
+    for (size_t i = 0; i < m_rootWidgets.size(); ++i) {
+        Widget* w = m_rootWidgets[i].get();
+        float depth = (w == m_topBar) ? 1000.0f : 10.0f + 10.0f * static_cast<float>(i);
+        if (w->getDepth() != depth) {
+            w->setDepth(depth);
         }
     }
-    return false;
+    m_geometryDirty = true;
+}
+
+void UIManager::bringToFront(Widget* widget) {
+    if (!widget || widget == m_topBar) return;
+    if (!m_rootWidgets.empty() && m_rootWidgets.size() >= 2 &&
+        m_rootWidgets[m_rootWidgets.size() - 2].get() == widget) {
+        return;  // already frontmost (below the pinned top bar)
+    }
+
+    auto it = std::find_if(m_rootWidgets.begin(), m_rootWidgets.end(),
+        [widget](const std::unique_ptr<Widget>& w) { return w.get() == widget; });
+    if (it == m_rootWidgets.end()) return;
+
+    std::unique_ptr<Widget> owned = std::move(*it);
+    m_rootWidgets.erase(it);
+    // Insert just below the top bar (which stays last/topmost)
+    if (!m_rootWidgets.empty() && m_rootWidgets.back().get() == m_topBar) {
+        m_rootWidgets.insert(m_rootWidgets.end() - 1, std::move(owned));
+    } else {
+        m_rootWidgets.push_back(std::move(owned));
+    }
+    updateRootDepths();
+}
+
+void UIManager::clampRootToScreen(Widget* widget) {
+    if (!widget || widget == m_topBar) return;
+
+    // Keep enough of the widget on screen to grab it again: at least 60 px
+    // horizontally and the header strip vertically.
+    const float keep = 60.0f;
+    float2 pos = widget->getPosition();
+    float2 size = widget->getSize();
+    float maxX = static_cast<float>(m_screenWidth) - keep;
+    float minX = keep - size.x;
+    float maxY = static_cast<float>(m_screenHeight) - 30.0f;
+    float minY = 0.0f;
+
+    float x = std::min(std::max(pos.x, minX), maxX);
+    float y = std::min(std::max(pos.y, minY), maxY);
+    if (x != pos.x || y != pos.y) {
+        widget->setPosition(x, y);
+    }
+}
+
+bool UIManager::handleMouseMove(float2 pos) {
+    // While a drag is in progress, the capturing widget gets EVERY move —
+    // routing through the normal front-to-back walk let other panels steal
+    // the event mid-drag, stalling panel/slider drags ("janky" drags).
+    if (m_mouseCaptureWidget) {
+        m_mouseCaptureWidget->onMouseMove(pos);
+        clampRootToScreen(m_mouseCaptureWidget);
+        return true;
+    }
+
+    bool consumed = false;
+    for (auto it = m_rootWidgets.rbegin(); it != m_rootWidgets.rend(); ++it) {
+        if (!(*it)->isVisible()) continue;
+        if (!consumed && (*it)->onMouseMove(pos)) {
+            consumed = true;
+            continue;  // keep iterating: the roots below must clear hover
+        }
+        if (consumed) {
+            (*it)->clearHoverRecursive();
+        }
+    }
+    return consumed;
 }
 
 bool UIManager::handleMouseDown(float2 pos, int button) {
+    m_mouseCaptureWidget = nullptr;  // safety: stale capture can't survive a new press
     for (auto it = m_rootWidgets.rbegin(); it != m_rootWidgets.rend(); ++it) {
-        if ((*it)->isVisible() && (*it)->onMouseDown(pos, button)) {
+        Widget* root = it->get();
+        if (root->isVisible() && root->onMouseDown(pos, button)) {
+            // Capture the mouse for the duration of this press and raise the
+            // panel: the panel you click is the one on top and the one that
+            // keeps receiving the drag.
+            m_mouseCaptureWidget = root;
+            bringToFront(root);
             return true;
         }
     }
@@ -136,6 +224,13 @@ bool UIManager::handleMouseDown(float2 pos, int button) {
 }
 
 bool UIManager::handleMouseUp(float2 pos, int button) {
+    if (m_mouseCaptureWidget) {
+        Widget* captured = m_mouseCaptureWidget;
+        m_mouseCaptureWidget = nullptr;
+        captured->onMouseUp(pos, button);
+        return true;  // the press was UI-owned, so the release is too
+    }
+
     for (auto it = m_rootWidgets.rbegin(); it != m_rootWidgets.rend(); ++it) {
         if ((*it)->isVisible() && (*it)->onMouseUp(pos, button)) {
             return true;
@@ -145,10 +240,13 @@ bool UIManager::handleMouseUp(float2 pos, int button) {
 }
 
 bool UIManager::handleMouseScroll(float2 pos, float delta) {
+    // Scroll goes to the topmost root under the cursor only — no falling
+    // through to a scroll view in a panel underneath.
     for (auto it = m_rootWidgets.rbegin(); it != m_rootWidgets.rend(); ++it) {
-        if ((*it)->isVisible() && (*it)->onMouseScroll(pos, delta)) {
-            return true;
-        }
+        Widget* root = it->get();
+        if (!root->isVisible()) continue;
+        if (!root->containsPoint(pos)) continue;
+        return root->onMouseScroll(pos, delta);
     }
     return false;
 }
@@ -198,9 +296,11 @@ void UIManager::createDefaultUI() {
     m_scenePanel->setTitle("Scene Hierarchy");
     m_scenePanel->setCloseable(true);
     m_scenePanel->setDraggable(true);
-    m_scenePanel->setDepth(50.0f);
     m_scenePanel->setTheme(m_theme);
-    m_scenePanel->setOnClose([this]() {});
+    m_scenePanel->setOnClose([this]() {
+        // Keep the top-bar toggle in sync when closed via the X button
+        if (m_sceneToggleBtn) m_sceneToggleBtn->setToggled(false);
+    });
 
     auto scrollView = std::make_unique<ScrollView>();
     scrollView->setPosition(0.0f, 30.0f);
@@ -214,7 +314,6 @@ void UIManager::createDefaultUI() {
     m_propertyPanel = propertyPanel.get();
     m_propertyPanel->setPosition(static_cast<float>(m_screenWidth) - 310.0f, 50.0f);
     m_propertyPanel->setSize(300.0f, 500.0f);
-    m_propertyPanel->setDepth(50.0f);
     m_propertyPanel->setTheme(m_theme);
     m_propertyPanel->setDraggable(true);
     m_propertyPanel->setVisible(false);
@@ -229,7 +328,6 @@ void UIManager::createDefaultUI() {
     m_topBar->setSize(static_cast<float>(m_screenWidth), 40.0f);
     m_topBar->setShowHeader(false);
     m_topBar->setShowBorder(false);
-    m_topBar->setDepth(100.0f);
     m_topBar->setTheme(m_theme);
 
     auto titleLabel = std::make_unique<Label>("SpectraPBR");
@@ -243,6 +341,7 @@ void UIManager::createDefaultUI() {
     sceneBtn->setSize(60.0f, 28.0f);
     sceneBtn->setToggleMode(true);
     sceneBtn->setToggled(true);
+    m_sceneToggleBtn = sceneBtn.get();
     sceneBtn->setOnClick([this]() { toggleScenePanel(); });
     m_topBar->addChild(std::move(sceneBtn));
 
@@ -253,6 +352,8 @@ void UIManager::createDefaultUI() {
     m_topBar->addChild(std::move(themeBtn));
 
     m_rootWidgets.push_back(std::move(topBar));
+
+    updateRootDepths();
 }
 
 void UIManager::buildSceneTree(const SceneManager* sceneManager) {
@@ -377,12 +478,11 @@ void UIManager::setSelectedInstanceId(uint32_t id) {
 
 void UIManager::toggleScenePanel() {
     if (m_scenePanel) {
-        bool wasVisible = m_scenePanel->isVisible();
-        m_scenePanel->setVisible(!wasVisible);
+        m_scenePanel->setVisible(!m_scenePanel->isVisible());
+        if (m_sceneToggleBtn) {
+            m_sceneToggleBtn->setToggled(m_scenePanel->isVisible());
+        }
         m_geometryDirty = true;  // Ensure geometry regenerates on visibility change
-        std::cout << "[UIManager] toggleScenePanel: " << wasVisible << " -> " << m_scenePanel->isVisible() << "\n";
-    } else {
-        std::cout << "[UIManager] toggleScenePanel: m_scenePanel is null!\n";
     }
 }
 
@@ -397,7 +497,7 @@ void UIManager::addRootWidget(std::unique_ptr<Widget> widget) {
     } else {
         m_rootWidgets.push_back(std::move(widget));
     }
-    m_geometryDirty = true;
+    updateRootDepths();
 }
 
 void UIManager::onSceneNodeSelected(TreeNode* node) {
@@ -528,7 +628,6 @@ void UIManager::addPathGuideGridDebugPanel(
     m_gridDebugPanel->setTitle("Path Guide Grid (Sparse)");
     m_gridDebugPanel->setCloseable(true);
     m_gridDebugPanel->setDraggable(true);
-    m_gridDebugPanel->setDepth(50.0f);
     m_gridDebugPanel->setTheme(m_theme);
     m_gridDebugPanel->setVisible(false);
 
@@ -656,7 +755,7 @@ void UIManager::addPathGuideGridDebugPanel(
 
     // Insert before top bar so it receives input in correct order
     m_rootWidgets.insert(m_rootWidgets.end() - 1, std::move(gridPanel));
-    m_geometryDirty = true;
+    updateRootDepths();
 }
 
 void UIManager::toggleGridDebugPanel() {
@@ -722,7 +821,6 @@ void UIManager::addCellInspectorPanel() {
     m_cellInspectorPanel->setTitle("Cell Inspector");
     m_cellInspectorPanel->setCloseable(true);
     m_cellInspectorPanel->setDraggable(true);
-    m_cellInspectorPanel->setDepth(55.0f);
     m_cellInspectorPanel->setTheme(m_theme);
     m_cellInspectorPanel->setVisible(false);
 
@@ -750,7 +848,7 @@ void UIManager::addCellInspectorPanel() {
     m_cellStatusLabel = makeLabel("Status: --");
 
     m_rootWidgets.insert(m_rootWidgets.end() - 1, std::move(panel));
-    m_geometryDirty = true;
+    updateRootDepths();
 }
 
 void UIManager::updateCellInspectorData(const InspectedCellInfo& info) {

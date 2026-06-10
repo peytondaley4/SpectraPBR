@@ -137,9 +137,11 @@ bool Panel::onMouseDown(float2 pos, int button) {
         }
     }
 
-    // Do not consume clicks on content area - let parent (e.g. PropertyPanel)
-    // forward to child widgets (sliders, etc.)
-    return false;
+    // Consume clicks anywhere on the panel surface. Children were already
+    // offered the event above; an unhandled click on the panel body must NOT
+    // fall through to panels stacked underneath (pressing their controls) or
+    // to the 3D viewport (scene picking through the panel).
+    return containsPoint(pos);
 }
 
 bool Panel::onMouseUp(float2 pos, int button) {
@@ -211,14 +213,19 @@ bool Panel::onMouseMove(float2 pos) {
         }
     }
 
-    // If mouse isn't over this panel, clear hover on children that were hovered
+    // If mouse isn't over this panel, forward to children that still need the
+    // event: active ones keep receiving drags (sliders track the pointer
+    // outside the panel), hovered ones get to clear their hover state.
     if (!isOver) {
+        bool activeConsumed = false;
         for (auto& child : m_children) {
-            if (child->isHovered()) {
+            if (child->isActive()) {
+                activeConsumed = child->onMouseMove(pos) || activeConsumed;
+            } else if (child->isHovered()) {
                 child->onMouseMove(pos);
             }
         }
-        return false;
+        return activeConsumed;
     }
 
     // Check children (front to back)
@@ -229,6 +236,14 @@ bool Panel::onMouseMove(float2 pos) {
     }
 
     return true;
+}
+
+void Panel::clearHoverRecursive() {
+    if (m_closeHovered) {
+        m_closeHovered = false;
+        markDirty();
+    }
+    Widget::clearHoverRecursive();
 }
 
 } // namespace ui

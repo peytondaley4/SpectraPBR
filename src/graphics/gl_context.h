@@ -127,14 +127,20 @@ public:
     // Set resolution (triggers resize callback)
     void setResolution(uint32_t width, uint32_t height);
 
+    // Handle a framebuffer size change: pre-resize callback, GL buffer
+    // recreation, then resize callback. Called by the Application's GLFW
+    // framebuffer-size callback — GLContext deliberately registers NO GLFW
+    // callbacks itself. GLFW stores a single user pointer and one callback
+    // per event; GLContext and Application both claiming them is what caused
+    // the resize crash (the framebuffer callback cast the Application user
+    // pointer to GLContext*).
+    void onFramebufferResized(int width, int height);
+
     // Get GLFW window (for input handling in main)
     GLFWwindow* getWindow() const { return m_window; }
 
 private:
     void recreateBuffers();
-
-    static void framebufferSizeCallback(GLFWwindow* window, int width, int height);
-    static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
 
     GLFWwindow* m_window = nullptr;
     uint32_t m_width = 0;

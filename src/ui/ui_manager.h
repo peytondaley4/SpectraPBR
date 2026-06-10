@@ -202,6 +202,14 @@ private:
     void clearTreeSelection(Widget* widget, TreeNode* except);
     void buildTreeNodeRecursive(uint32_t nodeIndex, int indentLevel, float& yOffset);
 
+public:
+    // Open the property panel showing the given instance's material — used by
+    // viewport double-click (works during path guiding, where single clicks
+    // deliberately leave selection and accumulation untouched) and by the
+    // scene-tree double-click.
+    void showInstancePropertiesFor(uint32_t instanceId);
+
+private:
     // Raise a root widget to the top of the stack (just below the pinned top
     // bar) and reassign root depths to match the new order.
     void bringToFront(Widget* widget);

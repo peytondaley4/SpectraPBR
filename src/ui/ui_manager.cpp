@@ -522,34 +522,36 @@ void UIManager::onSceneNodeSelected(TreeNode* node) {
     }
 }
 
+void UIManager::showInstancePropertiesFor(uint32_t instanceId) {
+    if (instanceId == UINT32_MAX || !m_propertyPanel) return;
+
+    if (m_instanceInfoRequestCallback) {
+        InstanceInfo info = m_instanceInfoRequestCallback(instanceId);
+        m_propertyPanel->showInstanceProperties(info);
+    } else {
+        // Fallback: basic info with safe defaults
+        InstanceInfo info = {};
+        info.instanceId = instanceId;
+        info.modelName = "Instance " + std::to_string(instanceId);
+        info.baseColor = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+        info.metallic = 0.0f;
+        info.roughness = 0.5f;
+        info.emissive = make_float3(0.0f, 0.0f, 0.0f);
+        m_propertyPanel->showInstanceProperties(info);
+    }
+    m_propertyPanel->setVisible(true);
+    bringToFront(m_propertyPanel);
+    m_geometryDirty = true;
+}
+
 void UIManager::onSceneNodeDoubleClicked(TreeNode* node) {
     SceneNodeType nodeType = node->getNodeType();
 
     // Show property panel based on node type
     switch (nodeType) {
-        case SceneNodeType::Instance: {
-            uint32_t instanceId = node->getUserData();
-
-            // Use callback to get instance info if available
-            if (m_instanceInfoRequestCallback && m_propertyPanel) {
-                InstanceInfo info = m_instanceInfoRequestCallback(instanceId);
-                m_propertyPanel->showInstanceProperties(info);
-                m_propertyPanel->setVisible(true);
-            } else if (m_propertyPanel) {
-                // Fallback: basic info with safe defaults
-                InstanceInfo info = {};
-                info.instanceId = instanceId;
-                info.modelName = "Model";
-                info.meshName = node->getLabel();
-                info.baseColor = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-                info.metallic = 0.0f;
-                info.roughness = 0.5f;
-                info.emissive = make_float3(0.0f, 0.0f, 0.0f);
-                m_propertyPanel->showInstanceProperties(info);
-                m_propertyPanel->setVisible(true);
-            }
+        case SceneNodeType::Instance:
+            showInstancePropertiesFor(node->getUserData());
             break;
-        }
 
         case SceneNodeType::PointLight:
         case SceneNodeType::DirectionalLight:
@@ -561,8 +563,10 @@ void UIManager::onSceneNodeDoubleClicked(TreeNode* node) {
                 LightInfo info = m_lightInfoRequestCallback(nodeType, lightIndex);
                 m_propertyPanel->showLightProperties(info);
                 m_propertyPanel->setVisible(true);
+                bringToFront(m_propertyPanel);
             } else if (m_propertyPanel) {
                 m_propertyPanel->setVisible(true);
+                bringToFront(m_propertyPanel);
             }
             break;
         }

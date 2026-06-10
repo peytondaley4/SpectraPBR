@@ -1232,6 +1232,7 @@ void Application::printControls() {
     std::cout << "  H        - Toggle hierarchy panel\n";
     std::cout << "  P        - Toggle property panel\n";
     std::cout << "  G        - Toggle grid debug panel\n";
+    std::cout << "  DblClick - Open material panel for clicked surface\n";
     std::cout << "\n";
 }
 
@@ -1434,6 +1435,30 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !app->m_mouseCaptured) {
         PickResultBuffer pickResult = app->m_optixEngine->pickInstanceAndPosition(
             static_cast<uint32_t>(xpos), static_cast<uint32_t>(ypos));
+
+        // Viewport double-click: open the picked surface's material panel.
+        // Works in EVERY mode — during path guiding this is the only way to
+        // reach a material without disturbing the render (single clicks
+        // deliberately leave selection and accumulation untouched while
+        // guiding, and opening the panel disturbs neither).
+        double now = glfwGetTime();
+        bool isDoubleClick =
+            pickResult.instanceId != UINT32_MAX &&
+            pickResult.instanceId == app->m_lastViewportClickInstance &&
+            (now - app->m_lastViewportClickTime) < 0.35 &&
+            std::abs(xpos - app->m_lastViewportClickX) < 8.0 &&
+            std::abs(ypos - app->m_lastViewportClickY) < 8.0;
+        if (isDoubleClick) {
+            app->m_uiManager->showInstancePropertiesFor(pickResult.instanceId);
+            // Require a fresh pair of clicks for the next double-click
+            app->m_lastViewportClickTime = -1.0;
+            app->m_lastViewportClickInstance = UINT32_MAX;
+        } else {
+            app->m_lastViewportClickTime = now;
+            app->m_lastViewportClickX = xpos;
+            app->m_lastViewportClickY = ypos;
+            app->m_lastViewportClickInstance = pickResult.instanceId;
+        }
 
         // Only update selection highlight and reset accumulation when guiding is off.
         // When guiding is active, clicks inspect cells without disrupting the scene.

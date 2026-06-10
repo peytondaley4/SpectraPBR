@@ -163,6 +163,13 @@ private:
     double m_lastMouseX = 0.0;
     double m_lastMouseY = 0.0;
     bool m_firstMouse = true;
+
+    // Viewport double-click detection (opens the material panel for the
+    // picked surface — works during path guiding too)
+    double m_lastViewportClickTime = -1.0;
+    double m_lastViewportClickX = 0.0;
+    double m_lastViewportClickY = 0.0;
+    uint32_t m_lastViewportClickInstance = UINT32_MAX;
     bool m_keyW = false, m_keyS = false, m_keyA = false, m_keyD = false;
     bool m_keyQ = false, m_keyE = false, m_keyShift = false;
     bool m_diagEnabled = false;

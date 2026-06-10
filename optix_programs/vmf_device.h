@@ -2,31 +2,16 @@
 
 //------------------------------------------------------------------------------
 // von Mises–Fisher (vMF) distribution — device-side only
-// Self-contained: spherical/cartesian conversion, PDF, sampling.
-// Convention: theta = polar angle from +Y [0, pi], phi = azimuth [0, 2*pi].
-// mu = (sin(theta)*cos(phi), cos(theta), sin(theta)*sin(phi)).
+// Self-contained: PDF and sampling around an explicit mean direction mu.
 // PDF: C3(kappa)*exp(kappa*dot(mu,omega)), C3(kappa) = kappa/(4*pi*sinh(kappa)).
-// Sampling: Wood/Ulrich (Wikipedia; see also Müller et al. EGSR 2017 path guiding).
+// Sampling: Wood/Ulrich (see also Müller et al. EGSR 2017 path guiding).
+//
+// The cell storage keeps mu as a unit vector (not spherical angles), so no
+// trig conversion is needed in the sampling/PDF hot path. The host refit
+// kernel (path_guide_kernels.cu) writes mu/kappa with the same convention.
 //------------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
-
-__forceinline__ __device__ void vmfSphericalToCartesian(float theta, float phi, float& mx, float& my, float& mz) {
-    float sinTheta, cosTheta, sinPhi, cosPhi;
-    sincosf(theta, &sinTheta, &cosTheta);
-    sincosf(phi, &sinPhi, &cosPhi);
-    mx = sinTheta * cosPhi;
-    my = cosTheta;
-    mz = sinTheta * sinPhi;
-}
-
-__forceinline__ __device__ void vmfCartesianToSpherical(float mx, float my, float mz, float& theta, float& phi) {
-    float len = sqrtf(mx*mx + my*my + mz*mz);
-    if (len < 1e-8f) { theta = 0.0f; phi = 0.0f; return; }
-    theta = acosf(fminf(fmaxf(my / len, -1.0f), 1.0f));
-    phi = atan2f(mz, mx);
-    if (phi < 0.0f) phi += 6.28318530718f;
-}
 
 // vMF PDF in 3D: C3(kappa)*exp(kappa*cos_theta) where cos_theta = dot(mu, omega)
 // Numerically stable form: kappa/(2pi) * exp(kappa*(cos_theta-1)) / (1-exp(-2*kappa))
@@ -40,7 +25,8 @@ __forceinline__ __device__ float vmfPdf(float kappa, float cos_theta) {
     return fmaxf(pdf, 0.0f);
 }
 
-// Sample direction from vMF(mu, kappa). Wood/Ulrich: w = 1 + ln(u1+(1-u1)*exp(-2κ))/κ, then omega = sqrt(1-w^2)*v + w*mu.
+// Sample direction from vMF(mu, kappa). Wood/Ulrich:
+//   w = 1 + ln(u1 + (1-u1)*exp(-2k)) / k, then omega = sqrt(1-w^2)*v + w*mu.
 // mu must be unit length. u1, u2 in [0,1) from caller.
 __forceinline__ __device__ void vmfSample(
     float mx, float my, float mz,

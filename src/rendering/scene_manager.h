@@ -60,6 +60,11 @@ public:
     CUdeviceptr* getVertexBuffers() { return m_d_vertexBuffers; }
     CUdeviceptr* getIndexBuffers() { return m_d_indexBuffers; }
 
+    // Per-instance arrays for raygen-side shading (built in buildIAS)
+    const float* getInstanceTransforms() const { return m_d_instanceTransforms; }
+    const float* getInstanceNormalTransforms() const { return m_d_instanceNormalTransforms; }
+    const uint32_t* getInstanceMaterialIndices() const { return m_d_instanceMaterialIndices; }
+
     // Clear all scene data
     void clear();
 
@@ -85,6 +90,11 @@ public:
 
     // Build/update SBT with scene materials
     bool updateSBT();
+
+    // Fast-path: patch the SBT records + material array for every GAS using
+    // this material, without rebuilding the SBT. Returns false if a full
+    // rebuild is required (e.g. alphaMode changed) or nothing matched.
+    bool updateMaterialRecords(MaterialHandle handle, cudaStream_t stream);
 
 private:
     bool buildGAS(const GpuGeometry* geom, GasInfo& gas);
@@ -114,6 +124,12 @@ private:
     CUdeviceptr* m_d_vertexBuffers = nullptr;
     CUdeviceptr* m_d_indexBuffers = nullptr;
     size_t m_bufferArraySize = 0;
+
+    // Per-instance data for raygen-side shading: 3x4 object->world transform,
+    // 3x4 inverse-transpose (normal) transform, and material slot index
+    float* m_d_instanceTransforms = nullptr;
+    float* m_d_instanceNormalTransforms = nullptr;
+    uint32_t* m_d_instanceMaterialIndices = nullptr;
 
     // Temporary buffers for BVH building
     CUdeviceptr m_tempBuffer = 0;

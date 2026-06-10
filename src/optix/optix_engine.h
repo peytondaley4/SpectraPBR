@@ -72,11 +72,38 @@ public:
     // Set geometry buffers for shader access
     void setGeometryBuffers(CUdeviceptr* vertexBuffers, CUdeviceptr* indexBuffers);
 
-    // Build/update SBT with materials
+    // Per-instance data for raygen-side shading (device pointers, indexed by
+    // instance ID): transforms (12 floats), inverse-transpose normal
+    // transforms (12 floats), and instance -> material slot indices.
+    void setInstanceData(const float* transforms,
+                         const float* normalTransforms,
+                         const uint32_t* materialIndices);
+
+    // Instance -> area light index map (device pointer, UINT32_MAX = no light)
+    void setInstanceLightIndices(const uint32_t* lightIndices);
+
+    // Mesh-light triangle buffer (device pointer, 3 float4 per triangle)
+    void setAreaLightTriangles(const float4* tris);
+
+    // Environment selection weight for the NEE light pick
+    void setEnvSelectionWeight(float weight);
+
+    // Maximum path length (vertices after the camera)
+    void setMaxBounceDepth(uint32_t depth);
+    uint32_t getMaxBounceDepth() const { return m_launchParams.max_bounce_depth; }
+
+    // Build/update SBT with materials. Also uploads the material array for
+    // raygen-side shading and selects alpha-test hit groups per material.
     // materials: array of GpuMaterial for each hit group
     // geometryIndices: geometry index per material for buffer lookup
     bool buildSBT(const std::vector<GpuMaterial>& materials,
                   const std::vector<uint32_t>& geometryIndices);
+
+    // Fast-path update of a single material slot (SBT records + material
+    // array) without rebuilding the whole SBT. Returns false when the change
+    // affects hit-group selection (alphaMode) — caller must do a full rebuild.
+    bool updateMaterialRecord(uint32_t materialSlot, const GpuMaterial& material,
+                              cudaStream_t stream);
 
     // Render to output buffer
     // outputBuffer: CUDA device pointer to float4 array
@@ -133,8 +160,6 @@ public:
     // Path guide grid (sparse + staging)
     void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
         const PathGuideStagingDescriptor* staging);
-    void setPathGuideGridDebug(bool visualize, uint32_t level);
-    void setPathGuideNoJitter(bool noJitter);
     void setPathGuideEnabled(bool enabled);
     void setPathGuideMISWeight(float weight);
     void setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel);
@@ -170,15 +195,12 @@ private:
 
     // Program groups
     OptixProgramGroup m_raygenPG = nullptr;
-    OptixProgramGroup m_missPG = nullptr;           // Radiance miss (background)
+    OptixProgramGroup m_missPG = nullptr;           // Radiance miss (hit-info "no hit")
     OptixProgramGroup m_missShadowPG = nullptr;     // Shadow miss (visibility)
-    OptixProgramGroup m_missBouncePG = nullptr;     // Indirect bounce miss (background)
     OptixProgramGroup m_hitgroupPG = nullptr;       // Radiance hit (opaque)
     OptixProgramGroup m_hitgroupShadowPG = nullptr; // Shadow hit (opaque)
-    OptixProgramGroup m_hitgroupBouncePG = nullptr; // Indirect bounce hit (opaque, lightweight)
     OptixProgramGroup m_hitgroupAlphaPG = nullptr;  // Radiance hit (alpha tested)
     OptixProgramGroup m_hitgroupShadowAlphaPG = nullptr; // Shadow hit (alpha tested)
-    OptixProgramGroup m_hitgroupBounceAlphaPG = nullptr; // Indirect bounce hit (alpha tested)
 
     // Shader Binding Table
     OptixShaderBindingTable m_sbt = {};
@@ -186,6 +208,11 @@ private:
     CUdeviceptr m_missRecord = 0;
     CUdeviceptr m_hitgroupRecords = 0;
     size_t m_hitgroupRecordCount = 0;
+
+    // Device material array for raygen-side shading (mirrors SBT materials)
+    CUdeviceptr m_materialsBuffer = 0;
+    size_t m_materialsBufferCapacity = 0;   // in materials
+    std::vector<uint32_t> m_materialAlphaModes;  // per slot, for fast-path updates
 
     // Launch parameters
     LaunchParams m_launchParams = {};

@@ -95,9 +95,11 @@ bool Application::init() {
         std::cerr << "[App] Path guide grid init failed (non-fatal)\n";
         m_pathGuideGrid.reset();
     } else {
-        // Initialize async readback pipeline (double-buffered, non-blocking builds)
+        // Initialize async readback pipeline (double-buffered, non-blocking
+        // builds). Required for structure builds and refinement; without it
+        // the guide stays empty and rendering falls back to pure BSDF sampling.
         if (!m_pathGuideGrid->initAsync()) {
-            std::cerr << "[App] Path guide async init failed (falling back to sync)\n";
+            std::cerr << "[App] Path guide async init failed (guiding unavailable)\n";
         }
     }
 
@@ -332,6 +334,12 @@ bool Application::loadScene() {
         uint32_t globalInstanceId = 0;
         bool anyLoaded = false;
 
+        // Mesh-light extraction: world-space triangles of emissive meshes
+        // (3 float4 per triangle; tri[0].w = per-light cumulative area CDF,
+        // tri[1].w = triangle area) and instance -> light index map.
+        std::vector<float4> lightTris;
+        std::vector<std::pair<uint32_t, uint32_t>> instanceLightPairs; // (instanceId, lightIdx)
+
         // Track scene bounding box for camera auto-fit
         glm::vec3 sceneMin(std::numeric_limits<float>::max());
         glm::vec3 sceneMax(std::numeric_limits<float>::lowest());
@@ -387,22 +395,33 @@ bool Application::loadScene() {
 
                     uint32_t gasIndex = m_sceneManager->addMesh(mesh);
                     if (gasIndex != UINT32_MAX) {
+                        uint32_t thisInstanceId = globalInstanceId;
                         m_sceneManager->addInstance(gasIndex, instance.transform);
-                        std::string name = "Instance " + std::to_string(globalInstanceId);
-                        m_sceneHierarchy->addInstance(modelNodeIdx, instance.meshIndex, globalInstanceId, name);
+                        std::string name = "Instance " + std::to_string(thisInstanceId);
+                        m_sceneHierarchy->addInstance(modelNodeIdx, instance.meshIndex, thisInstanceId, name);
                         globalInstanceId++;
 
-                        // Extract area light from emissive meshes
+                        // Mesh light from emissive meshes: keep the ACTUAL
+                        // triangles so NEE samples the real surface (the old
+                        // centroid+rectangle proxy sampled points that are not
+                        // on the mesh) and so the emission can be MIS-paired
+                        // with BSDF hits on the same geometry. Meshes with an
+                        // emissive TEXTURE are skipped: NEE would evaluate the
+                        // wrong (constant) emission, so those emit via path
+                        // hits only — unbiased, just noisier.
                         const auto& srcMesh = model->meshes[instance.meshIndex];
                         uint32_t origMatIdx = srcMesh.materialIndex;
-                        if (origMatIdx < model->materials.size()) {
+                        if (origMatIdx < model->materials.size() &&
+                            model->materials[origMatIdx].emissiveTexPath.empty()) {
                             const float3& em = model->materials[origMatIdx].emissive;
                             if (em.x + em.y + em.z > 0.01f) {
                                 const float* t = instance.transform;
                                 const auto& verts = srcMesh.vertices;
                                 const auto& idxs  = srcMesh.indices;
 
-                                // Accumulate centroid, area-weighted normal, and total area
+                                uint32_t triOffset = static_cast<uint32_t>(lightTris.size() / 3);
+                                size_t firstTri = lightTris.size();
+
                                 glm::vec3 centroid(0.0f);
                                 glm::vec3 weightedNormal(0.0f);
                                 float totalArea = 0.0f;
@@ -419,40 +438,59 @@ bool Application::loadScene() {
                                     }
                                     glm::vec3 e1 = lp[1] - lp[0];
                                     glm::vec3 e2 = lp[2] - lp[0];
-                                    glm::vec3 cross = glm::cross(e1, e2);
-                                    float triArea = glm::length(cross) * 0.5f;
+                                    glm::vec3 cr = glm::cross(e1, e2);
+                                    float triArea = glm::length(cr) * 0.5f;
+                                    if (triArea <= 1e-12f) continue;
                                     totalArea += triArea;
-                                    weightedNormal += cross; // length = 2*area, acts as area weight
+                                    weightedNormal += cr;
                                     centroid += (lp[0] + lp[1] + lp[2]) * triArea;
+
+                                    lightTris.push_back(make_float4(lp[0].x, lp[0].y, lp[0].z, 0.0f)); // w = CDF (fixed up below)
+                                    lightTris.push_back(make_float4(lp[1].x, lp[1].y, lp[1].z, triArea));
+                                    lightTris.push_back(make_float4(lp[2].x, lp[2].y, lp[2].z, 0.0f));
                                 }
 
-                                if (totalArea > 1e-8f) {
+                                uint32_t triCount = static_cast<uint32_t>((lightTris.size() - firstTri) / 3);
+                                if (totalArea > 1e-8f && triCount > 0) {
+                                    // Per-light cumulative area CDF in tri[0].w
+                                    float cumulative = 0.0f;
+                                    for (uint32_t ti = 0; ti < triCount; ti++) {
+                                        cumulative += lightTris[firstTri + ti * 3 + 1].w / totalArea;
+                                        lightTris[firstTri + ti * 3].w = cumulative;
+                                    }
+                                    lightTris[firstTri + (triCount - 1) * 3].w = 1.0f;
+
                                     centroid /= (totalArea * 3.0f);
                                     glm::vec3 avgNormal = glm::normalize(weightedNormal);
-
-                                    // Build tangent perpendicular to normal
                                     glm::vec3 up = (std::abs(avgNormal.y) < 0.99f)
                                         ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
                                     glm::vec3 tangent = glm::normalize(glm::cross(up, avgNormal));
-
                                     float sideLen = std::sqrt(totalArea);
 
-                                    GpuAreaLight light;
+                                    GpuAreaLight light = {};
                                     light.position = make_float3(centroid.x, centroid.y, centroid.z);
                                     light.normal   = make_float3(avgNormal.x, avgNormal.y, avgNormal.z);
                                     light.tangent  = make_float3(tangent.x, tangent.y, tangent.z);
                                     light.emission = em;
                                     light.area     = totalArea;
                                     light.size     = make_float2(sideLen, sideLen);
+                                    light.triOffset = triOffset;
+                                    light.triCount  = triCount;
+                                    light.instanceId = thisInstanceId;
 
                                     uint32_t lightIdx = static_cast<uint32_t>(m_lightManager->getAreaLightCount());
                                     m_lightManager->addAreaLight(light);
+                                    instanceLightPairs.push_back({ thisInstanceId, lightIdx });
                                     std::string lightName = "Emissive " + std::to_string(lightIdx);
                                     m_sceneHierarchy->addAreaLight(lightIdx, lightName);
 
-                                    std::cout << "[App] Emissive mesh -> area light (emission: ["
+                                    std::cout << "[App] Emissive mesh -> mesh light (emission: ["
                                               << em.x << ", " << em.y << ", " << em.z
-                                              << "], area: " << totalArea << ")\n";
+                                              << "], area: " << totalArea
+                                              << ", tris: " << triCount << ")\n";
+                                } else {
+                                    // No usable triangles — drop the partial data
+                                    lightTris.resize(firstTri);
                                 }
                             }
                         }
@@ -468,6 +506,38 @@ bool Application::loadScene() {
             m_optixEngine->setSceneHandle(m_sceneManager->getSceneHandle());
             m_optixEngine->setGeometryBuffers(m_sceneManager->getVertexBuffers(),
                                                m_sceneManager->getIndexBuffers());
+            // Per-instance transforms + material slots for raygen-side shading
+            m_optixEngine->setInstanceData(
+                m_sceneManager->getInstanceTransforms(),
+                m_sceneManager->getInstanceNormalTransforms(),
+                m_sceneManager->getInstanceMaterialIndices());
+
+            // Mesh-light triangle buffer + instance -> light index map (for
+            // NEE <-> BSDF MIS on emissive geometry)
+            if (!lightTris.empty()) {
+                cudaMalloc(reinterpret_cast<void**>(&m_areaLightTris),
+                           lightTris.size() * sizeof(float4));
+                cudaMemcpy(m_areaLightTris, lightTris.data(),
+                           lightTris.size() * sizeof(float4), cudaMemcpyHostToDevice);
+                m_optixEngine->setAreaLightTriangles(m_areaLightTris);
+            }
+            {
+                std::vector<uint32_t> instanceLightIndices(
+                    m_sceneManager->getInstanceCount(), UINT32_MAX);
+                for (const auto& pair : instanceLightPairs) {
+                    if (pair.first < instanceLightIndices.size()) {
+                        instanceLightIndices[pair.first] = pair.second;
+                    }
+                }
+                if (!instanceLightIndices.empty()) {
+                    cudaMalloc(reinterpret_cast<void**>(&m_instanceLightIndices),
+                               instanceLightIndices.size() * sizeof(uint32_t));
+                    cudaMemcpy(m_instanceLightIndices, instanceLightIndices.data(),
+                               instanceLightIndices.size() * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice);
+                    m_optixEngine->setInstanceLightIndices(m_instanceLightIndices);
+                }
+            }
 
             // Auto-fit camera to scene bounding box
             glm::vec3 center = (sceneMin + sceneMax) * 0.5f;
@@ -561,7 +631,8 @@ void Application::setupDefaultScene() {
 
     if (!hdrPath.empty() && std::filesystem::exists(hdrPath)) {
         if (m_environmentMap->loadFromFile(hdrPath.string())) {
-            m_optixEngine->setEnvironmentMap(m_environmentMap->getTexture(), 1.0f);
+            const float envIntensity = 1.0f;
+            m_optixEngine->setEnvironmentMap(m_environmentMap->getTexture(), envIntensity);
             m_optixEngine->setEnvironmentCDF(
                 m_environmentMap->getConditionalCDF(),
                 m_environmentMap->getMarginalCDF(),
@@ -569,7 +640,18 @@ void Application::setupDefaultScene() {
                 m_environmentMap->getHeight(),
                 m_environmentMap->getTotalLuminance()
             );
-            std::cout << "[App] Environment map loaded\n";
+            // Selection weight of the environment in the NEE light pick:
+            // total incident radiance integral. The CDF total is
+            // sum(lum * sin(theta)) over texels; the solid-angle integral is
+            // that times 2*pi^2 / (W*H) (equirectangular texel solid angle).
+            float w = m_environmentMap->getWidth() > 0 && m_environmentMap->getHeight() > 0
+                ? envIntensity * m_environmentMap->getTotalLuminance() *
+                  (2.0f * 3.14159265f * 3.14159265f) /
+                  (static_cast<float>(m_environmentMap->getWidth()) *
+                   static_cast<float>(m_environmentMap->getHeight()))
+                : 0.0f;
+            m_optixEngine->setEnvSelectionWeight(w);
+            std::cout << "[App] Environment map loaded (selection weight " << w << ")\n";
         }
     }
 }
@@ -610,12 +692,15 @@ void Application::wireUICallbacks() {
         // Update the material's scalar properties (preserves texture handles)
         m_materialManager->updateMaterial(matHandle, material);
 
-        // Synchronize render stream before SBT rebuild — updateSBT frees and
-        // reallocates GPU memory, which is unsafe while optixLaunch is in flight.
-        m_cudaInterop->synchronize();
-
-        // Rebuild SBT so the GPU sees the new material values
-        m_sceneManager->updateSBT();
+        // Fast path: patch the affected SBT records in place (stream-ordered,
+        // no pipeline stall — slider drags no longer hitch). Falls back to a
+        // full SBT rebuild when hit-group selection changes (alphaMode).
+        if (!m_sceneManager->updateMaterialRecords(matHandle, m_cudaInterop->getStream())) {
+            // Synchronize render stream before SBT rebuild — updateSBT frees
+            // and reallocates GPU memory, unsafe while optixLaunch is in flight.
+            m_cudaInterop->synchronize();
+            m_sceneManager->updateSBT();
+        }
 
         // Reset accumulation so the new material is immediately visible
         m_optixEngine->resetAccumulation();
@@ -795,9 +880,11 @@ void Application::renderFrame() {
 
     m_displayIdx = (m_writeIdx + 1) % 3;
 
-    // ═══ PHASE 1: BUILD THREAD CHECK (render stream is idle, safe for sync) ═══
-    // finishBuildFromReadback does hashing, sorting, vMF fitting (10-300ms CPU).
-    // Running it on a background thread lets the GPU render continuously.
+    // ═══ PHASE 1: BUILD THREAD CHECK ═══
+    // finishBuildFromReadback only manages the cell SET now (dedup + sort +
+    // hash build — lobe fitting happens on-device via refitLobes). It is
+    // cheap, but still runs on a background thread so cell-set growth never
+    // blocks the render loop.
 
     // Step 1: Check if background build thread completed
     if (m_buildThreadActive) {
@@ -881,11 +968,12 @@ void Application::renderFrame() {
     { auto tNow = diagT(); diagAccum[0] += diagMs(tPrev, tNow); tPrev = tNow; }
 
     // ═══ PHASE 2: DISPLAY PREVIOUS FRAME ═══
-    // On Windows WDDM, glTexSubImage2D on a CUDA-registered PBO triggers an
-    // implicit full-device sync. cudaStreamSynchronize is much faster because it
-    // returns as soon as the GPU finishes, without WDDM driver overhead.
-    // This wait IS the GPU render time — it's the minimum possible wait.
-    m_cudaInterop->synchronize();
+    // Wait only for the buffer being DISPLAYED (event recorded after its
+    // unmap), not the whole render stream. The displayed buffer is 2 frames
+    // old, so this wait is usually zero and the triple buffer can actually
+    // keep more than one frame in flight. (cudaEventSynchronize on a
+    // never-recorded event returns immediately, so warmup frames are safe.)
+    m_cudaInterop->waitForRender(m_displayIdx);
 
     // [DIAG] syncRdr (time spent waiting for previous frame's GPU render)
     { auto tNow = diagT(); diagAccum[1] += diagMs(tPrev, tNow); tPrev = tNow; }
@@ -977,9 +1065,12 @@ void Application::renderFrame() {
 
     // ═══ PHASE 3: PATH GUIDE SETUP ═══
     m_buildThisFrame = false;
-    uint32_t savedSpp = 0;
     if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
-        // Determine if we should build this frame (only if no build in flight)
+        bool training = (m_pathGuideMode == PathGuideMode::Running ||
+                         m_pathGuideMode == PathGuideMode::StepOnce);
+
+        // Determine if we should run a STRUCTURE build this frame (staging ->
+        // new cells). Lobe refitting is separate and happens on-device below.
         if (!m_pathGuideBuildInFlight) {
             if (m_pathGuideMode == PathGuideMode::Running &&
                 m_pathGuideTrainingFrameCount >= m_pathGuideAutoBuildInterval) {
@@ -989,22 +1080,27 @@ void Application::renderFrame() {
             }
         }
 
+        // Device-side lobe refit: fold interval sums into cumulative sums and
+        // refit vMF lobes in place — a tiny kernel on the render stream,
+        // replacing the old CPU fit + full readback/upload round trip. Lobes
+        // only change between launches, so sampling PDFs stay consistent
+        // within each frame.
+        if (training && m_pathGuideGrid->hasSparseData() &&
+            (m_pathGuideTrainingFrameCount % m_pathGuideRefitInterval) == 0) {
+            m_pathGuideGrid->refitLobes(
+                m_optixEngine->getFrameIndex(),
+                m_cudaInterop ? m_cudaInterop->getStream() : nullptr);
+        }
+
         // Use render descriptor (stable, not being mutated by build)
         SparsePathGuideDescriptor sparseDesc = m_pathGuideGrid->getRenderDescriptor();
         PathGuideStagingDescriptor stagingDesc = m_pathGuideGrid->getStagingDescriptor();
         m_optixEngine->setPathGuideGridDescriptor(&sparseDesc, &stagingDesc);
-        m_optixEngine->setPathGuideGridDebug(m_debugGridVisualize, m_debugGridLevel);
         const auto& config = m_pathGuideGrid->getConfig();
         m_optixEngine->setPathGuideLevelConfig(config.start_level, config.min_level, config.max_level);
 
-        m_optixEngine->setPathGuideNoJitter(false);
-        if (m_buildThisFrame) {
-            savedSpp = m_optixEngine->getSamplesPerPixel();
-            m_optixEngine->setSamplesPerPixel(1);
-        }
-
         // Increment training frame counter when actively training
-        if (m_pathGuideMode == PathGuideMode::Running || m_pathGuideMode == PathGuideMode::StepOnce) {
+        if (training) {
             m_pathGuideTrainingFrameCount++;
         }
     } else {
@@ -1024,17 +1120,14 @@ void Application::renderFrame() {
 
     m_optixEngine->render(devicePtr, m_cudaInterop->getStream());
 
-    // Restore SPP if we changed it for the build
-    if (savedSpp > 0) {
-        m_optixEngine->setSamplesPerPixel(savedSpp);
-    }
-
     // [DIAG] render
     { auto tNow = diagT(); diagAccum[7] += diagMs(tPrev, tNow); tPrev = tNow; }
 
-    // Record event + unmap: both stream-ordered, no CPU block
-    m_cudaInterop->recordRenderComplete(m_writeIdx);
+    // Unmap, THEN record the event: the display path waits on this event
+    // before glTexSubImage2D, so it must cover the unmap (GL may not touch a
+    // PBO that is still CUDA-mapped). Both calls are stream-ordered.
     m_cudaInterop->unmapBuffer(m_writeIdx);
+    m_cudaInterop->recordRenderComplete(m_writeIdx);
 
     // [DIAG] unmapEvt
     { auto tNow = diagT(); diagAccum[8] += diagMs(tPrev, tNow); tPrev = tNow; }
@@ -1101,6 +1194,14 @@ void Application::shutdown() {
     if (m_accumulationBuffer) {
         cudaFree(m_accumulationBuffer);
         m_accumulationBuffer = nullptr;
+    }
+    if (m_areaLightTris) {
+        cudaFree(m_areaLightTris);
+        m_areaLightTris = nullptr;
+    }
+    if (m_instanceLightIndices) {
+        cudaFree(m_instanceLightIndices);
+        m_instanceLightIndices = nullptr;
     }
 }
 
@@ -1344,24 +1445,37 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                 info.iz = cellResult.iz;
                 std::memcpy(info.cellAABBMin, cellResult.aabbMin, sizeof(float) * 3);
                 std::memcpy(info.cellAABBMax, cellResult.aabbMax, sizeof(float) * 3);
-                // vMF lobes
-                info.theta0 = cellResult.data[0];
-                info.phi0 = cellResult.data[1];
-                info.kappa0 = cellResult.data[2];
-                info.theta1 = cellResult.data[3];
-                info.phi1 = cellResult.data[4];
-                info.kappa1 = cellResult.data[5];
-                // Stats (offsets 6-11)
-                info.sumW = cellResult.data[9];
-                float sumX = cellResult.data[6], sumY = cellResult.data[7], sumZ = cellResult.data[8];
+                // Single vMF lobe stored as mean vector + kappa
+                // (layout: see path_guide_grid.h PG_* offsets)
+                float mx = cellResult.data[PG_MU_X];
+                float my = cellResult.data[PG_MU_Y];
+                float mz = cellResult.data[PG_MU_Z];
+                float mlen = std::sqrt(mx*mx + my*my + mz*mz);
+                if (mlen > 1e-8f) {
+                    info.theta0 = std::acos(std::max(-1.0f, std::min(1.0f, my / mlen)));
+                    info.phi0 = std::atan2(mz, mx);
+                    if (info.phi0 < 0.0f) info.phi0 += 6.28318530718f;
+                } else {
+                    info.theta0 = 0.0f;
+                    info.phi0 = 0.0f;
+                }
+                info.kappa0 = cellResult.data[PG_KAPPA];
+                info.theta1 = 0.0f;
+                info.phi1 = 0.0f;
+                info.kappa1 = 0.0f;
+                info.pi0 = 1.0f;
+                // Cumulative (EMA lifetime) stats
+                info.sumW = cellResult.data[PG_CUM_SUM_W];
+                float sumX = cellResult.data[PG_CUM_SUM_X];
+                float sumY = cellResult.data[PG_CUM_SUM_Y];
+                float sumZ = cellResult.data[PG_CUM_SUM_Z];
                 float meanLen = (info.sumW > 1e-9f)
                     ? std::sqrt(sumX*sumX + sumY*sumY + sumZ*sumZ) / info.sumW
                     : 0.0f;
                 info.variance = 1.0f - meanLen;
-                info.pi0 = cellResult.data[10];
-                info.lastFrame = cellResult.data[11];
+                info.lastFrame = cellResult.data[PG_LAST_HIT_FRAME];
 
-                // Determine subdivision/coarsening status
+                // Determine subdivision/coarsening status (display heuristic)
                 const auto& config = app->m_pathGuideGrid->getConfig();
                 info.wouldSubdivide = (cellResult.level < config.max_level &&
                     info.sumW >= config.subdivide_sample_threshold &&

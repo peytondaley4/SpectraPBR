@@ -141,6 +141,8 @@ private:
 
     // Buffers
     float4* m_accumulationBuffer = nullptr;
+    float4* m_areaLightTris = nullptr;          // Mesh-light triangles (device)
+    uint32_t* m_instanceLightIndices = nullptr; // instance -> area light index (device)
 
     // Scene bounds (world space, computed during loadScene)
     glm::vec3 m_sceneMin = glm::vec3(0.0f);
@@ -182,7 +184,8 @@ private:
     };
     PathGuideMode m_pathGuideMode = PathGuideMode::Disabled;
     uint32_t m_pathGuideTrainingFrameCount = 0;
-    uint32_t m_pathGuideAutoBuildInterval = 8;  // Rebuild every N frames (Müller et al. recommend frequent rebuilds)
+    uint32_t m_pathGuideAutoBuildInterval = 8;  // Structure rebuild check every N frames
+    uint32_t m_pathGuideRefitInterval = 4;      // Device-side lobe refit every N frames
     uint32_t m_pathGuideTotalBuilds = 0;
     bool m_buildThisFrame = false;
     bool m_pathGuideBuildInFlight = false;

@@ -4,50 +4,35 @@
 #include <cuda_runtime.h>
 
 //------------------------------------------------------------------------------
-// Ray Payload Structure
-// Using 4 payload slots for color (RGB) and hit distance
+// Radiance Ray Payload (5 registers)
+//
+// The path tracer is iterative: closest-hit only reports WHERE the ray hit,
+// and raygen does all shading. Payload layout:
+//   p0 = hit distance t (float bits, negative = miss)
+//   p1 = instance ID
+//   p2 = primitive index
+//   p3 = barycentric u (float bits)
+//   p4 = barycentric v (float bits)
+//
+// Shadow rays use a single register: p0 = occluded (init 1, miss writes 0).
 //------------------------------------------------------------------------------
-struct RayPayload {
-    float3 color;
-    float hitDistance;
+
+struct HitInfo {
+    float t;                 // < 0 means miss
+    unsigned int instanceId;
+    unsigned int primIdx;
+    float baryU;
+    float baryV;
 };
 
-//------------------------------------------------------------------------------
-// Payload Packing/Unpacking
-// OptiX uses 32-bit payload registers, so we pack/unpack floats
-//------------------------------------------------------------------------------
-__forceinline__ __device__ void setPayloadColor(const float3& color) {
-    optixSetPayload_0(__float_as_uint(color.x));
-    optixSetPayload_1(__float_as_uint(color.y));
-    optixSetPayload_2(__float_as_uint(color.z));
-}
-
-__forceinline__ __device__ void setPayloadHitDistance(float dist) {
-    optixSetPayload_3(__float_as_uint(dist));
-}
-
-__forceinline__ __device__ void setPayloadInstanceId(unsigned int instanceId) {
-    optixSetPayload_4(instanceId);
-}
-
-__forceinline__ __device__ void setPayloadDepth(unsigned int depth) {
-    optixSetPayload_5(depth);
-}
-
-__forceinline__ __device__ unsigned int getPayloadDepth() {
-    return optixGetPayload_5();
-}
-
-__forceinline__ __device__ float3 getPayloadColor() {
-    return make_float3(
-        __uint_as_float(optixGetPayload_0()),
-        __uint_as_float(optixGetPayload_1()),
-        __uint_as_float(optixGetPayload_2())
-    );
-}
-
-__forceinline__ __device__ float getPayloadHitDistance() {
-    return __uint_as_float(optixGetPayload_3());
+__forceinline__ __device__ void setPayloadHitInfo(
+    float t, unsigned int instanceId, unsigned int primIdx, float baryU, float baryV)
+{
+    optixSetPayload_0(__float_as_uint(t));
+    optixSetPayload_1(instanceId);
+    optixSetPayload_2(primIdx);
+    optixSetPayload_3(__float_as_uint(baryU));
+    optixSetPayload_4(__float_as_uint(baryV));
 }
 
 //------------------------------------------------------------------------------
@@ -164,48 +149,28 @@ __forceinline__ __device__ float4 operator-(const float4& a, const float4& b) {
 }
 
 //------------------------------------------------------------------------------
-// Transform helpers
+// Instance transform helpers (3x4 row-major matrices stored as 12 floats)
 //------------------------------------------------------------------------------
-__forceinline__ __device__ float3 transformPoint(const float* matrix, const float3& p) {
-    // matrix is 3x4 row-major
+__forceinline__ __device__ float3 transformPoint(const float* m, const float3& p) {
     return make_float3(
-        matrix[0] * p.x + matrix[1] * p.y + matrix[2] * p.z + matrix[3],
-        matrix[4] * p.x + matrix[5] * p.y + matrix[6] * p.z + matrix[7],
-        matrix[8] * p.x + matrix[9] * p.y + matrix[10] * p.z + matrix[11]
+        m[0] * p.x + m[1] * p.y + m[2]  * p.z + m[3],
+        m[4] * p.x + m[5] * p.y + m[6]  * p.z + m[7],
+        m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]
     );
 }
 
-__forceinline__ __device__ float3 transformNormal(const float* matrix, const float3& n) {
-    // For normals, we need the inverse transpose
-    // For orthonormal rotation matrices, this is just the rotation part
-    return normalize(make_float3(
-        matrix[0] * n.x + matrix[4] * n.y + matrix[8] * n.z,
-        matrix[1] * n.x + matrix[5] * n.y + matrix[9] * n.z,
-        matrix[2] * n.x + matrix[6] * n.y + matrix[10] * n.z
-    ));
-}
-
-//------------------------------------------------------------------------------
-// Color helpers
-//------------------------------------------------------------------------------
-__forceinline__ __device__ float3 srgbToLinear(const float3& srgb) {
-    // Simplified sRGB to linear conversion
+// Linear part only (directions / tangents)
+__forceinline__ __device__ float3 transformVector(const float* m, const float3& v) {
     return make_float3(
-        powf(srgb.x, 2.2f),
-        powf(srgb.y, 2.2f),
-        powf(srgb.z, 2.2f)
+        m[0] * v.x + m[1] * v.y + m[2]  * v.z,
+        m[4] * v.x + m[5] * v.y + m[6]  * v.z,
+        m[8] * v.x + m[9] * v.y + m[10] * v.z
     );
 }
 
-__forceinline__ __device__ float3 linearToSrgb(const float3& linear) {
-    // Simplified linear to sRGB conversion
-    return make_float3(
-        powf(linear.x, 1.0f / 2.2f),
-        powf(linear.y, 1.0f / 2.2f),
-        powf(linear.z, 1.0f / 2.2f)
-    );
-}
-
+//------------------------------------------------------------------------------
+// Scalar helpers
+//------------------------------------------------------------------------------
 __forceinline__ __device__ float clamp(float x, float lo, float hi) {
     return fminf(hi, fmaxf(lo, x));
 }
@@ -216,6 +181,12 @@ __forceinline__ __device__ float3 clamp(const float3& v, float lo, float hi) {
         clamp(v.y, lo, hi),
         clamp(v.z, lo, hi)
     );
+}
+
+// Rec. 709 luminance — the single shared definition used by light selection,
+// guide training, and RR. Host code (LightManager::syncToGpu) must match.
+__forceinline__ __device__ float luminance3(const float3& c) {
+    return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
 }
 
 //------------------------------------------------------------------------------
@@ -263,13 +234,14 @@ __forceinline__ __device__ float2 randomFloat2(unsigned int& seed) {
 }
 
 // R2 low-discrepancy sequence (Generalized Golden Ratio, Roberts 2018).
-// Returns 2D point in [0,1)^2 with excellent coverage over N frames.
-// Much faster AA convergence than white noise for progressive rendering.
+// Computed in 32-bit fixed point: n * frac(a) mod 2^32 wraps exactly, so the
+// sequence never degrades for large n (float fmodf loses low bits past ~10^5
+// frames, which matters for long accumulation runs).
+//   a1 = 1/g  = 0.7548776662  -> round(a1 * 2^32) = 3242174889
+//   a2 = 1/g^2 = 0.5698402910 -> round(a2 * 2^32) = 2447445414
+// where g = 1.32471795724 (plastic constant, real root of x^3 = x + 1).
 __forceinline__ __device__ float2 r2Sequence(unsigned int n) {
-    const float g  = 1.32471795724f;  // plastic constant: real root of x^3 = x + 1
-    const float a1 = 1.0f / g;        // ~0.7549
-    const float a2 = 1.0f / (g * g);  // ~0.5699
-    float u = fmodf(0.5f + a1 * (float)n, 1.0f);
-    float v = fmodf(0.5f + a2 * (float)n, 1.0f);
-    return make_float2(u, v);
+    unsigned int u = n * 3242174889u;
+    unsigned int v = n * 2447445414u;
+    return make_float2(hashToFloat(u), hashToFloat(v));
 }

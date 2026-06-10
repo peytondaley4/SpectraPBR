@@ -1,67 +1,61 @@
 #pragma once
 
 //------------------------------------------------------------------------------
-// Sparse path guide grid — device-side (collision-free, binary search lookup)
-// Layout must match path_guide_grid.h. Used from raygen and closesthit.
+// Sparse path guide grid — device-side (collision-free, hash lookup)
+// Layout must match src/rendering/path_guide_grid.h. Used from raygen.
 //
-// Path guiding: per-cell mixture of 2 von Mises–Fisher (vMF) lobes for
-// importance sampling of directions. References:
+// Path guiding: one von Mises–Fisher (vMF) lobe per cell for importance
+// sampling of incident radiance. References:
 //   - Müller et al., "Practical Path Guiding for Efficient Light-Transport
 //     Simulation", EGSR 2017 (Computer Graphics Forum).
-//   - Von Mises–Fisher distribution: Wikipedia; sampling via Wood/Ulrich:
-//     w = 1 + (1/κ)*ln(ξ + (1-ξ)*exp(-2κ)), then orthonormal tangent + v on circle.
+//   - Von Mises–Fisher distribution; sampling via Wood/Ulrich.
+//
+// A single lobe per cell is deliberate: the aggregate sums (sumX/Y/Z/W) the
+// shaders accumulate are sufficient statistics for ONE vMF lobe only — they
+// cannot separate the modes of a genuinely bimodal distribution, so a second
+// lobe fit from the same sums never represented real bimodality (it only
+// reacted to temporal lighting changes). Spatial subdivision (refinement)
+// handles multimodal regions instead; the BSDF leg of the MIS covers the
+// rest. A future per-lobe-statistics online EM can reintroduce mixtures.
 //------------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
 #include "vmf_device.h"
 
-// ─── Cell data layout (named offsets) ───────────────────────────────────────
-// Every field access uses a named constant — no magic numbers.
+// ─── Cell data layout (named offsets, 16 floats = 64 bytes per cell) ─────────
 //
-//  [0-2]:  lobe 0 (theta, phi, kappa)
-//  [3-5]:  lobe 1 (theta, phi, kappa)     kappa ≤ 0 → lobe inactive
-//  [6]:    mixture weight pi_0 (lobe 0 weight; 1-pi_0 = lobe 1 weight)
-//  [7-10]: interval stats (sumX, sumY, sumZ, sumW)  — zeroed after each build
-//  [11]:   lastHitFrame
+//  [0-2]:  fitted vMF mean direction mu (unit vector); written by refit kernel
+//  [3]:    fitted vMF kappa; <= 0 means no valid lobe yet
+//  [4-7]:  interval sums (sumX, sumY, sumZ, sumW) — atomicAdd from shaders,
+//          consumed and zeroed by the device refit kernel
+//  [8-11]: cumulative sums — EMA-decayed lifetime totals, owned by the refit
+//          kernel (never touched by shaders)
+//  [12]:   lastHitFrame — atomicMax (positive floats sort like ints)
+//  [13]:   interval deposit count — atomicAdd 1 per deposit
+//  [14]:   cumulative deposit count — EMA-decayed, owned by refit kernel
+//  [15]:   reserved
 //
-//  Total: 12 floats per cell (unchanged from previous layout)
-//  Ready for 4-lobe extension: would expand lobes [0-11], weights [12-15],
-//  stats [16-19], meta [20-21] = 22 floats.
-// ────────────────────────────────────────────────────────────────────────────
+// The hot fields for sampling (mu + kappa) are the first 16 bytes, so the
+// sampling/PDF path touches a single aligned segment per cell.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Per-lobe field count
-#define PG_FLOATS_PER_LOBE   3
-
-// Lobe 0: theta, phi, kappa
-#define PG_LOBE0_THETA       0
-#define PG_LOBE0_PHI         1
-#define PG_LOBE0_KAPPA       2
-
-// Lobe 1: theta, phi, kappa
-#define PG_LOBE1_THETA       3
-#define PG_LOBE1_PHI         4
-#define PG_LOBE1_KAPPA       5
-
-// Interval statistics (accumulated via atomicAdd on GPU, consumed by CPU build)
-#define PG_STAT_SUM_X        6
-#define PG_STAT_SUM_Y        7
-#define PG_STAT_SUM_Z        8
-#define PG_STAT_SUM_W        9
-
-// Mixture weight and metadata
-#define PG_MIX_WEIGHT        10
-#define PG_LAST_HIT_FRAME    11
-
-// Aggregate constants
-#define PG_NUM_LOBES               2
-#define PG_VMF_FLOATS              6    // PG_NUM_LOBES * PG_FLOATS_PER_LOBE
-#define PG_ENTRY_STRIDE            12
-// Legacy aliases for compatibility with CPU-side constants
-#define PATH_GUIDE_VMF_FLOATS_PER_LOBE  PG_FLOATS_PER_LOBE
-#define PATH_GUIDE_LOBES_PER_SLOT       PG_NUM_LOBES
-#define PATH_GUIDE_VMF_FLOATS           PG_VMF_FLOATS
-#define PATH_GUIDE_ENTRY_STRIDE         PG_ENTRY_STRIDE
-#define PATH_GUIDE_MIX_WEIGHT_OFFSET    PG_MIX_WEIGHT
+#define PG_MU_X              0
+#define PG_MU_Y              1
+#define PG_MU_Z              2
+#define PG_KAPPA             3
+#define PG_INT_SUM_X         4
+#define PG_INT_SUM_Y         5
+#define PG_INT_SUM_Z         6
+#define PG_INT_SUM_W         7
+#define PG_CUM_SUM_X         8
+#define PG_CUM_SUM_Y         9
+#define PG_CUM_SUM_Z         10
+#define PG_CUM_SUM_W         11
+#define PG_LAST_HIT_FRAME    12
+#define PG_INT_COUNT         13
+#define PG_CUM_COUNT         14
+#define PG_RESERVED          15
+#define PG_ENTRY_STRIDE      16
 
 // Sparse grid: lightweight descriptor with pointers into __constant__ params.
 // Does NOT copy level_resolutions[16] — reads directly from params to avoid
@@ -193,18 +187,6 @@ __forceinline__ __device__ unsigned int sparseCellIndex(
     return 0xFFFFFFFFu;
 }
 
-// True if cell (ix, iy, iz) at level exists in sparse grid
-__forceinline__ __device__ bool sparseCellExists(
-    const SparsePathGuideDescriptorDevice& grid,
-    unsigned int level,
-    int ix, int iy, int iz)
-{
-    if (grid.morton_codes == nullptr || grid.level_offsets == nullptr) return false;
-    if (level >= grid.num_levels) return false;
-    unsigned long long m = mortonEncode64((unsigned int)ix, (unsigned int)iy, (unsigned int)iz);
-    return sparseCellIndex(grid, level, m) != 0xFFFFFFFFu;
-}
-
 // Pointer to cell data or nullptr if not found
 __forceinline__ __device__ float* sparseCellDataPtr(
     const SparsePathGuideDescriptorDevice& grid,
@@ -256,25 +238,6 @@ __forceinline__ __device__ unsigned int hierarchicalCellLookup(
     return 0xFFFFFFFFu;
 }
 
-__forceinline__ __device__ void sparseCellAABB(
-    const SparsePathGuideDescriptorDevice& grid,
-    unsigned int level,
-    int ix, int iy, int iz,
-    float& out_minx, float& out_miny, float& out_minz,
-    float& out_maxx, float& out_maxy, float& out_maxz)
-{
-    float res = sparseResolutionAtLevel(grid, level);
-    float resU = floorf(res);
-    if (resU < 1.0f) resU = 1.0f;
-    float inv_res = 1.0f / resU;
-    out_minx = grid.bounds_min[0] + (float)ix * inv_res * (grid.bounds_max[0] - grid.bounds_min[0]);
-    out_maxx = grid.bounds_min[0] + (float)(ix + 1) * inv_res * (grid.bounds_max[0] - grid.bounds_min[0]);
-    out_miny = grid.bounds_min[1] + (float)iy * inv_res * (grid.bounds_max[1] - grid.bounds_min[1]);
-    out_maxy = grid.bounds_min[1] + (float)(iy + 1) * inv_res * (grid.bounds_max[1] - grid.bounds_min[1]);
-    out_minz = grid.bounds_min[2] + (float)iz * inv_res * (grid.bounds_max[2] - grid.bounds_min[2]);
-    out_maxz = grid.bounds_min[2] + (float)(iz + 1) * inv_res * (grid.bounds_max[2] - grid.bounds_min[2]);
-}
-
 // Append (level, ix, iy, iz) to staging; no-op if staging null or full
 __forceinline__ __device__ void pathGuideStagingAppend(
     const PathGuideStagingDevice& staging,
@@ -290,9 +253,11 @@ __forceinline__ __device__ void pathGuideStagingAppend(
     slot[3] = (unsigned int)iz;
 }
 
-// Train a cell directly given its data pointer.  Caller is responsible for
-// the cell lookup — use this when the lookup was already done (e.g. cell
-// seeding shares the same lookup as training).
+// Train a cell: accumulate an importance-weighted direction deposit into the
+// interval sums. The refit kernel (path_guide_kernels.cu) periodically folds
+// these into the cumulative sums and refits mu/kappa — shaders never write
+// the fields the sampling path reads, so sampling PDFs stay consistent
+// within a launch.
 __forceinline__ __device__ void pathGuideTrainCell(
     float* cell,
     float dx, float dy, float dz, float weight,
@@ -304,83 +269,34 @@ __forceinline__ __device__ void pathGuideTrainCell(
         !isfinite(dx) || !isfinite(dy) || !isfinite(dz))
         return;
 
-    atomicAdd(&cell[PG_STAT_SUM_X], dx * weight);
-    atomicAdd(&cell[PG_STAT_SUM_Y], dy * weight);
-    atomicAdd(&cell[PG_STAT_SUM_Z], dz * weight);
-    atomicAdd(&cell[PG_STAT_SUM_W], weight);
+    atomicAdd(&cell[PG_INT_SUM_X], dx * weight);
+    atomicAdd(&cell[PG_INT_SUM_Y], dy * weight);
+    atomicAdd(&cell[PG_INT_SUM_Z], dz * weight);
+    atomicAdd(&cell[PG_INT_SUM_W], weight);
+    atomicAdd(&cell[PG_INT_COUNT], 1.0f);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);
     atomicMax((int*)&cell[PG_LAST_HIT_FRAME], frameAsInt);
 }
 
-// Atomic training: accumulate direction*weight into cell stats directly on GPU.
-// Every hit with non-zero luminance trains its cell — 100% training rate.
-// Writes to cell[6..9] (sumX, sumY, sumZ, sumW) via atomicAdd and
-// cell[11] (lastHitFrame) via atomicMax (positive floats sort like ints).
-__forceinline__ __device__ void pathGuideTrainAtomic(
-    const SparsePathGuideDescriptorDevice& grid,
-    float px, float py, float pz,
-    float dx, float dy, float dz, float weight,
-    unsigned int frameIndex,
-    unsigned int minLevel, unsigned int maxLevel)
-{
-    if (grid.data == nullptr) return;
-
-    unsigned int foundLevel = 0;
-    unsigned int cellIdx = hierarchicalCellLookup(grid, px, py, pz, maxLevel, minLevel, &foundLevel);
-    if (cellIdx == 0xFFFFFFFFu) return;
-
-    float* cell = sparseCellDataPtr(grid, cellIdx);
-    if (cell == nullptr) return;
-
-    pathGuideTrainCell(cell, dx, dy, dz, weight, frameIndex);
-}
-
-// Cell data: 6 floats = lobe0(theta, phi, kappa), lobe1(theta, phi, kappa). kappa<=0 means lobe inactive.
-// Sample from 2-lobe mixture (equal weight). Caller provides randoms u_lobe, u1, u2 in [0,1). If both lobes inactive returns false.
+// Sample a direction from the cell's vMF lobe. Returns false if no valid lobe.
 __forceinline__ __device__ bool pathGuideSampleDirection(
     const SparsePathGuideDescriptorDevice& grid,
     unsigned int global_index,
-    float u_lobe, float u1, float u2,
+    float u1, float u2,
     float& ox, float& oy, float& oz)
 {
     float* cell = sparseCellDataPtr(grid, global_index);
     if (cell == nullptr) return false;
-    float k0 = cell[PG_LOBE0_KAPPA], k1 = cell[PG_LOBE1_KAPPA];
-    bool use0 = (k0 > 1e-6f);
-    bool use1 = (k1 > 1e-6f);
-    if (!use0 && !use1) return false;
-
-    if (use0 && !use1) {
-        float mx, my, mz;
-        vmfSphericalToCartesian(cell[PG_LOBE0_THETA], cell[PG_LOBE0_PHI], mx, my, mz);
-        vmfSample(mx, my, mz, k0, u1, u2, ox, oy, oz);
-        return true;
-    }
-    if (!use0 && use1) {
-        float mx, my, mz;
-        vmfSphericalToCartesian(cell[PG_LOBE1_THETA], cell[PG_LOBE1_PHI], mx, my, mz);
-        vmfSample(mx, my, mz, k1, u1, u2, ox, oy, oz);
-        return true;
-    }
-    float pi0 = cell[PG_MIX_WEIGHT];
-    if (pi0 <= 0.0f || pi0 >= 1.0f) pi0 = 0.5f;  // safety fallback
-    if (u_lobe < pi0) {
-        float mx, my, mz;
-        vmfSphericalToCartesian(cell[PG_LOBE0_THETA], cell[PG_LOBE0_PHI], mx, my, mz);
-        vmfSample(mx, my, mz, k0, u1, u2, ox, oy, oz);
-    } else {
-        float mx, my, mz;
-        vmfSphericalToCartesian(cell[PG_LOBE1_THETA], cell[PG_LOBE1_PHI], mx, my, mz);
-        vmfSample(mx, my, mz, k1, u1, u2, ox, oy, oz);
-    }
+    float kappa = cell[PG_KAPPA];
+    if (kappa <= 1e-6f) return false;
+    vmfSample(cell[PG_MU_X], cell[PG_MU_Y], cell[PG_MU_Z], kappa, u1, u2, ox, oy, oz);
     return true;
 }
 
-// PDF of 2-lobe mixture at direction (ox, oy, oz)
-// Weights must match pathGuideSampleDirection: when both lobes active, 50/50;
-// when only one active, that lobe has weight 1.0.
+// PDF of the cell's vMF lobe at direction (ox, oy, oz).
+// Must match pathGuideSampleDirection exactly.
 __forceinline__ __device__ float pathGuidePdfDirection(
     const SparsePathGuideDescriptorDevice& grid,
     unsigned int global_index,
@@ -388,36 +304,10 @@ __forceinline__ __device__ float pathGuidePdfDirection(
 {
     float* cell = sparseCellDataPtr(grid, global_index);
     if (cell == nullptr) return 0.07957747154f;  // 1/(4π) uniform
-    float k0 = cell[PG_LOBE0_KAPPA], k1 = cell[PG_LOBE1_KAPPA];
-    bool use0 = (k0 > 1e-6f);
-    bool use1 = (k1 > 1e-6f);
-    if (!use0 && !use1) return 0.07957747154f;
-
-    float p0 = 0.0f, p1 = 0.0f;
-    if (use0) {
-        float mx, my, mz;
-        vmfSphericalToCartesian(cell[PG_LOBE0_THETA], cell[PG_LOBE0_PHI], mx, my, mz);
-        p0 = vmfPdf(k0, mx*ox + my*oy + mz*oz);
-    }
-    if (use1) {
-        float mx, my, mz;
-        vmfSphericalToCartesian(cell[PG_LOBE1_THETA], cell[PG_LOBE1_PHI], mx, my, mz);
-        p1 = vmfPdf(k1, mx*ox + my*oy + mz*oz);
-    }
-
-    // Match sampling: both active → use fitted mixture weight; one active → weight 1.0
-    float p;
-    if (use0 && use1) {
-        float pi0 = cell[PG_MIX_WEIGHT];
-        if (pi0 <= 0.0f || pi0 >= 1.0f) pi0 = 0.5f;  // safety fallback
-        p = pi0 * p0 + (1.0f - pi0) * p1;
-    } else if (use0) {
-        p = p0;
-    } else {
-        p = p1;
-    }
-
-    return fmaxf(p, 1e-10f);
+    float kappa = cell[PG_KAPPA];
+    if (kappa <= 1e-6f) return 0.07957747154f;
+    float cosTheta = cell[PG_MU_X] * ox + cell[PG_MU_Y] * oy + cell[PG_MU_Z] * oz;
+    return fmaxf(vmfPdf(kappa, cosTheta), 1e-10f);
 }
 
 //------------------------------------------------------------------------------
@@ -514,7 +404,7 @@ __forceinline__ __device__ TrilinearInfo filterTrilinearByValidLobes(
         filtered.weight[i] = 0.0f;
         if (all.cellIdx[i] != 0xFFFFFFFFu) {
             float* cell = sparseCellDataPtr(grid, all.cellIdx[i]);
-            if (cell != nullptr && (cell[PG_LOBE0_KAPPA] > 1e-6f || cell[PG_LOBE1_KAPPA] > 1e-6f)) {
+            if (cell != nullptr && cell[PG_KAPPA] > 1e-6f) {
                 filtered.cellIdx[i] = all.cellIdx[i];
                 filtered.weight[i] = all.weight[i];
                 filtered.weightSum += all.weight[i];
@@ -546,7 +436,9 @@ __forceinline__ __device__ unsigned int stochasticSelectCell(
 }
 
 // Trilinear-weighted PDF for MIS. Computes the weighted average of all valid
-// neighbor cells' PDFs, matching the stochastic sampling distribution exactly.
+// neighbor cells' PDFs, matching the stochastic sampling distribution exactly:
+// the sampler picks cell i with probability weight[i]/weightSum and then
+// samples that cell's vMF, so the marginal density is this weighted mixture.
 __forceinline__ __device__ float trilinearGuidePdf(
     const SparsePathGuideDescriptorDevice& grid,
     const TrilinearInfo& info,

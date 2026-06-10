@@ -276,6 +276,7 @@ add_executable(SpectraPBR
     src/rendering/geometry_manager.cpp
     src/rendering/light_manager.cpp
     src/rendering/path_guide_grid.cpp
+    src/rendering/path_guide_kernels.cu
     src/rendering/vmf_fitting.cpp
     src/rendering/hemisphere_vis.cpp
     # Loaders

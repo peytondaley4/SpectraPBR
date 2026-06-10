@@ -6,7 +6,8 @@
 // This file contains all GPU-side structures shared between OptiX .cu files.
 // It uses pure C-compatible syntax (no namespaces, no STL) for CUDA compatibility.
 //
-// These types must stay in sync with src/shared_types.h (CPU-side definitions).
+// These types must stay in sync with src/core/shared_types.h (CPU-side
+// definitions). Field order, types, and padding must match exactly.
 //------------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -16,11 +17,12 @@
 // Constants
 //------------------------------------------------------------------------------
 
-// Ray types
+// Ray types. The path tracer is iterative (loop in raygen), so there is no
+// separate "indirect" ray type — every path segment is a RADIANCE ray whose
+// closest-hit only reports hit info back to raygen.
 constexpr unsigned int RAY_TYPE_RADIANCE = 0;
 constexpr unsigned int RAY_TYPE_SHADOW   = 1;
-constexpr unsigned int RAY_TYPE_INDIRECT = 2;  // Lightweight secondary bounce (no path guiding)
-constexpr unsigned int RAY_TYPE_COUNT    = 3;
+constexpr unsigned int RAY_TYPE_COUNT    = 2;
 
 // Alpha modes
 constexpr unsigned int ALPHA_MODE_OPAQUE = 0;
@@ -46,7 +48,8 @@ struct GpuVertex {
 };
 
 //------------------------------------------------------------------------------
-// GPU Material Structure (for SBT hit group records)
+// GPU Material Structure (for SBT hit group records and the global material
+// array read by raygen)
 // Supports glTF 2.0 metallic-roughness workflow and common extensions
 //------------------------------------------------------------------------------
 struct GpuMaterial {
@@ -72,7 +75,7 @@ struct GpuMaterial {
 
     // KHR_materials_volume (Absorption)
     float3 attenuationColor;    // Absorption color
-    float attenuationDistance;  // Distance for Beer's law
+    float attenuationDistance;  // Distance for Beer's law (0 = no absorption)
     float thickness;            // Material thickness
     float3 _pad3;               // Padding
 
@@ -125,17 +128,27 @@ struct GpuDirectionalLight {
     float _pad;
 };
 
+// Area light. Two kinds share this struct:
+//  - Virtual rectangle (triCount == 0): UI-created light with no geometry in
+//    the BVH. Sampled as a rectangle; BSDF rays can never hit it, so NEE takes
+//    full weight (no MIS needed).
+//  - Mesh light (triCount > 0): extracted from an emissive mesh that IS in the
+//    BVH. Sampled from its actual triangles (area_light_tris); MIS-weighted
+//    against BSDF/guide sampling because BSDF rays can also hit the geometry.
 struct GpuAreaLight {
-    float3 position;        // Center position
+    float3 position;        // Center position (virtual rect) / centroid (mesh)
     float _pad0;
-    float3 normal;          // Surface normal
+    float3 normal;          // Surface normal (virtual rect orientation)
     float _pad1;
-    float3 tangent;         // Surface tangent (for orientation)
+    float3 tangent;         // Surface tangent (virtual rect orientation)
     float _pad2;
     float3 emission;        // Emitted radiance (color * intensity)
-    float area;             // Surface area for PDF calculation
-    float2 size;            // Width and height (for rectangular lights)
-    float2 _pad3;
+    float area;             // Total surface area for PDF calculation
+    float2 size;            // Width and height (virtual rect only)
+    unsigned int triOffset; // First triangle in area_light_tris (mesh light)
+    unsigned int triCount;  // Triangle count (0 = virtual rectangle)
+    unsigned int instanceId;// Owning instance (mesh light; 0xFFFFFFFF for virtual)
+    unsigned int _pad3[3];
 };
 
 //------------------------------------------------------------------------------
@@ -169,6 +182,7 @@ struct PickResultBuffer {
 
 //------------------------------------------------------------------------------
 // Launch Parameters (passed to all OptiX programs)
+// MUST match src/core/shared_types.h::LaunchParams field-for-field.
 //------------------------------------------------------------------------------
 struct GpuLaunchParams {
     // Output buffer (final display)
@@ -190,8 +204,13 @@ struct GpuLaunchParams {
     CUdeviceptr* vertex_buffers;    // Array of pointers to GpuVertex arrays
     CUdeviceptr* index_buffers;     // Array of pointers to uint32_t index arrays
 
-    // Material indices per instance (maps instance ID -> material SBT index)
-    unsigned int* instance_material_indices;
+    // Per-instance data (indexed by instance ID). Raygen shades hits itself,
+    // so it needs material + transform access outside the SBT.
+    const GpuMaterial* materials;                   // One per GAS/material slot
+    const unsigned int* instance_material_indices;  // instance -> material slot
+    const float* instance_transforms;               // 12 floats per instance (3x4 row-major, object->world)
+    const float* instance_normal_transforms;        // 12 floats per instance (inverse-transpose linear part)
+    const unsigned int* instance_light_indices;     // instance -> area light index, 0xFFFFFFFF if none
 
     // Lighting
     GpuPointLight* point_lights;
@@ -202,7 +221,21 @@ struct GpuLaunchParams {
     unsigned int _pad_lights1;
     GpuAreaLight* area_lights;
     unsigned int area_light_count;
-    float total_light_luminance;  // Precomputed sum of all light luminances for importance sampling
+    // Lights-only selection total. Selection weights (must match
+    // LightManager::syncToGpu exactly): point = lum(intensity),
+    // directional = lum(irradiance) * 10, area = lum(emission) * area.
+    float total_light_luminance;
+    // Mesh-light triangles: 3 float4 per triangle.
+    //   tri[0].xyz = v0, tri[0].w = cumulative area fraction within the light (CDF)
+    //   tri[1].xyz = v1, tri[1].w = triangle area
+    //   tri[2].xyz = v2, tri[2].w = unused
+    const float4* area_light_tris;
+    // Environment selection weight in the NEE light pick (host-computed,
+    // ~total incident env flux). 0 when no env importance data.
+    float env_selection_weight;
+    // Per-bounce contribution clamp for firefly suppression. Biased — set to
+    // FLT_MAX (host: QUALITY_ACCURATE) for unbiased accumulation.
+    float firefly_clamp;
 
     // Environment map (equirectangular HDR)
     cudaTextureObject_t environment_map;  // 0 = none
@@ -220,7 +253,7 @@ struct GpuLaunchParams {
     // Quality and rendering settings
     unsigned int quality_mode;
     unsigned int samples_per_pixel;     // SPP per frame (higher = less noise, slower)
-    unsigned int random_seed;           // Per-frame random seed for sampling
+    unsigned int max_bounce_depth;      // Maximum path length (path vertices after the camera)
     unsigned int _pad_quality;
 
     // UI selection (UINT32_MAX = no selection)
@@ -246,11 +279,8 @@ struct GpuLaunchParams {
     unsigned int* path_guide_staging_buffer;
     unsigned int* path_guide_staging_count;
     unsigned int path_guide_staging_capacity;
-    unsigned int debug_grid_visualize;
-    unsigned int debug_grid_level;
-    unsigned int path_guide_no_jitter;  // When set, use center-pixel rays for deterministic staging
     unsigned int path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
-    float path_guide_mis_weight;        // Blend factor for MIS (0.5 = balanced)
+    float path_guide_mis_weight;        // Probability of sampling the guide (one-sample MIS alpha)
     // Adaptive level parameters (from config)
     unsigned int path_guide_start_level; // Initial level for new regions
     unsigned int path_guide_min_level;   // Coarsest allowed level
@@ -264,23 +294,23 @@ struct GpuLaunchParams {
     unsigned int path_guide_hash_shift;                 // 64 - log2(hash_table_size)
 
     // Debug statistics (atomic counters, reset each frame)
-    unsigned int* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed
+    unsigned int* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed, [5]=bsdf_sampled
     unsigned int path_guide_debug_enabled; // 1 = collect debug stats
-
-    unsigned int max_bounce_depth;      // Max recursive bounces for glass/transmission
 
     // Precomputed per-frame constants (avoid transcendentals on GPU)
     float tan_half_fov_y;               // tanf(camera.fovY * 0.5f)
     float tan_half_fov_x;               // tan_half_fov_y * camera.aspectRatio
     float pixel_world_size;             // (2 * tan_half_fov_y) / height
-    unsigned int stratified_grid_dim;   // ceil(sqrt(samples_per_pixel))
+    float _pad_tail;
 };
 
 //------------------------------------------------------------------------------
 // SBT Record Data Structures
 //------------------------------------------------------------------------------
 
-// Hit group data follows the SBT record header
+// Hit group data follows the SBT record header.
+// Only the anyhit alpha-test programs read this (raygen shades from the global
+// material array); kept per-record so anyhit needs no extra indirection.
 struct HitGroupData {
     GpuMaterial material;
     unsigned int geometryIndex;     // Index into vertex_buffers/index_buffers

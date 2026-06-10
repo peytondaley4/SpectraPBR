@@ -1,6 +1,7 @@
 #include "scene_manager.h"
 #include <iostream>
 #include <cstring>
+#include <cmath>
 
 namespace spectra {
 
@@ -98,8 +99,17 @@ bool SceneManager::buildGAS(const GpuGeometry* geom, GasInfo& gas) {
     buildInput.triangleArray.numIndexTriplets = geom->indexCount / 3;
     buildInput.triangleArray.indexBuffer = d_indices;
 
-    // Flags (one per SBT record)
-    uint32_t triangleFlags = OPTIX_GEOMETRY_FLAG_NONE;
+    // Flags (one per SBT record). Opaque materials disable anyhit at the
+    // geometry level — traversal takes the fast path; only alpha-MASK
+    // materials pay for anyhit (their hit groups carry the alpha-test
+    // programs, see OptixEngine::buildSBT).
+    uint32_t triangleFlags = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
+    if (m_materialManager) {
+        const GpuMaterial* mat = m_materialManager->get(gas.materialHandle);
+        if (mat && mat->alphaMode == ALPHA_MODE_MASK) {
+            triangleFlags = OPTIX_GEOMETRY_FLAG_NONE;
+        }
+    }
     buildInput.triangleArray.flags = &triangleFlags;
     buildInput.triangleArray.numSbtRecords = 1;
 
@@ -273,7 +283,7 @@ bool SceneManager::buildIAS() {
         memcpy(oi.transform, inst.transform, sizeof(oi.transform));
 
         oi.instanceId = inst.instanceId;
-        // SBT layout: [gas0_radiance, gas0_shadow, gas0_indirect, gas1_radiance, gas1_shadow, gas1_indirect, ...]
+        // SBT layout: [gas0_radiance, gas0_shadow, gas1_radiance, gas1_shadow, ...]
         // So offset = gasIndex * RAY_TYPE_COUNT
         oi.sbtOffset = inst.gasIndex * RAY_TYPE_COUNT;
         oi.visibilityMask = 0xFF;
@@ -369,14 +379,55 @@ bool SceneManager::buildIAS() {
     if (m_d_indexBuffers) {
         cudaFree(m_d_indexBuffers);
     }
+    if (m_d_instanceTransforms) {
+        cudaFree(m_d_instanceTransforms);
+        m_d_instanceTransforms = nullptr;
+    }
+    if (m_d_instanceNormalTransforms) {
+        cudaFree(m_d_instanceNormalTransforms);
+        m_d_instanceNormalTransforms = nullptr;
+    }
+    if (m_d_instanceMaterialIndices) {
+        cudaFree(m_d_instanceMaterialIndices);
+        m_d_instanceMaterialIndices = nullptr;
+    }
 
     std::vector<CUdeviceptr> vertexPtrs(m_instances.size());
     std::vector<CUdeviceptr> indexPtrs(m_instances.size());
+    std::vector<float> transforms(m_instances.size() * 12);
+    std::vector<float> normalTransforms(m_instances.size() * 12);
+    std::vector<uint32_t> materialIndices(m_instances.size());
 
     for (size_t i = 0; i < m_instances.size(); ++i) {
-        const GasInfo& gas = m_gasList[m_instances[i].gasIndex];
+        const SceneInstance& inst = m_instances[i];
+        const GasInfo& gas = m_gasList[inst.gasIndex];
         vertexPtrs[i] = m_geometryManager->getVertexBuffer(gas.geometryHandle);
         indexPtrs[i] = m_geometryManager->getIndexBuffer(gas.geometryHandle);
+        // Material slot == GAS index (updateSBT builds one material per GAS)
+        materialIndices[i] = inst.gasIndex;
+
+        const float* m = inst.transform;
+        std::memcpy(&transforms[i * 12], m, 12 * sizeof(float));
+
+        // Normal matrix = inverse-transpose of the 3x3 linear part = cofactor
+        // matrix / det. Handles non-uniform scale and mirrored instances
+        // (negative determinant flips normals correctly).
+        float c00 =  (m[5] * m[10] - m[6] * m[9]);
+        float c01 = -(m[4] * m[10] - m[6] * m[8]);
+        float c02 =  (m[4] * m[9]  - m[5] * m[8]);
+        float c10 = -(m[1] * m[10] - m[2] * m[9]);
+        float c11 =  (m[0] * m[10] - m[2] * m[8]);
+        float c12 = -(m[0] * m[9]  - m[1] * m[8]);
+        float c20 =  (m[1] * m[6]  - m[2] * m[5]);
+        float c21 = -(m[0] * m[6]  - m[2] * m[4]);
+        float c22 =  (m[0] * m[5]  - m[1] * m[4]);
+        float det = m[0] * c00 + m[1] * c01 + m[2] * c02;
+        float invDet = (std::abs(det) > 1e-12f) ? 1.0f / det : 1.0f;
+
+        float* n = &normalTransforms[i * 12];
+        n[0] = c00 * invDet; n[1] = c01 * invDet; n[2]  = c02 * invDet; n[3]  = 0.0f;
+        n[4] = c10 * invDet; n[5] = c11 * invDet; n[6]  = c12 * invDet; n[7]  = 0.0f;
+        n[8] = c20 * invDet; n[9] = c21 * invDet; n[10] = c22 * invDet; n[11] = 0.0f;
     }
 
     m_bufferArraySize = m_instances.size();
@@ -394,6 +445,27 @@ bool SceneManager::buildIAS() {
         return false;
     }
     cudaMemcpy(m_d_indexBuffers, indexPtrs.data(), sizeof(CUdeviceptr) * m_bufferArraySize, cudaMemcpyHostToDevice);
+
+    err = cudaMalloc(reinterpret_cast<void**>(&m_d_instanceTransforms), sizeof(float) * transforms.size());
+    if (err != cudaSuccess) {
+        std::cerr << "[SceneManager] Failed to allocate instance transforms: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    cudaMemcpy(m_d_instanceTransforms, transforms.data(), sizeof(float) * transforms.size(), cudaMemcpyHostToDevice);
+
+    err = cudaMalloc(reinterpret_cast<void**>(&m_d_instanceNormalTransforms), sizeof(float) * normalTransforms.size());
+    if (err != cudaSuccess) {
+        std::cerr << "[SceneManager] Failed to allocate instance normal transforms: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    cudaMemcpy(m_d_instanceNormalTransforms, normalTransforms.data(), sizeof(float) * normalTransforms.size(), cudaMemcpyHostToDevice);
+
+    err = cudaMalloc(reinterpret_cast<void**>(&m_d_instanceMaterialIndices), sizeof(uint32_t) * materialIndices.size());
+    if (err != cudaSuccess) {
+        std::cerr << "[SceneManager] Failed to allocate instance material indices: " << cudaGetErrorString(err) << "\n";
+        return false;
+    }
+    cudaMemcpy(m_d_instanceMaterialIndices, materialIndices.data(), sizeof(uint32_t) * materialIndices.size(), cudaMemcpyHostToDevice);
 
     std::cout << "[SceneManager] Built IAS with " << m_instances.size()
               << " instances (" << m_iasBufferSize / 1024 << " KB)\n";
@@ -435,6 +507,23 @@ bool SceneManager::updateSBT() {
     return m_optixEngine->buildSBT(materials, geometryIndices);
 }
 
+bool SceneManager::updateMaterialRecords(MaterialHandle handle, cudaStream_t stream) {
+    if (!m_optixEngine || !m_materialManager) return false;
+    const GpuMaterial* mat = m_materialManager->get(handle);
+    if (!mat) return false;
+
+    bool any = false;
+    for (size_t i = 0; i < m_gasList.size(); ++i) {
+        if (m_gasList[i].materialHandle == handle) {
+            if (!m_optixEngine->updateMaterialRecord(static_cast<uint32_t>(i), *mat, stream)) {
+                return false;  // needs full rebuild (e.g. alphaMode changed)
+            }
+            any = true;
+        }
+    }
+    return any;
+}
+
 void SceneManager::clear() {
     // Free IAS
     if (m_iasBuffer) {
@@ -455,6 +544,18 @@ void SceneManager::clear() {
     if (m_d_indexBuffers) {
         cudaFree(m_d_indexBuffers);
         m_d_indexBuffers = nullptr;
+    }
+    if (m_d_instanceTransforms) {
+        cudaFree(m_d_instanceTransforms);
+        m_d_instanceTransforms = nullptr;
+    }
+    if (m_d_instanceNormalTransforms) {
+        cudaFree(m_d_instanceNormalTransforms);
+        m_d_instanceNormalTransforms = nullptr;
+    }
+    if (m_d_instanceMaterialIndices) {
+        cudaFree(m_d_instanceMaterialIndices);
+        m_d_instanceMaterialIndices = nullptr;
     }
 
     // Free GAS and release geometry

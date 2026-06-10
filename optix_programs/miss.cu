@@ -1,58 +1,22 @@
 #include <optix.h>
 #include "gpu_types.h"
 #include "shared_device.h"
-#include "brdf.h"
 
 //------------------------------------------------------------------------------
-// Phase 3: Miss Programs
+// Miss Programs
 //
-// - Background miss: Sky gradient or environment map sampling
-// - Shadow miss: Returns visibility (not occluded)
+// Radiance miss only flags "no hit" (t = -1). Environment radiance is
+// evaluated in raygen, where the previous bounce's sampling PDF is available —
+// that is what makes the env contribution MIS-weighted against environment
+// NEE instead of double counted.
 //------------------------------------------------------------------------------
 
-//------------------------------------------------------------------------------
-// Background Miss (Radiance Rays)
-//------------------------------------------------------------------------------
-
-extern "C" __global__ void __miss__background() {
-    // Get SBT data for background color override
-    const MissData* sbtData = reinterpret_cast<MissData*>(optixGetSbtDataPointer());
-
-    // Get ray direction for sky/environment sampling
-    const float3 rayDir = optixGetWorldRayDirection();
-
-    float3 color;
-
-    // Check if we have an environment map
-    if (params.environment_map != 0) {
-        // Sample environment map using equirectangular mapping
-        float2 uv = directionToEquirectangular(rayDir);
-        float4 envSample = tex2D<float4>(params.environment_map, uv.x, uv.y);
-        color = make_float3(envSample.x, envSample.y, envSample.z) * params.environment_intensity;
-    }
-    // Check for explicit background color in SBT
-    else if (sbtData && (sbtData->backgroundColor.x > 0.0f ||
-                         sbtData->backgroundColor.y > 0.0f ||
-                         sbtData->backgroundColor.z > 0.0f)) {
-        color = sbtData->backgroundColor;
-    }
-    else {
-        // Default: True black (no phantom illumination)
-        color = make_float3(0.0f, 0.0f, 0.0f);
-    }
-
-    // Set payload
-    setPayloadColor(color);
-    setPayloadHitDistance(-1.0f);  // Negative distance indicates miss
-    setPayloadInstanceId(0xFFFFFFFFu);  // No instance hit
+extern "C" __global__ void __miss__radiance() {
+    optixSetPayload_0(__float_as_uint(-1.0f));
+    optixSetPayload_1(0xFFFFFFFFu);
 }
 
-//------------------------------------------------------------------------------
-// Shadow Miss (Shadow Rays)
-// When shadow ray misses, the light is visible (not occluded)
-//------------------------------------------------------------------------------
-
+// Shadow ray miss: light is visible (payload = 0 means not occluded)
 extern "C" __global__ void __miss__shadow() {
-    // Shadow ray miss - light is visible (payload = 0 means not occluded)
     optixSetPayload_0(0);
 }

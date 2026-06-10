@@ -28,7 +28,12 @@ void LightManager::updateAreaLight(uint32_t index, const ui::LightInfo& info) {
     areaLights[index].position = info.position;
     areaLights[index].emission = info.color;
     areaLights[index].size = info.size;
-    areaLights[index].area = info.size.x * info.size.y;
+    // Mesh lights (triCount > 0) keep the area of their actual triangles —
+    // it drives the sampling PDF and MIS weights. Only virtual rectangles
+    // derive area from the editable size.
+    if (areaLights[index].triCount == 0) {
+        areaLights[index].area = info.size.x * info.size.y;
+    }
 }
 
 void LightManager::updatePointLight(uint32_t index, const ui::LightInfo& info) {
@@ -122,7 +127,14 @@ void LightManager::syncToGpu(OptixEngine* engine, cudaStream_t stream) {
                                 static_cast<uint32_t>(pointLights.size()));
     }
 
-    // Compute total light luminance for importance sampling
+    // Compute the light-selection total for NEE importance sampling.
+    // These weight formulas MUST match raygen.cu::selectLight exactly — the
+    // device walks the same lists with the same per-light weights and divides
+    // by this total; any mismatch biases the estimator.
+    //   point:       lum(intensity)
+    //   directional: lum(irradiance) * 10   (selection-importance heuristic:
+    //                directional lights illuminate everything, so oversample)
+    //   area:        lum(emission) * area   (~flux; big bright panels matter more)
     float totalLightLum = 0.0f;
     for (const auto& light : pointLights) {
         totalLightLum += 0.2126f * light.intensity.x +
@@ -135,9 +147,9 @@ void LightManager::syncToGpu(OptixEngine* engine, cudaStream_t stream) {
                           0.0722f * light.irradiance.z) * 10.0f;
     }
     for (const auto& light : areaLights) {
-        totalLightLum += 0.2126f * light.emission.x +
-                         0.7152f * light.emission.y +
-                         0.0722f * light.emission.z;
+        totalLightLum += (0.2126f * light.emission.x +
+                          0.7152f * light.emission.y +
+                          0.0722f * light.emission.z) * light.area;
     }
     engine->setTotalLightLuminance(totalLightLum);
 }
@@ -164,24 +176,30 @@ void LightManager::createDefaultLights() {
     sunLight.irradiance = make_float3(3.0f, 2.9f, 2.7f);
     addDirectionalLight(sunLight);
 
-    // Key light
-    GpuAreaLight keyLight;
+    // Key light (virtual rectangle: no geometry, NEE-only)
+    GpuAreaLight keyLight = {};
     keyLight.position = make_float3(3.0f, 4.0f, 2.0f);
     keyLight.normal = normalizeFloat3(make_float3(-0.3f, -0.8f, -0.2f));
     keyLight.tangent = make_float3(1.0f, 0.0f, 0.0f);
     keyLight.emission = make_float3(200.0f, 150.0f, 160.0f);
     keyLight.size = make_float2(2.0f, 2.0f);
     keyLight.area = 4.0f;
+    keyLight.triOffset = 0;
+    keyLight.triCount = 0;
+    keyLight.instanceId = UINT32_MAX;
     addAreaLight(keyLight);
 
-    // Fill light
-    GpuAreaLight fillLight;
+    // Fill light (virtual rectangle)
+    GpuAreaLight fillLight = {};
     fillLight.position = make_float3(-2.5f, 2.0f, 3.0f);
     fillLight.normal = normalizeFloat3(make_float3(0.4f, -0.5f, -0.6f));
     fillLight.tangent = make_float3(0.0f, 0.0f, 1.0f);
     fillLight.emission = make_float3(100.0f, 110.0f, 120.0f);
     fillLight.size = make_float2(1.5f, 1.5f);
     fillLight.area = 2.25f;
+    fillLight.triOffset = 0;
+    fillLight.triCount = 0;
+    fillLight.instanceId = UINT32_MAX;
     addAreaLight(fillLight);
 }
 

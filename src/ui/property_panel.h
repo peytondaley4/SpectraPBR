@@ -117,6 +117,7 @@ public:
     bool onMouseUp(float2 pos, int button) override;
     bool onMouseMove(float2 pos) override;
     bool onMouseScroll(float2 pos, float delta) override;
+    void clearHoverRecursive() override;
 
 protected:
     void generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayout* textLayout) override;

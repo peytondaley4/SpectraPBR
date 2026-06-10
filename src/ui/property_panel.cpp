@@ -342,6 +342,16 @@ void PropertyPanel::updatePanelAndTheme() {
         m_panel->setSize(bounds.width, bounds.height);
     }
 
+    // The panel is not a child (no parent link), so it can't inherit this
+    // root's depth: without the sync its background renders at depth 0 —
+    // underneath every other panel — while our content renders at root depth.
+    if (m_panel) {
+        float depth = getEffectiveDepth();
+        if (m_panel->getDepth() != depth) {
+            m_panel->setDepth(depth);
+        }
+    }
+
     if (themeChanged) {
         if (m_panel) m_panel->setTheme(theme);
         // Set theme on all widgets
@@ -369,21 +379,18 @@ void PropertyPanel::addWidget(Widget* widget, float height, std::vector<UIQuad>&
         return;  // Don't position or advance for hidden widgets
     }
 
-    // Skip if entirely off-screen (culling)
+    // Position widget relative to PropertyPanel — even when culled below, so
+    // hit testing sees the real scrolled location, not wherever the widget
+    // was last drawn. Direct setters avoid markDirty cascade during layout.
+    float widgetY = m_contentY - m_bounds.y;
+    widget->setPositionDirect(make_float2(PADDING, widgetY));
+    widget->setSizeDirect(make_float2(m_contentWidth, height));
+
+    // Skip rendering if entirely off-screen (culling)
     if (m_contentY + height < m_visibleMinY || m_contentY > m_visibleMaxY) {
         m_contentY += height;
         return;
     }
-
-    // Position widget relative to PropertyPanel
-    // Use setPositionDirect/setSizeDirect to avoid markDirty cascade during layout
-    float widgetY = m_contentY - m_bounds.y;
-    float2 newPos = make_float2(PADDING, widgetY);
-    float2 newSize = make_float2(m_contentWidth, height);
-
-    // Use direct setters to avoid dirty propagation during layout
-    widget->setPositionDirect(newPos);
-    widget->setSizeDirect(newSize);
 
     // Render widget
     widget->collectGeometry(outQuads, textLayout);
@@ -746,9 +753,6 @@ void PropertyPanel::generateGeometry(std::vector<UIQuad>& outQuads, text::TextLa
 bool PropertyPanel::onMouseDown(float2 pos, int button) {
     if (!m_visible || !m_enabled) return false;
 
-    // Forward to Panel first (handles dragging)
-    if (m_panel && m_panel->onMouseDown(pos, button)) return true;
-
     // Check scrollbar interaction
     if (button == 0 && needsScrolling()) {
         Rect scrollbarRect = getScrollbarRect();
@@ -778,12 +782,21 @@ bool PropertyPanel::onMouseDown(float2 pos, int button) {
         }
     }
 
-    // Forward to visible widgets
-    Widget* widgets[EDITABLE_WIDGET_COUNT];
-    getEditableWidgets(widgets);
-    for (Widget* w : widgets) {
-        if (w && w->isVisible() && w->onMouseDown(pos, button)) return true;
+    // Content widgets BEFORE the panel: Panel::onMouseDown consumes any
+    // click on the panel body (no fall-through to panels underneath), and
+    // these widgets are not its children — offered after, they'd never see
+    // the press. Gate by the clip rect so a widget scrolled under the header
+    // can't steal header-drag clicks.
+    if (getContentClipBounds().contains(pos)) {
+        Widget* widgets[EDITABLE_WIDGET_COUNT];
+        getEditableWidgets(widgets);
+        for (Widget* w : widgets) {
+            if (w && w->isVisible() && w->onMouseDown(pos, button)) return true;
+        }
     }
+
+    // Panel last: close button, header drag, and body-consume.
+    if (m_panel && m_panel->onMouseDown(pos, button)) return true;
 
     return containsPoint(pos);
 }
@@ -859,6 +872,18 @@ bool PropertyPanel::onMouseMove(float2 pos) {
     }
 
     return consumed;
+}
+
+void PropertyPanel::clearHoverRecursive() {
+    Widget::clearHoverRecursive();
+    // The panel and editable widgets are not children, so the base walk
+    // doesn't reach them.
+    if (m_panel) m_panel->clearHoverRecursive();
+    Widget* widgets[EDITABLE_WIDGET_COUNT];
+    getEditableWidgets(widgets);
+    for (Widget* w : widgets) {
+        if (w) w->clearHoverRecursive();
+    }
 }
 
 bool PropertyPanel::onMouseScroll(float2 pos, float delta) {

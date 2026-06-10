@@ -147,6 +147,16 @@ bool Slider::onMouseUp(float2 pos, int button) {
     return false;
 }
 
+void Slider::clearHoverRecursive() {
+    // The thumb highlight is this widget's real hover visual; the base
+    // clear only resets m_hovered.
+    if (m_thumbHovered) {
+        m_thumbHovered = false;
+        markDirty();
+    }
+    Widget::clearHoverRecursive();
+}
+
 bool Slider::onMouseMove(float2 pos) {
     if (!m_visible || !m_enabled) return false;
 

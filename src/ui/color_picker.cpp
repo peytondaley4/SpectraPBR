@@ -124,15 +124,22 @@ void ColorPicker::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLayou
 
     // Set theme only if it changed (Widget::setTheme now has early exit)
     const Theme* theme = getTheme();
+    // The sliders are not children (their positions are absolute), so they
+    // can't inherit this widget's depth: without the sync they render at
+    // depth 0, underneath any overlapping panel.
+    float sliderDepth = getEffectiveDepth() + 0.001f;
     if (m_redSlider) {
+        if (m_redSlider->getDepth() != sliderDepth) m_redSlider->setDepth(sliderDepth);
         m_redSlider->setTheme(theme);
         m_redSlider->collectGeometry(outQuads, textLayout);
     }
     if (m_greenSlider) {
+        if (m_greenSlider->getDepth() != sliderDepth) m_greenSlider->setDepth(sliderDepth);
         m_greenSlider->setTheme(theme);
         m_greenSlider->collectGeometry(outQuads, textLayout);
     }
     if (m_blueSlider) {
+        if (m_blueSlider->getDepth() != sliderDepth) m_blueSlider->setDepth(sliderDepth);
         m_blueSlider->setTheme(theme);
         m_blueSlider->collectGeometry(outQuads, textLayout);
     }
@@ -194,6 +201,14 @@ bool ColorPicker::onMouseMove(float2 pos) {
     if (m_blueSlider) consumed = m_blueSlider->onMouseMove(pos) || consumed;
 
     return consumed;
+}
+
+void ColorPicker::clearHoverRecursive() {
+    Widget::clearHoverRecursive();
+    // The sliders are not children, so the base walk doesn't reach them.
+    if (m_redSlider) m_redSlider->clearHoverRecursive();
+    if (m_greenSlider) m_greenSlider->clearHoverRecursive();
+    if (m_blueSlider) m_blueSlider->clearHoverRecursive();
 }
 
 } // namespace ui

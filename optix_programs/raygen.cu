@@ -59,9 +59,16 @@ __forceinline__ __device__ float sceneFarDistance() {
 #define GUIDE_STAT_CONTRIBUTED  4
 #define GUIDE_STAT_BSDF_SAMPLED 5
 
+// Stats are SAMPLED from 1/256 of pixels. Counting from every vertex fired
+// 3-4 global atomics per vertex on six hot counters (~20M serialized atomics
+// per frame at 1080p) — a measurable permanent tax whenever guiding is on.
+// The UI panel reads these as ratios, so uniform subsampling preserves them.
 __forceinline__ __device__ void incrementGuideStat(unsigned int statIdx) {
     if (params.path_guide_debug_enabled && params.path_guide_debug_stats != nullptr) {
-        atomicAdd(&params.path_guide_debug_stats[statIdx], 1u);
+        const uint3 li = optixGetLaunchIndex();
+        if (((li.x & 15u) | (li.y & 15u)) == 0u) {
+            atomicAdd(&params.path_guide_debug_stats[statIdx], 1u);
+        }
     }
 }
 
@@ -255,13 +262,17 @@ __forceinline__ __device__ Surface loadSurface(
     }
     s.shadingNormal = shadingNormal;
 
+    // Clearcoat only contributes at QUALITY_HIGH and up — skip its texture
+    // fetches below that.
     s.clearcoat = material.clearcoat;
     s.clearcoatRoughness = material.clearcoatRoughness;
-    if (material.clearcoatTex != 0) {
-        s.clearcoat *= tex2DLod<float4>(material.clearcoatTex, texCoord.x, texCoord.y, texLOD).x;
-    }
-    if (material.clearcoatRoughnessTex != 0) {
-        s.clearcoatRoughness *= tex2DLod<float4>(material.clearcoatRoughnessTex, texCoord.x, texCoord.y, texLOD).y;
+    if (s.clearcoat > 0.0f && params.quality_mode >= QUALITY_HIGH) {
+        if (material.clearcoatTex != 0) {
+            s.clearcoat *= tex2DLod<float4>(material.clearcoatTex, texCoord.x, texCoord.y, texLOD).x;
+        }
+        if (material.clearcoatRoughnessTex != 0) {
+            s.clearcoatRoughness *= tex2DLod<float4>(material.clearcoatRoughnessTex, texCoord.x, texCoord.y, texLOD).y;
+        }
     }
 
     s.sheenColor = material.sheenColor;
@@ -739,7 +750,20 @@ __forceinline__ __device__ float3 tracePath(
             continue;
         }
 
+        //── Lobe weights for this vertex (shared by sampler, PDF, NEE MIS) ──
+        float NdotV = fmaxf(dot(s.shadingNormal, V), BRDF_EPSILON);
+        float pSpec = specularSelectProb(NdotV, s.baseColor, s.metallic, params.quality_mode);
+
         //── Path-guide lookup (sampling + training context) ─────────────────
+        // The guide learns INCIDENT RADIANCE, which is only a good sampling
+        // distribution for wide (diffuse-ish) lobes. Scaling the guide
+        // probability by the diffuse selection weight (1 - pSpec) makes
+        // near-specular surfaces sample pure VNDF: a fixed alpha sent 30% of
+        // samples at every metal vertex toward the light source, where the
+        // mirror BRDF is ~zero — compounding per bounce, that blackened
+        // metallic scenes and traced dead near-zero-throughput paths.
+        // pSpec is deterministic, so sampler / combined PDF / NEE MIS all
+        // derive the same effective alpha — the estimator stays consistent.
         float guideAlpha = 0.0f;
         unsigned int trainCellIdx = 0xFFFFFFFFu;
         TrilinearInfo guideTrilinear;
@@ -759,17 +783,28 @@ __forceinline__ __device__ float3 tracePath(
                 trainCellIdx = stochasticSelectCell(allNeighbors, randomFloat(seed));
                 if (trainCellIdx == 0xFFFFFFFFu) trainCellIdx = exactCellIdx;
 
-                guideTrilinear = filterTrilinearByValidLobes(grid, allNeighbors);
-                if (guideTrilinear.weightSum > 0.0f) {
-                    incrementGuideStat(GUIDE_STAT_VALID_LOBE);
-                    guideAlpha = clamp(params.path_guide_mis_weight, 0.0f, 0.95f);
+                float wantGuide = clamp(params.path_guide_mis_weight, 0.0f, 0.95f)
+                                * (1.0f - pSpec);
+                if (wantGuide > 0.02f) {
+                    guideTrilinear = filterTrilinearByValidLobes(grid, allNeighbors);
+                    if (guideTrilinear.weightSum > 0.0f) {
+                        incrementGuideStat(GUIDE_STAT_VALID_LOBE);
+                        guideAlpha = wantGuide;
+                    }
                 }
             } else if (params.path_guide_staging_buffer != nullptr &&
                        params.path_guide_staging_count != nullptr &&
-                       params.path_guide_staging_capacity > 0) {
+                       params.path_guide_staging_capacity > 0 &&
+                       randomFloat(seed) < 0.0625f) {
                 // Seed a cell so this region gets coverage. Seeding from every
                 // path vertex (not just primary hits) lets indirectly-visible
                 // regions — where guiding matters most — learn too.
+                //
+                // Probability-gated (1/16): on a fresh grid EVERY vertex used
+                // to append — millions of atomicAdds per frame on a SINGLE
+                // counter, fully serialized. That was the startup stall that
+                // faded as cells appeared. At 1/16 coverage still floods the
+                // staging buffer within a couple of frames.
                 float nx, ny, nz;
                 worldToNormalized(grid, s.pos.x, s.pos.y, s.pos.z, nx, ny, nz);
                 int ix, iy, iz;
@@ -781,10 +816,6 @@ __forceinline__ __device__ float3 tracePath(
                 pathGuideStagingAppend(staging, params.path_guide_start_level, ix, iy, iz);
             }
         }
-
-        //── Lobe weights for this vertex (shared by sampler, PDF, NEE MIS) ──
-        float NdotV = fmaxf(dot(s.shadingNormal, V), BRDF_EPSILON);
-        float pSpec = specularSelectProb(NdotV, s.baseColor, s.metallic, params.quality_mode);
 
         //── Next event estimation (one light sample, one shadow ray) ────────
         float3 neeContrib = sampleDirectLight(s, V, pSpec, guideAlpha,
@@ -807,10 +838,16 @@ __forceinline__ __device__ float3 tracePath(
         }
 
         //── Russian roulette (throughput-based, unbiased) ────────────────────
+        // Starts at depth 3, not 2: geometry seen THROUGH a reflection has its
+        // first GI bounce at depth 2, and killing there made reflected GI
+        // systematically noisier (and clamp-darker) than directly-viewed GI —
+        // the "back wall is black in the cups" symptom. Survival caps at 1:
+        // a path still carrying full throughput (mirror chains) loses real
+        // energy if killed; the depth cap bounds the cost instead.
         float rrInv = 1.0f;
-        if (depth >= 2) {
+        if (depth >= 3) {
             float maxT = fmaxf(throughput.x, fmaxf(throughput.y, throughput.z));
-            float survival = clamp(maxT, 0.05f, 0.95f);
+            float survival = clamp(maxT, 0.05f, 1.0f);
             if (randomFloat(seed) >= survival) {
                 if (trainCount < MAX_TRAIN_VERTICES) {
                     TrainRecord& tr = train[trainCount++];

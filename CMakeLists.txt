@@ -205,6 +205,8 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
         ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/brdf.h
         ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/vmf_device.h
         ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_grid_device.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_hash_device.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_cell_layout.h
     )
 
     add_custom_command(
@@ -277,7 +279,6 @@ add_executable(SpectraPBR
     src/rendering/light_manager.cpp
     src/rendering/path_guide_grid.cpp
     src/rendering/path_guide_kernels.cu
-    src/rendering/vmf_fitting.cpp
     src/rendering/hemisphere_vis.cpp
     # Loaders
     src/loaders/model_loader.cpp
@@ -315,6 +316,7 @@ target_include_directories(SpectraPBR PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/optix
     ${CMAKE_CURRENT_SOURCE_DIR}/src/rendering
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loaders
+    ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs
     ${OptiX_INCLUDE_DIRS}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${tinygltf_SOURCE_DIR}

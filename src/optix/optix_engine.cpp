@@ -125,23 +125,21 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.pick_x = 0;
     m_launchParams.pick_y = 0;
 
-    // Path guide grid (sparse + staging, cleared until set)
-    m_launchParams.path_guide_morton_codes = nullptr;
+    // Path guide grid (device-resident cell table, cleared until set)
     m_launchParams.path_guide_data = nullptr;
-    m_launchParams.path_guide_level_offsets = nullptr;
     m_launchParams.path_guide_num_levels = 0;
     m_launchParams.path_guide_entry_stride = 0;
     m_launchParams.path_guide_base_resolution = 0;
     m_launchParams.path_guide_per_level_scale = 1.0f;
     m_launchParams.path_guide_bounds_min[0] = m_launchParams.path_guide_bounds_min[1] = m_launchParams.path_guide_bounds_min[2] = 0.0f;
     m_launchParams.path_guide_bounds_max[0] = m_launchParams.path_guide_bounds_max[1] = m_launchParams.path_guide_bounds_max[2] = 0.0f;
-    m_launchParams.path_guide_staging_buffer = nullptr;
-    m_launchParams.path_guide_staging_count = nullptr;
-    m_launchParams.path_guide_staging_capacity = 0;
     m_launchParams.path_guide_hash_keys = nullptr;
     m_launchParams.path_guide_hash_values = nullptr;
     m_launchParams.path_guide_hash_table_size = 0;
     m_launchParams.path_guide_hash_shift = 64;
+    m_launchParams.path_guide_cell_keys = nullptr;
+    m_launchParams.path_guide_cell_counter = nullptr;
+    m_launchParams.path_guide_cell_capacity = 0;
     m_launchParams.path_guide_enabled = 0;     // Disabled by default
     m_launchParams.path_guide_mis_weight = 0.3f;  // Conservative: guide needs time to converge
     // Adaptive level parameters (defaults, updated when grid is set)
@@ -868,16 +866,13 @@ uint32_t OptixEngine::getAccumulatedFrames() const {
     return m_launchParams.accumulated_frames;
 }
 
-void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
-    const PathGuideStagingDescriptor* staging) {
+void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse) {
     auto zeroBounds = [this]() {
         m_launchParams.path_guide_bounds_min[0] = m_launchParams.path_guide_bounds_min[1] = m_launchParams.path_guide_bounds_min[2] = 0.0f;
         m_launchParams.path_guide_bounds_max[0] = m_launchParams.path_guide_bounds_max[1] = m_launchParams.path_guide_bounds_max[2] = 0.0f;
     };
     if (!sparse) {
-        m_launchParams.path_guide_morton_codes = nullptr;
         m_launchParams.path_guide_data = nullptr;
-        m_launchParams.path_guide_level_offsets = nullptr;
         m_launchParams.path_guide_num_levels = 0;
         m_launchParams.path_guide_entry_stride = 0;
         m_launchParams.path_guide_base_resolution = 0;
@@ -888,10 +883,11 @@ void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sp
         m_launchParams.path_guide_hash_values = nullptr;
         m_launchParams.path_guide_hash_table_size = 0;
         m_launchParams.path_guide_hash_shift = 64;
+        m_launchParams.path_guide_cell_keys = nullptr;
+        m_launchParams.path_guide_cell_counter = nullptr;
+        m_launchParams.path_guide_cell_capacity = 0;
     } else {
-        m_launchParams.path_guide_morton_codes = sparse->morton_codes;
         m_launchParams.path_guide_data = sparse->data;
-        m_launchParams.path_guide_level_offsets = sparse->level_offsets;
         m_launchParams.path_guide_num_levels = sparse->num_levels;
         m_launchParams.path_guide_entry_stride = sparse->entry_stride;
         m_launchParams.path_guide_base_resolution = sparse->base_resolution;
@@ -912,15 +908,9 @@ void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sp
         m_launchParams.path_guide_hash_values = sparse->hash_values;
         m_launchParams.path_guide_hash_table_size = sparse->hash_table_size;
         m_launchParams.path_guide_hash_shift = sparse->hash_shift;
-    }
-    if (!staging) {
-        m_launchParams.path_guide_staging_buffer = nullptr;
-        m_launchParams.path_guide_staging_count = nullptr;
-        m_launchParams.path_guide_staging_capacity = 0;
-    } else {
-        m_launchParams.path_guide_staging_buffer = staging->buffer;
-        m_launchParams.path_guide_staging_count = staging->count;
-        m_launchParams.path_guide_staging_capacity = staging->capacity;
+        m_launchParams.path_guide_cell_keys = sparse->cell_keys;
+        m_launchParams.path_guide_cell_counter = sparse->cell_counter;
+        m_launchParams.path_guide_cell_capacity = sparse->cell_capacity;
     }
 }
 

@@ -71,7 +71,8 @@ bool Application::init() {
     cudaMemset(m_accumulationBuffer, 0, bufferSize);
     m_optixEngine->setAccumulationBuffer(m_accumulationBuffer);
 
-    // Sparse multi-res path guide grid (collision-free)
+    // Sparse multi-res path guide grid (device-resident cell table:
+    // shaders allocate cells on first touch, no CPU build pipeline)
     m_pathGuideGrid = std::make_unique<PathGuideGrid>();
     PathGuideGridConfig gridConfig;
     gridConfig.num_levels = 8;
@@ -95,13 +96,6 @@ bool Application::init() {
     if (!m_pathGuideGrid->init(gridConfig)) {
         std::cerr << "[App] Path guide grid init failed (non-fatal)\n";
         m_pathGuideGrid.reset();
-    } else {
-        // Initialize async readback pipeline (double-buffered, non-blocking
-        // builds). Required for structure builds and refinement; without it
-        // the guide stays empty and rendering falls back to pure BSDF sampling.
-        if (!m_pathGuideGrid->initAsync()) {
-            std::cerr << "[App] Path guide async init failed (guiding unavailable)\n";
-        }
     }
 
     // Initialize wireframe renderer for grid debug visualization
@@ -138,7 +132,7 @@ bool Application::init() {
             [this](uint32_t l) {
                 m_debugGridLevel = l;
                 if (m_wireframeRenderer && m_wireframeRenderer->isInitialized() &&
-                    m_pathGuideGrid && m_pathGuideGrid->hasSparseData()) {
+                    m_pathGuideGrid && m_pathGuideGrid->refreshHostMirror()) {
                     auto vertices = m_pathGuideGrid->generateEdgeVertices(l);
                     m_wireframeRenderer->updateVertices(vertices);
                 }
@@ -887,75 +881,36 @@ void Application::renderFrame() {
 
     m_displayIdx = (m_writeIdx + 1) % 3;
 
-    // ═══ PHASE 1: BUILD THREAD CHECK ═══
-    // finishBuildFromReadback only manages the cell SET now (dedup + sort +
-    // hash build — lobe fitting happens on-device via refitLobes). It is
-    // cheap, but still runs on a background thread so cell-set growth never
-    // blocks the render loop.
-
-    // Step 1: Check if background build thread completed
-    if (m_buildThreadActive) {
-        if (m_buildFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            bool success = m_buildFuture.get();
-            m_buildThreadActive = false;
-
-            if (success) {
-                cudaStream_t renderStream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
-                m_pathGuideGrid->swapGrids(renderStream);
-                m_pathGuideBuildInFlight = false;
-                m_pathGuideTotalBuilds++;
-                m_pathGuideTrainingFrameCount = 0;
-
-                if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
-                    auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
-                    m_wireframeRenderer->updateVertices(vertices);
-                }
-                if (m_uiManager) {
-                    auto d = m_pathGuideGrid->getDescriptor();
-                    m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
-                }
-
-                // Run adaptive refinement every 5 builds
-                uint32_t currentFrame = m_optixEngine ? m_optixEngine->getFrameIndex() : 0;
-                if (m_pathGuideTotalBuilds > 0 && m_pathGuideTotalBuilds % 5 == 0) {
-                    cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
-                    if (m_pathGuideGrid->runRefinementPass(currentFrame, stream)) {
-                        if (m_debugGridVisualize && m_wireframeRenderer && m_wireframeRenderer->isInitialized()) {
-                            auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
-                            m_wireframeRenderer->updateVertices(vertices);
-                        }
-                        if (m_uiManager) {
-                            auto d = m_pathGuideGrid->getDescriptor();
-                            m_uiManager->updatePathGuideGridStats(d.num_levels, m_pathGuideGrid->getTotalCells(), d.entry_stride);
-                        }
-                    }
-                }
-
-                // If StepOnce, transition to Paused after build
-                if (m_pathGuideMode == PathGuideMode::StepOnce) {
-                    m_pathGuideMode = PathGuideMode::Paused;
-                }
-            } else {
-                m_pathGuideBuildInFlight = false;
-            }
-        }
-    }
-
-    // Step 2: Poll readback and launch build thread (only if no thread running)
-    if (!m_buildThreadActive && m_pathGuideBuildInFlight &&
-        m_pathGuideGrid && m_pathGuideGrid->pollAsyncReadback()) {
-        m_buildFuture = std::async(std::launch::async, [this]() {
-            return m_pathGuideGrid->finishBuildFromReadback();
-        });
-        m_buildThreadActive = true;
-    }
-
-    // Update UI status and optionally print stats when running
+    // ═══ PHASE 1: PATH GUIDE UI/DEBUG UPKEEP ═══
+    // The cell table is device-resident (shaders allocate cells on first
+    // touch), so there is no build pipeline to drive — only periodic UI
+    // bookkeeping: a non-blocking 4-byte cell-count poll, the debug stat
+    // reset, and (debug-viz only) a synchronous host-mirror refresh for the
+    // wireframe overlay.
     if (m_pathGuideMode != PathGuideMode::Disabled && m_optixEngine) {
         m_pathGuideStatsFrame++;
         if (m_pathGuideStatsFrame >= 60) {
             m_pathGuideStatsFrame = 0;
-            m_optixEngine->resetPathGuideStats(m_cudaInterop ? m_cudaInterop->getStream() : nullptr);
+            cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+            m_optixEngine->resetPathGuideStats(stream);
+
+            if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+                m_pathGuideGrid->requestCellCountAsync(stream);
+
+                if (m_debugGridVisualize && m_wireframeRenderer &&
+                    m_wireframeRenderer->isInitialized() &&
+                    m_pathGuideGrid->refreshHostMirror()) {
+                    auto vertices = m_pathGuideGrid->generateEdgeVerticesAllLevels();
+                    m_wireframeRenderer->updateVertices(vertices);
+                }
+
+                if (m_uiManager) {
+                    m_uiManager->updatePathGuideGridStats(
+                        m_pathGuideGrid->getNumLevels(),
+                        m_pathGuideGrid->getTotalCells(),
+                        m_pathGuideGrid->getEntryStride());
+                }
+            }
 
             // Update automation status in UI
             if (m_uiManager) {
@@ -966,7 +921,7 @@ void Application::renderFrame() {
                     case PathGuideMode::StepOnce: modeStr = "StepOnce"; break;
                     default: break;
                 }
-                m_uiManager->updatePathGuideAutomationStatus(modeStr, m_pathGuideTrainingFrameCount, m_pathGuideTotalBuilds);
+                m_uiManager->updatePathGuideAutomationStatus(modeStr, m_pathGuideTrainingFrameCount, m_pathGuideSubdivPasses);
             }
         }
     }
@@ -1071,38 +1026,40 @@ void Application::renderFrame() {
     { auto tNow = diagT(); diagAccum[4] += diagMs(tPrev, tNow); tPrev = tNow; }
 
     // ═══ PHASE 3: PATH GUIDE SETUP ═══
-    m_buildThisFrame = false;
     if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
         bool training = (m_pathGuideMode == PathGuideMode::Running ||
                          m_pathGuideMode == PathGuideMode::StepOnce);
-
-        // Determine if we should run a STRUCTURE build this frame (staging ->
-        // new cells). Lobe refitting is separate and happens on-device below.
-        if (!m_pathGuideBuildInFlight) {
-            if (m_pathGuideMode == PathGuideMode::Running &&
-                m_pathGuideTrainingFrameCount >= m_pathGuideAutoBuildInterval) {
-                m_buildThisFrame = true;
-            } else if (m_pathGuideMode == PathGuideMode::StepOnce) {
-                m_buildThisFrame = true;
-            }
-        }
+        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+        uint32_t currentFrame = m_optixEngine->getFrameIndex();
+        bool stepOnce = (m_pathGuideMode == PathGuideMode::StepOnce);
 
         // Device-side lobe refit: fold interval sums into cumulative sums and
-        // refit vMF lobes in place — a tiny kernel on the render stream,
-        // replacing the old CPU fit + full readback/upload round trip. Lobes
-        // only change between launches, so sampling PDFs stay consistent
-        // within each frame.
-        if (training && m_pathGuideGrid->hasSparseData() &&
-            (m_pathGuideTrainingFrameCount % m_pathGuideRefitInterval) == 0) {
-            m_pathGuideGrid->refitLobes(
-                m_optixEngine->getFrameIndex(),
-                m_cudaInterop ? m_cudaInterop->getStream() : nullptr);
+        // refit vMF lobes in place — a tiny kernel on the render stream.
+        // Lobes only change between launches, so sampling PDFs stay
+        // consistent within each frame.
+        if (training &&
+            ((m_pathGuideTrainingFrameCount % m_pathGuideRefitInterval) == 0 || stepOnce)) {
+            m_pathGuideGrid->refitLobes(currentFrame, stream);
         }
 
-        // Use render descriptor (stable, not being mutated by build)
-        SparsePathGuideDescriptor sparseDesc = m_pathGuideGrid->getRenderDescriptor();
-        PathGuideStagingDescriptor stagingDesc = m_pathGuideGrid->getStagingDescriptor();
-        m_optixEngine->setPathGuideGridDescriptor(&sparseDesc, &stagingDesc);
+        // Device-side subdivision: insert children of cells whose EMA deposit
+        // count crossed the threshold. Idempotent and cheap; the new cells
+        // are usable as soon as the next refit gives them their own fit
+        // (until then they sample with the parent's warm-started lobe).
+        if (training && (stepOnce ||
+            (m_pathGuideTrainingFrameCount > 0 &&
+             (m_pathGuideTrainingFrameCount % m_pathGuideGrid->getConfig().refine_interval_frames) == 0))) {
+            m_pathGuideGrid->runSubdivisionPass(currentFrame, stream);
+            m_pathGuideSubdivPasses++;
+        }
+
+        // StepOnce: one refit + subdivision step, then freeze
+        if (stepOnce) {
+            m_pathGuideMode = PathGuideMode::Paused;
+        }
+
+        SparsePathGuideDescriptor sparseDesc = m_pathGuideGrid->getDescriptor();
+        m_optixEngine->setPathGuideGridDescriptor(&sparseDesc);
         const auto& config = m_pathGuideGrid->getConfig();
         m_optixEngine->setPathGuideLevelConfig(config.start_level, config.min_level, config.max_level);
 
@@ -1111,7 +1068,7 @@ void Application::renderFrame() {
             m_pathGuideTrainingFrameCount++;
         }
     } else {
-        m_optixEngine->setPathGuideGridDescriptor(nullptr, nullptr);
+        m_optixEngine->setPathGuideGridDescriptor(nullptr);
     }
 
     // [DIAG] pgSetup
@@ -1139,15 +1096,7 @@ void Application::renderFrame() {
     // [DIAG] unmapEvt
     { auto tNow = diagT(); diagAccum[8] += diagMs(tPrev, tNow); tPrev = tNow; }
 
-    // ═══ PHASE 5: ASYNC I/O + ADVANCE ═══
-    // Kick off async readback after this frame's trace has written to staging
-    if (m_buildThisFrame && m_pathGuideGrid && m_pathGuideGrid->isInitialized() && !m_pathGuideBuildInFlight) {
-        cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
-        uint32_t currentFrame = m_optixEngine ? m_optixEngine->getFrameIndex() : 0;
-        m_pathGuideGrid->beginAsyncReadback(stream, currentFrame);
-        m_pathGuideBuildInFlight = true;
-    }
-
+    // ═══ PHASE 5: ADVANCE ═══
     m_writeIdx = (m_writeIdx + 1) % 3;
     m_framesPipelined++;
 
@@ -1187,12 +1136,6 @@ void Application::updateCamera(float deltaTime) {
 void Application::shutdown() {
     m_running = false;
     s_instance = nullptr;
-
-    // Wait for any in-flight build thread before destroying resources
-    if (m_buildThreadActive && m_buildFuture.valid()) {
-        m_buildFuture.wait();
-        m_buildThreadActive = false;
-    }
 
     if (m_hemisphereVis) m_hemisphereVis->shutdown();
     if (m_inputHandler) m_inputHandler->shutdown();
@@ -1471,8 +1414,10 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
         }
 
         // Cell inspector: look up grid cell at hit position
+        // (inspectCellAtPosition refreshes the host mirror itself, so gate on
+        // initialization only — the polled cell count can lag by ~60 frames)
         if (pickResult.instanceId != UINT32_MAX && app->m_pathGuideGrid &&
-            app->m_pathGuideGrid->hasSparseData()) {
+            app->m_pathGuideGrid->isInitialized()) {
             const auto& cfg = app->m_pathGuideGrid->getConfig();
             std::cout << "[CellInspect] Hit pos: (" << pickResult.hitX << ", "
                       << pickResult.hitY << ", " << pickResult.hitZ
@@ -1496,43 +1441,59 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                 info.iz = cellResult.iz;
                 std::memcpy(info.cellAABBMin, cellResult.aabbMin, sizeof(float) * 3);
                 std::memcpy(info.cellAABBMax, cellResult.aabbMax, sizeof(float) * 3);
-                // Single vMF lobe stored as mean vector + kappa
-                // (layout: see path_guide_grid.h PG_* offsets)
-                float mx = cellResult.data[PG_MU_X];
-                float my = cellResult.data[PG_MU_Y];
-                float mz = cellResult.data[PG_MU_Z];
-                float mlen = std::sqrt(mx*mx + my*my + mz*mz);
-                if (mlen > 1e-8f) {
-                    info.theta0 = std::acos(std::max(-1.0f, std::min(1.0f, my / mlen)));
-                    info.phi0 = std::atan2(mz, mx);
-                    if (info.phi0 < 0.0f) info.phi0 += 6.28318530718f;
-                } else {
-                    info.theta0 = 0.0f;
-                    info.phi0 = 0.0f;
+                // vMF mixture: show the top-2 lobes by mixture weight
+                // (layout: see path_guide_cell_layout.h)
+                int top0 = 0, top1 = -1;
+                for (int k = 1; k < PG_NUM_LOBES; k++) {
+                    float w = cellResult.data[k * PG_LOBE_STRIDE + PG_L_WEIGHT];
+                    if (w > cellResult.data[top0 * PG_LOBE_STRIDE + PG_L_WEIGHT]) {
+                        top1 = top0;
+                        top0 = k;
+                    } else if (top1 < 0 ||
+                               w > cellResult.data[top1 * PG_LOBE_STRIDE + PG_L_WEIGHT]) {
+                        top1 = k;
+                    }
                 }
-                info.kappa0 = cellResult.data[PG_KAPPA];
-                info.theta1 = 0.0f;
-                info.phi1 = 0.0f;
-                info.kappa1 = 0.0f;
-                info.pi0 = 1.0f;
-                // Cumulative (EMA lifetime) stats
-                info.sumW = cellResult.data[PG_CUM_SUM_W];
-                float sumX = cellResult.data[PG_CUM_SUM_X];
-                float sumY = cellResult.data[PG_CUM_SUM_Y];
-                float sumZ = cellResult.data[PG_CUM_SUM_Z];
-                float meanLen = (info.sumW > 1e-9f)
-                    ? std::sqrt(sumX*sumX + sumY*sumY + sumZ*sumZ) / info.sumW
+                auto lobeAngles = [&cellResult](int k, float& theta, float& phi) {
+                    const float* l = cellResult.data + k * PG_LOBE_STRIDE;
+                    float mx = l[PG_L_MU_X], my = l[PG_L_MU_Y], mz = l[PG_L_MU_Z];
+                    float mlen = std::sqrt(mx*mx + my*my + mz*mz);
+                    if (mlen > 1e-8f) {
+                        theta = std::acos(std::max(-1.0f, std::min(1.0f, my / mlen)));
+                        phi = std::atan2(mz, mx);
+                        if (phi < 0.0f) phi += 6.28318530718f;
+                    } else {
+                        theta = 0.0f;
+                        phi = 0.0f;
+                    }
+                };
+                lobeAngles(top0, info.theta0, info.phi0);
+                info.kappa0 = cellResult.data[top0 * PG_LOBE_STRIDE + PG_L_KAPPA];
+                lobeAngles(top1, info.theta1, info.phi1);
+                info.kappa1 = cellResult.data[top1 * PG_LOBE_STRIDE + PG_L_KAPPA];
+                float w0 = cellResult.data[top0 * PG_LOBE_STRIDE + PG_L_WEIGHT];
+                float w1 = cellResult.data[top1 * PG_LOBE_STRIDE + PG_L_WEIGHT];
+                info.pi0 = (w0 + w1 > 1e-9f) ? w0 / (w0 + w1) : 1.0f;
+                // Cumulative (EMA lifetime) stats, summed over all lobes
+                float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f, sumW = 0.0f;
+                for (int k = 0; k < PG_NUM_LOBES; k++) {
+                    const float* cs = cellResult.data + PG_CUMS_BASE + k * 4;
+                    sumX += cs[0]; sumY += cs[1]; sumZ += cs[2]; sumW += cs[3];
+                }
+                info.sumW = sumW;
+                float meanLen = (sumW > 1e-9f)
+                    ? std::sqrt(sumX*sumX + sumY*sumY + sumZ*sumZ) / sumW
                     : 0.0f;
                 info.variance = 1.0f - meanLen;
                 info.lastFrame = cellResult.data[PG_LAST_HIT_FRAME];
 
                 // Determine subdivision/coarsening status (display heuristic)
                 const auto& config = app->m_pathGuideGrid->getConfig();
+                // Subdivision is count-based (matches subdivideCellsKernel);
+                // coarsening is retired (cell indices are stable).
                 info.wouldSubdivide = (cellResult.level < config.max_level &&
-                    info.sumW >= config.subdivide_sample_threshold &&
-                    info.variance > config.subdivide_variance_threshold);
-                info.wouldCoarsen = (cellResult.level > config.min_level &&
-                    app->m_optixEngine->getFrameIndex() > static_cast<uint32_t>(info.lastFrame) + config.coarsen_frames_threshold);
+                    cellResult.data[PG_CUM_COUNT] >= config.subdivide_count_threshold);
+                info.wouldCoarsen = false;
             }
 
             app->m_inspectedCell = info;

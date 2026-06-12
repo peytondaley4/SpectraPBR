@@ -25,12 +25,23 @@ __forceinline__ __device__ float vmfPdf(float kappa, float cos_theta) {
     return fmaxf(pdf, 0.0f);
 }
 
+// Cached-normalization variant: exp(-2*kappa) is precomputed by the refit
+// kernel and stored per lobe, halving the expf count on the PDF hot path.
+__forceinline__ __device__ float vmfPdfCached(float kappa, float exp_neg2k, float cos_theta) {
+    if (kappa <= 1e-6f) return 0.07957747154f;  // 1/(4*pi)
+    float denom = 1.0f - exp_neg2k;
+    if (denom < 1e-10f) denom = 1.0f;  // large kappa: exp(-2k) underflows to 0
+    float pdf = (kappa / 6.28318530718f) * expf(kappa * (cos_theta - 1.0f)) / denom;
+    return fmaxf(pdf, 0.0f);
+}
+
 // Sample direction from vMF(mu, kappa). Wood/Ulrich:
 //   w = 1 + ln(u1 + (1-u1)*exp(-2k)) / k, then omega = sqrt(1-w^2)*v + w*mu.
-// mu must be unit length. u1, u2 in [0,1) from caller.
-__forceinline__ __device__ void vmfSample(
+// mu must be unit length. u1, u2 in [0,1) from caller. exp_neg2k is the
+// precomputed exp(-2*kappa) (refit kernel caches it per lobe).
+__forceinline__ __device__ void vmfSampleCached(
     float mx, float my, float mz,
-    float kappa,
+    float kappa, float exp_neg2k,
     float u1, float u2,
     float& ox, float& oy, float& oz)
 {
@@ -38,8 +49,7 @@ __forceinline__ __device__ void vmfSample(
     if (kappa <= 1e-6f) {
         w = 2.0f * u1 - 1.0f;  // uniform on sphere
     } else {
-        float exp2k = expf(-2.0f * kappa);
-        float arg = u1 + (1.0f - u1) * exp2k;
+        float arg = u1 + (1.0f - u1) * exp_neg2k;
         if (arg < 1e-10f) arg = 1e-10f;
         w = 1.0f + logf(arg) / kappa;
     }

@@ -26,7 +26,6 @@
 #include <filesystem>
 #include <string>
 #include <memory>
-#include <future>
 
 namespace spectra {
 
@@ -193,13 +192,8 @@ private:
     };
     PathGuideMode m_pathGuideMode = PathGuideMode::Disabled;
     uint32_t m_pathGuideTrainingFrameCount = 0;
-    uint32_t m_pathGuideAutoBuildInterval = 8;  // Structure rebuild check every N frames
     uint32_t m_pathGuideRefitInterval = 4;      // Device-side lobe refit every N frames
-    uint32_t m_pathGuideTotalBuilds = 0;
-    bool m_buildThisFrame = false;
-    bool m_pathGuideBuildInFlight = false;
-    std::future<bool> m_buildFuture;         // Background thread for CPU-heavy build processing
-    bool m_buildThreadActive = false;        // True while background build thread is running
+    uint32_t m_pathGuideSubdivPasses = 0;       // Subdivision kernel runs (UI status)
     uint32_t m_pathGuideStatsFrame = 0;      // Frame counter for stats printing
 
     // Cell inspector state (populated on click)

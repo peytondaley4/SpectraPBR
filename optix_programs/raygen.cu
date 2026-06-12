@@ -44,6 +44,12 @@
 #define MAX_TRAIN_VERTICES   8
 #define TRAIN_WEIGHT_CLAMP   500.0f
 
+// Training deposits are subsampled per path with compensating weight: the
+// learned distribution is unchanged in expectation, the contended per-cell
+// atomic traffic drops by 1/PG_TRAIN_PROB.
+#define PG_TRAIN_PROB        0.25f
+#define PG_TRAIN_WEIGHT_SCALE 4.0f   // 1 / PG_TRAIN_PROB
+
 // Far distance for secondary rays and unbounded shadow rays. Tied to the
 // camera far plane (which the host scales to the scene size) so very large
 // scenes don't get clipped by a hardcoded constant.
@@ -395,17 +401,34 @@ __forceinline__ __device__ bool sampleMeshLightPoint(
     return true;
 }
 
+// Per-vertex guide context: ONE cell's vMF lobe, cached in registers.
+// Müller-style single-cell conditioning — the position is jittered by ±0.5
+// cell, the cell at the jittered position becomes THE guide distribution for
+// this vertex, and the sampler, the continuation PDF, and the NEE MIS pdf all
+// condition on it. The jitter is drawn independently of any direction, so the
+// estimator stays unbiased while touching one cell instead of an 8-cell
+// trilinear mixture (and zero cell memory per PDF evaluation).
+struct GuideLobe {
+    float mux, muy, muz;
+    float kappa;
+    float expNeg2K;   // exp(-2*kappa), cached by the refit kernel
+};
+
+__forceinline__ __device__ float guideLobePdf(const GuideLobe& lobe, const float3& L) {
+    float cosT = lobe.mux * L.x + lobe.muy * L.y + lobe.muz * L.z;
+    return fmaxf(vmfPdfCached(lobe.kappa, lobe.expNeg2K, cosT), 1e-10f);
+}
+
 // Next event estimation at a shading vertex. Returns the (selection- and
 // MIS-weighted) radiance contribution, NOT multiplied by path throughput.
 // pathPdfAt(L) for the MIS weight is alpha*p_guide(L) + (1-alpha)*p_bsdf(L),
-// evaluated with the same guide context / lobe weights the path sampler uses.
+// evaluated with the same guide lobe the path sampler uses.
 // finalVertex: the path will NOT continue past this vertex (depth cap), so
 // the BSDF-side technique does not exist and NEE must take full weight —
 // MIS-weighting it down here would lose direct light.
 __forceinline__ __device__ float3 sampleDirectLight(
     const Surface& s, const float3& V,
-    float pSpec, float guideAlpha,
-    const SparsePathGuideDescriptorDevice& grid, const TrilinearInfo& guideTrilinear,
+    float pSpec, float guideAlpha, const GuideLobe& guideLobe,
     unsigned int& seed, bool finalVertex)
 {
     float grandTotal = params.total_light_luminance + params.env_selection_weight;
@@ -491,7 +514,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
                             // BSDF/guide sampling can also hit this geometry — MIS.
                             float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec);
                             if (guideAlpha > 0.0f) {
-                                float pGuide = trilinearGuidePdf(grid, guideTrilinear, L.x, L.y, L.z);
+                                float pGuide = guideLobePdf(guideLobe, L);
                                 pPath = guideAlpha * pGuide + (1.0f - guideAlpha) * pPath;
                             }
                             misW = pLight / (pLight + pPath);
@@ -524,7 +547,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
                     if (!finalVertex) {
                         float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec);
                         if (guideAlpha > 0.0f) {
-                            float pGuide = trilinearGuidePdf(grid, guideTrilinear, L.x, L.y, L.z);
+                            float pGuide = guideLobePdf(guideLobe, L);
                             pPath = guideAlpha * pGuide + (1.0f - guideAlpha) * pPath;
                         }
                         misW = pLight / (pLight + pPath);
@@ -590,24 +613,25 @@ __forceinline__ __device__ float3 tracePath(
     float tmax = params.camera.farPlane;
 
     // Training records (backward pass at path end)
-    const bool guidingActive = (params.path_guide_enabled != 0) && (params.path_guide_num_levels > 0);
+    const bool guidingActive = (params.path_guide_enabled != 0) &&
+                               (params.path_guide_hash_table_size > 0);
     SparsePathGuideDescriptorDevice grid = {};
     if (guidingActive) {
-        grid.morton_codes = params.path_guide_morton_codes;
-        grid.data = params.path_guide_data;
-        grid.level_offsets = params.path_guide_level_offsets;
-        grid.num_levels = params.path_guide_num_levels;
-        grid.entry_stride = params.path_guide_entry_stride;
+        grid.table.hash_keys = params.path_guide_hash_keys;
+        grid.table.hash_values = params.path_guide_hash_values;
+        grid.table.hash_table_size = params.path_guide_hash_table_size;
+        grid.table.hash_shift = params.path_guide_hash_shift;
+        grid.table.cell_keys = params.path_guide_cell_keys;
+        grid.table.cell_counter = params.path_guide_cell_counter;
+        grid.table.cell_capacity = params.path_guide_cell_capacity;
+        grid.table.data = params.path_guide_data;
+        grid.table.entry_stride = params.path_guide_entry_stride;
         grid.bounds_min[0] = params.path_guide_bounds_min[0];
         grid.bounds_min[1] = params.path_guide_bounds_min[1];
         grid.bounds_min[2] = params.path_guide_bounds_min[2];
         grid.bounds_max[0] = params.path_guide_bounds_max[0];
         grid.bounds_max[1] = params.path_guide_bounds_max[1];
         grid.bounds_max[2] = params.path_guide_bounds_max[2];
-        grid.hash_keys = params.path_guide_hash_keys;
-        grid.hash_values = params.path_guide_hash_values;
-        grid.hash_table_size = params.path_guide_hash_table_size;
-        grid.hash_shift = params.path_guide_hash_shift;
     }
     TrainRecord train[MAX_TRAIN_VERTICES];
     int trainCount = 0;
@@ -762,64 +786,113 @@ __forceinline__ __device__ float3 tracePath(
         // samples at every metal vertex toward the light source, where the
         // mirror BRDF is ~zero — compounding per bounce, that blackened
         // metallic scenes and traced dead near-zero-throughput paths.
-        // pSpec is deterministic, so sampler / combined PDF / NEE MIS all
-        // derive the same effective alpha — the estimator stays consistent.
+        // pSpec, the jittered cell, kappa, and the cumN confidence ramp are
+        // all deterministic given the jitter, so sampler / combined PDF /
+        // NEE MIS all derive the same effective alpha and lobe — the
+        // estimator stays consistent.
         float guideAlpha = 0.0f;
-        unsigned int trainCellIdx = 0xFFFFFFFFu;
-        TrilinearInfo guideTrilinear;
-        guideTrilinear.weightSum = 0.0f;
+        unsigned int trainCellIdx = PG_INVALID_CELL;
+        GuideLobe guideLobe = {};
         if (guidingActive && !atCap) {
             incrementGuideStat(GUIDE_STAT_ATTEMPTS);
             unsigned int foundLevel = 0;
-            unsigned int exactCellIdx = hierarchicalCellLookup(
+            unsigned int exactCellIdx = topDownCellLookup(
                 grid, s.pos.x, s.pos.y, s.pos.z,
-                params.path_guide_max_level, params.path_guide_min_level, &foundLevel);
-            if (exactCellIdx != 0xFFFFFFFFu) {
+                params.path_guide_start_level, params.path_guide_max_level, &foundLevel);
+            if (exactCellIdx == PG_INVALID_CELL) {
+                // First touch of this region: allocate the base-level cell on
+                // device (atomicCAS insert, deduplicated by construction —
+                // replaces the staging buffer + readback + CPU merge round
+                // trip, which took ~10 frames and flooded with duplicates).
+                // Bounds-checked inside: out-of-grid vertices never allocate.
+                // The fresh cell trains immediately; it cannot be sampled
+                // until its first refit fits a lobe.
+                exactCellIdx = pathGuideInsertBaseCell(
+                    grid, s.pos.x, s.pos.y, s.pos.z, params.path_guide_start_level);
+                foundLevel = params.path_guide_start_level;
+            }
+            if (exactCellIdx != PG_INVALID_CELL) {
                 incrementGuideStat(GUIDE_STAT_CELL_FOUND);
-                TrilinearInfo allNeighbors = computeTrilinearNeighbors(
-                    grid, s.pos.x, s.pos.y, s.pos.z, foundLevel);
-                // Stochastic box filter (Müller 2017): train one trilinear
-                // neighbor picked by weight — equivalent to ±0.5 cell jitter.
-                trainCellIdx = stochasticSelectCell(allNeighbors, randomFloat(seed));
-                if (trainCellIdx == 0xFFFFFFFFu) trainCellIdx = exactCellIdx;
+
+                // Stochastic box filter (Müller 2017): jitter the query by
+                // ±0.5 cell at the found level and use THE cell at the
+                // jittered position for training, sampling, and every PDF.
+                // Marginalized over the jitter this is the same box-filtered
+                // mixture the old 8-cell trilinear evaluated explicitly.
+                float res = sparseResolutionAtLevel(grid, foundLevel);
+                float invRes = 1.0f / res;
+                float jx = s.pos.x + (randomFloat(seed) - 0.5f) * (grid.bounds_max[0] - grid.bounds_min[0]) * invRes;
+                float jy = s.pos.y + (randomFloat(seed) - 0.5f) * (grid.bounds_max[1] - grid.bounds_min[1]) * invRes;
+                float jz = s.pos.z + (randomFloat(seed) - 0.5f) * (grid.bounds_max[2] - grid.bounds_min[2]) * invRes;
+                unsigned int jitterLevel = 0;
+                unsigned int ctxCellIdx = topDownCellLookup(
+                    grid, jx, jy, jz,
+                    params.path_guide_start_level, params.path_guide_max_level, &jitterLevel);
+                if (ctxCellIdx == PG_INVALID_CELL) ctxCellIdx = exactCellIdx;  // jitter left coverage
+                trainCellIdx = ctxCellIdx;
 
                 float wantGuide = clamp(params.path_guide_mis_weight, 0.0f, 0.95f)
                                 * (1.0f - pSpec);
                 if (wantGuide > 0.02f) {
-                    guideTrilinear = filterTrilinearByValidLobes(grid, allNeighbors);
-                    if (guideTrilinear.weightSum > 0.0f) {
-                        incrementGuideStat(GUIDE_STAT_VALID_LOBE);
-                        guideAlpha = wantGuide;
+                    const float* cell = sparseCellDataPtr(grid, ctxCellIdx);
+                    if (cell != nullptr) {
+                        // Confidence ramp keeps barely-trained mixtures from
+                        // grabbing full weight.
+                        float cumN = cell[PG_CUM_COUNT];
+                        float conf = fminf(cumN * (1.0f / 32.0f), 1.0f);
+                        if (conf > 0.0f) {
+                            // Eligible-lobe subset: only narrow lobes (kappa
+                            // >= 2) with real mixture weight. Wide lobes are
+                            // no better than the cosine BSDF leg and waste up
+                            // to half their samples below the horizon;
+                            // re-seeded exploratory lobes (kappa 1) stay
+                            // training-only. The guide leg samples ONE
+                            // eligible lobe picked by mixture weight — the
+                            // same auxiliary-variable conditioning as the
+                            // cell jitter, so using that lobe's pdf in every
+                            // MIS denominator stays unbiased.
+                            float eligW[PG_NUM_LOBES];
+                            float eligSum = 0.0f;
+                            for (int k = 0; k < PG_NUM_LOBES; k++) {
+                                const float* l = cell + k * PG_LOBE_STRIDE;
+                                bool elig = (l[PG_L_KAPPA] >= 2.0f) &&
+                                            (l[PG_L_WEIGHT] >= 0.05f);
+                                eligW[k] = elig ? l[PG_L_WEIGHT] : 0.0f;
+                                eligSum += eligW[k];
+                            }
+                            // Alpha scales by the eligible mixture mass: a
+                            // cell that is half "narrow window" and half
+                            // "broad sky" guides half its continuation budget
+                            // and leaves the rest to the BSDF leg.
+                            float alpha = wantGuide * conf * eligSum;
+                            if (eligSum > 0.05f && alpha >= 0.02f) {
+                                float target = randomFloat(seed) * eligSum;
+                                float cum = 0.0f;
+                                int pick = 0;
+                                for (int k = 0; k < PG_NUM_LOBES; k++) {
+                                    if (eligW[k] <= 0.0f) continue;
+                                    pick = k;  // last eligible is the fallback
+                                    cum += eligW[k];
+                                    if (target <= cum) break;
+                                }
+                                const float* l = cell + pick * PG_LOBE_STRIDE;
+                                incrementGuideStat(GUIDE_STAT_VALID_LOBE);
+                                guideLobe.mux = l[PG_L_MU_X];
+                                guideLobe.muy = l[PG_L_MU_Y];
+                                guideLobe.muz = l[PG_L_MU_Z];
+                                guideLobe.kappa = l[PG_L_KAPPA];
+                                guideLobe.expNeg2K = l[PG_L_EXP_NEG2K];
+                                guideAlpha = alpha;
+                            }
+                        }
                     }
                 }
-            } else if (params.path_guide_staging_buffer != nullptr &&
-                       params.path_guide_staging_count != nullptr &&
-                       params.path_guide_staging_capacity > 0 &&
-                       randomFloat(seed) < 0.0625f) {
-                // Seed a cell so this region gets coverage. Seeding from every
-                // path vertex (not just primary hits) lets indirectly-visible
-                // regions — where guiding matters most — learn too.
-                //
-                // Probability-gated (1/16): on a fresh grid EVERY vertex used
-                // to append — millions of atomicAdds per frame on a SINGLE
-                // counter, fully serialized. That was the startup stall that
-                // faded as cells appeared. At 1/16 coverage still floods the
-                // staging buffer within a couple of frames.
-                float nx, ny, nz;
-                worldToNormalized(grid, s.pos.x, s.pos.y, s.pos.z, nx, ny, nz);
-                int ix, iy, iz;
-                normalizedToCell(nx, ny, nz, params.path_guide_start_level, grid, ix, iy, iz);
-                PathGuideStagingDevice staging;
-                staging.buffer = params.path_guide_staging_buffer;
-                staging.count = params.path_guide_staging_count;
-                staging.capacity = params.path_guide_staging_capacity;
-                pathGuideStagingAppend(staging, params.path_guide_start_level, ix, iy, iz);
             }
         }
 
         //── Next event estimation (one light sample, one shadow ray) ────────
         float3 neeContrib = sampleDirectLight(s, V, pSpec, guideAlpha,
-            grid, guideTrilinear, seed, atCap);
+            guideLobe, seed, atCap);
         radiance = radiance + clampContribution(throughput * neeContrib);
 
         float localLum = luminance3(emissionContrib + neeContrib);
@@ -866,14 +939,13 @@ __forceinline__ __device__ float3 tracePath(
         float3 L;
         bool haveDir = false;
         if (guideAlpha > 0.0f && randomFloat(seed) < guideAlpha) {
-            // Guide leg: pick one trilinear neighbor, sample its vMF
-            unsigned int sampleCell = stochasticSelectCell(guideTrilinear, randomFloat(seed));
+            // Guide leg: sample the vertex's conditioned vMF lobe
             float gx, gy, gz;
-            if (sampleCell != 0xFFFFFFFFu &&
-                pathGuideSampleDirection(grid, sampleCell, randomFloat(seed), randomFloat(seed), gx, gy, gz)) {
-                L = make_float3(gx, gy, gz);
-                haveDir = true;
-            }
+            vmfSampleCached(guideLobe.mux, guideLobe.muy, guideLobe.muz,
+                guideLobe.kappa, guideLobe.expNeg2K,
+                randomFloat(seed), randomFloat(seed), gx, gy, gz);
+            L = make_float3(gx, gy, gz);
+            haveDir = true;
         } else {
             incrementGuideStat(GUIDE_STAT_BSDF_SAMPLED);
             haveDir = sampleBSDFMixture(V, s.shadingNormal, s.roughness, pSpec,
@@ -901,7 +973,7 @@ __forceinline__ __device__ float3 tracePath(
         float pdfBsdf = pdfBSDFMixture(V, L, s.shadingNormal, s.roughness, pSpec);
         float combinedPdf;
         if (guideAlpha > 0.0f) {
-            float pdfGuide = trilinearGuidePdf(grid, guideTrilinear, L.x, L.y, L.z);
+            float pdfGuide = guideLobePdf(guideLobe, L);
             combinedPdf = guideAlpha * pdfGuide + (1.0f - guideAlpha) * pdfBsdf;
         } else {
             combinedPdf = pdfBsdf;
@@ -951,15 +1023,21 @@ __forceinline__ __device__ float3 tracePath(
     // direction:  L_o(k) = local(k) + beta(k) * L_o(k+1), seeded with the
     // environment radiance if the path escaped. Deposit Li/pdf (clamped) into
     // the vertex's training cell. Training only shapes the guide — image
-    // unbiasedness never depends on it.
-    if (guidingActive && trainCount > 0) {
+    // unbiasedness never depends on it. Subsampled per path (PG_TRAIN_PROB)
+    // with compensating weight to cut contended atomic traffic.
+    if (guidingActive && trainCount > 0 && randomFloat(seed) < PG_TRAIN_PROB) {
         float lo = terminalEnvLum;
         for (int k = trainCount - 1; k >= 0; --k) {
             const TrainRecord& tr = train[k];
             if (tr.cellIdx != 0xFFFFFFFFu && lo > 1e-6f && tr.pdf > 1e-8f) {
                 float* cell = sparseCellDataPtr(grid, tr.cellIdx);
                 if (cell != nullptr) {
-                    float w = fminf(lo / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP);
+                    // Clamp BEFORE the subsampling compensation so the
+                    // effective per-estimate clamp matches the unsubsampled
+                    // semantics (clamp-after-scale would tighten it 4x and
+                    // suppress exactly the bright signals worth learning).
+                    float w = fminf(lo / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
+                            * PG_TRAIN_WEIGHT_SCALE;
                     pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, params.frame_index);
                 }
             }

@@ -3,11 +3,16 @@
 //------------------------------------------------------------------------------
 // Device-side path-guide maintenance kernels (launchers).
 //
-// These replace the previous CPU build pipeline's per-build full readback /
-// vMF fit / full upload (10–300 ms CPU plus a training-loss window between
-// snapshot and swap). The refit kernel runs in-place on the render stream in
-// well under a millisecond, so lobes can be refit every few frames and no
-// training deposit is ever lost.
+// The cell table is device-resident (path_guide_hash_device.h): shaders
+// allocate cells on first touch, so there is no structure build, readback,
+// or grid swap to maintain. What remains host-driven is launching:
+//   - the refit kernel (fold interval sums into EMA cumulative sums, refit
+//     each cell's vMF lobe in place), every few frames, and
+//   - the subdivision kernel (insert the 8 children of any cell whose
+//     EMA deposit count crossed the threshold; PPG-style sample-count
+//     criterion), every refine interval.
+// Both are bounded by the device-side allocation counter — the host never
+// needs to know the cell count to launch them.
 //------------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -15,28 +20,44 @@
 
 namespace spectra {
 
-// Gather-map sentinel/flags (see launchGatherCells)
-constexpr uint32_t PG_GATHER_NEW_CELL   = 0xFFFFFFFFu;  // zero-init, lastHitFrame = current
-constexpr uint32_t PG_GATHER_LOBE_ONLY  = 0x80000000u;  // copy lobe from (map & 0x7FFFFFFF), zero stats
-constexpr uint32_t PG_GATHER_INDEX_MASK = 0x7FFFFFFFu;
-
-// Fold interval sums into EMA cumulative sums, refit each cell's vMF lobe
-// (Banerjee/Sra kappa approximation), zero the interval sums, and initialize
-// lastHitFrame for cells that have never been hit. Must run on the render
-// stream so it is ordered against optixLaunch (shaders and the refit never
-// touch the cell data concurrently).
-void launchRefitCells(float* data, uint32_t totalCells,
+// Fold per-lobe interval sums into EMA cumulative sums and refit the cell's
+// vMF mixture (hard-assignment stepwise EM M-step; Banerjee/Sra kappa
+// approximation; dead-lobe re-seeding). Must run on the render stream so it
+// is ordered against optixLaunch (shaders and the refit never touch the cell
+// data concurrently).
+void launchRefitCells(float* data,
+                      const uint32_t* cellCounter, uint32_t cellCapacity,
                       float emaDecay, uint32_t currentFrame,
                       cudaStream_t stream);
 
-// Re-layout cell data after a structure change (new cells / refinement):
-// dst[i] = src[map[i]] for surviving cells; PG_GATHER_NEW_CELL entries are
-// zero-initialized; PG_GATHER_LOBE_ONLY entries copy mu/kappa from the parent
-// (warm start for subdivided children) with fresh statistics. Runs on the
-// render stream at swap time, so it picks up every deposit made since the
-// staging snapshot — the old pipeline silently dropped those.
-void launchGatherCells(float* dst, const float* src, const uint32_t* map,
-                       uint32_t totalNewCells, uint32_t currentFrame,
-                       cudaStream_t stream);
+// Subdivide well-fed cells: for every cell with level < maxLevel whose EMA
+// deposit count is >= countThreshold, insert its 8 children into the table.
+// Children warm-start with the parent's mixture and 1/8 of its cumulative
+// statistics so guiding (and the confidence ramp) survive the split.
+// Idempotent: existing children are left untouched, so re-running on an
+// already-subdivided parent only costs hash probes. Runs on the render
+// stream for the same ordering reason as the refit.
+//
+// countSnapshot must hold a copy of *cellCounter taken (stream-ordered)
+// BEFORE the launch: bounding by the live counter would let late-scheduled
+// blocks process children inserted earlier in the same pass — a warm-started
+// child inherits parent/8 evidence and could cascade-subdivide within one
+// pass, and its payload may still be mid-write.
+void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
+                          uint32_t hashTableSize, uint32_t hashShift,
+                          uint64_t* cellKeys, uint32_t* cellCounter, uint32_t cellCapacity,
+                          const uint32_t* countSnapshot,
+                          float* data, uint32_t entryStride,
+                          uint32_t maxLevel, float countThreshold,
+                          uint32_t currentFrame,
+                          cudaStream_t stream);
+
+// Reinitialize every allocated cell's lobes to the tetrahedral starting
+// mixture. Required after clear(): an all-zero mixture would collapse the
+// deposit hard-assignment onto lobe 0. Stream-ordered after the clearing
+// memset.
+void launchInitCells(float* data,
+                     const uint32_t* cellCounter, uint32_t cellCapacity,
+                     cudaStream_t stream);
 
 } // namespace spectra

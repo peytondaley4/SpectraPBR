@@ -266,32 +266,30 @@ struct GpuLaunchParams {
     unsigned int pick_y;            // Pick pixel Y coordinate
     unsigned int pick_mode;         // 0 = normal render, 1 = pick mode (single ray)
 
-    // Path guide grid (sparse)
-    const unsigned long long* path_guide_morton_codes;
+    // Path guide grid (sparse, device-resident cell table)
     float* path_guide_data;
-    const unsigned int* path_guide_level_offsets;
     unsigned int path_guide_num_levels;
     unsigned int path_guide_entry_stride;
     unsigned int path_guide_base_resolution;
     float path_guide_per_level_scale;
     float path_guide_bounds_min[3];
     float path_guide_bounds_max[3];
-    unsigned int* path_guide_staging_buffer;
-    unsigned int* path_guide_staging_count;
-    unsigned int path_guide_staging_capacity;
     unsigned int path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
     float path_guide_mis_weight;        // Probability of sampling the guide (one-sample MIS alpha)
     // Adaptive level parameters (from config)
-    unsigned int path_guide_start_level; // Initial level for new regions
-    unsigned int path_guide_min_level;   // Coarsest allowed level
+    unsigned int path_guide_start_level; // Base level allocated on first touch
+    unsigned int path_guide_min_level;   // Retired from the hot path (UI compat)
     unsigned int path_guide_max_level;   // Finest allowed level
     unsigned int path_guide_level_resolutions[16];  // Precomputed floor(base_res * scale^level)
 
-    // Hash table for O(1) cell lookup (replaces binary search)
-    const unsigned long long* path_guide_hash_keys;    // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF
-    const unsigned int* path_guide_hash_values;        // flat cell index
+    // Cell table: hash for O(1) lookup + insert-on-first-touch allocation
+    unsigned long long* path_guide_hash_keys;          // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF (CAS target)
+    unsigned int* path_guide_hash_values;              // cell index or sentinel (PENDING/FULL)
     unsigned int path_guide_hash_table_size;            // power of 2
     unsigned int path_guide_hash_shift;                 // 64 - log2(hash_table_size)
+    unsigned long long* path_guide_cell_keys;           // packed key per allocated cell
+    unsigned int* path_guide_cell_counter;              // bump allocator (1 element)
+    unsigned int path_guide_cell_capacity;              // max live cells
 
     // Debug statistics (atomic counters, reset each frame)
     unsigned int* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed, [5]=bsdf_sampled

@@ -10,7 +10,6 @@
 namespace spectra {
 
 struct SparsePathGuideDescriptor;
-struct PathGuideStagingDescriptor;
 
 // OptiX error checking macro
 #define OPTIX_CHECK(call)                                                        \
@@ -157,9 +156,8 @@ public:
     void resetAccumulation();
     uint32_t getAccumulatedFrames() const;
 
-    // Path guide grid (sparse + staging)
-    void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse,
-        const PathGuideStagingDescriptor* staging);
+    // Path guide grid (device-resident cell table)
+    void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse);
     void setPathGuideEnabled(bool enabled);
     void setPathGuideMISWeight(float weight);
     void setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel);

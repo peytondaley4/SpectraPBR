@@ -250,33 +250,30 @@ struct LaunchParams {
     uint32_t pick_y;            // Pick pixel Y coordinate
     uint32_t pick_mode;         // 0 = normal render, 1 = pick mode (single ray)
 
-    // Path guide grid (sparse, collision-free)
-    const uint64_t* path_guide_morton_codes;   // Sorted per level (null = no grid)
+    // Path guide grid (sparse, device-resident cell table)
     float* path_guide_data;
-    const uint32_t* path_guide_level_offsets;  // num_levels+1
     uint32_t path_guide_num_levels;
     uint32_t path_guide_entry_stride;
     uint32_t path_guide_base_resolution;
     float path_guide_per_level_scale;
     float path_guide_bounds_min[3];
     float path_guide_bounds_max[3];
-    // Staging for occupancy collection (raygen appends on cell-lookup miss)
-    uint32_t* path_guide_staging_buffer;
-    uint32_t* path_guide_staging_count;   // Atomic
-    uint32_t path_guide_staging_capacity;
     uint32_t path_guide_enabled;    // 1 = use guide for sampling, 0 = BSDF only
     float path_guide_mis_weight;    // Probability of sampling the guide (one-sample MIS alpha)
     // Adaptive level parameters (from config)
-    uint32_t path_guide_start_level; // Initial level for new regions
-    uint32_t path_guide_min_level;   // Coarsest allowed level
+    uint32_t path_guide_start_level; // Base level allocated on first touch
+    uint32_t path_guide_min_level;   // Retired from the hot path (UI compat)
     uint32_t path_guide_max_level;   // Finest allowed level
     uint32_t path_guide_level_resolutions[16];  // Precomputed floor(base_res * scale^level)
 
-    // Hash table for O(1) cell lookup (replaces binary search)
-    const uint64_t* path_guide_hash_keys;        // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF
-    const uint32_t* path_guide_hash_values;      // flat cell index
+    // Cell table: hash for O(1) lookup + insert-on-first-touch allocation
+    uint64_t* path_guide_hash_keys;              // (level<<48 | morton), empty = 0xFFFFFFFFFFFFFFFF (CAS target)
+    uint32_t* path_guide_hash_values;            // cell index or sentinel (PENDING/FULL)
     uint32_t path_guide_hash_table_size;          // power of 2
     uint32_t path_guide_hash_shift;               // 64 - log2(hash_table_size)
+    uint64_t* path_guide_cell_keys;               // packed key per allocated cell
+    uint32_t* path_guide_cell_counter;            // bump allocator (1 element)
+    uint32_t path_guide_cell_capacity;            // max live cells
 
     // Debug statistics (atomic counters, reset each frame)
     uint32_t* path_guide_debug_stats;  // [0]=attempts, [1]=cell_found, [2]=valid_lobe, [3]=below_horizon, [4]=contributed, [5]=bsdf_sampled

@@ -211,6 +211,7 @@ private:
     CUdeviceptr m_materialsBuffer = 0;
     size_t m_materialsBufferCapacity = 0;   // in materials
     std::vector<uint32_t> m_materialAlphaModes;  // per slot, for fast-path updates
+    std::vector<uint32_t> m_materialShadowAnyhit; // per slot: shadow record uses anyhit group
 
     // Launch parameters
     LaunchParams m_launchParams = {};

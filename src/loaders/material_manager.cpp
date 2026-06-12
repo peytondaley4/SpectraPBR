@@ -170,8 +170,13 @@ bool MaterialManager::updateMaterial(MaterialHandle handle, const GpuMaterial& u
     mat.metallic = updated.metallic;
     mat.roughness = updated.roughness;
     mat.emissive = updated.emissive;
-    // Preserve all texture objects, alpha settings, and extension properties
-    // that were loaded from the model file.
+    // Glass controls (UI-editable): transmission toggles the dielectric
+    // transmission path in raygen, ior drives Fresnel/Snell.
+    mat.transmission = updated.transmission;
+    mat.ior = updated.ior;
+    // Preserve all texture objects, alpha settings, and the remaining
+    // extension properties (attenuation, clearcoat, sheen) that were loaded
+    // from the model file.
     return true;
 }
 

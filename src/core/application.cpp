@@ -730,6 +730,8 @@ void Application::wireUICallbacks() {
                 info.metallic = mat->metallic;
                 info.roughness = mat->roughness;
                 info.emissive = mat->emissive;
+                info.transmission = mat->transmission;
+                info.ior = mat->ior;
 
                 if (mat->baseColorTex != 0) {
                     info.hasBaseColorTex = true;

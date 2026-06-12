@@ -134,6 +134,29 @@ void PropertyPanel::createWidgets() {
     m_roughnessSlider->setParent(this);
     m_roughnessSlider->setOnValueChanged([this](Slider*, float) { updateMaterialFromSliders(); });
 
+    // Glass toggle: switches the material's dielectric transmission 0 <-> 1.
+    // Button flips its toggled state before onClick fires, so isToggled()
+    // reads the new state here.
+    m_glassToggle = std::make_unique<Button>("Glass");
+    m_glassToggle->setToggleMode(true);
+    m_glassToggle->setTextScale(0.5f);
+    m_glassToggle->setParent(this);
+    m_glassToggle->setOnClick([this]() {
+        if (m_iorSlider) {
+            m_iorSlider->setVisible(m_displayMode == DisplayMode::Instance &&
+                                    m_glassToggle->isToggled());
+        }
+        updateMaterialFromSliders();
+    });
+
+    m_iorSlider = std::make_unique<Slider>();
+    m_iorSlider->setLabel("IOR");
+    m_iorSlider->setLabelWidth(60.0f);
+    m_iorSlider->setRange(1.0f, 2.5f);   // vacuum .. diamond-ish
+    m_iorSlider->setValueFormat("%.2f");
+    m_iorSlider->setParent(this);
+    m_iorSlider->setOnValueChanged([this](Slider*, float) { updateMaterialFromSliders(); });
+
     m_emissivePicker = std::make_unique<ColorPicker>();
     m_emissivePicker->setShowPreview(true);
     m_emissivePicker->setIntensityRange(10.0f);
@@ -173,6 +196,14 @@ void PropertyPanel::showInstanceProperties(const InstanceInfo& info) {
     if (m_roughnessSlider) {
         m_roughnessSlider->setValue(info.roughness);
         m_roughnessSlider->setVisible(true);
+    }
+    if (m_glassToggle) {
+        m_glassToggle->setToggled(info.transmission > 0.0f);
+        m_glassToggle->setVisible(true);
+    }
+    if (m_iorSlider) {
+        m_iorSlider->setValue(info.ior);
+        m_iorSlider->setVisible(info.transmission > 0.0f);
     }
     if (m_emissivePicker) {
         float intensity = std::max({info.emissive.x, info.emissive.y, info.emissive.z, 1.0f});
@@ -242,6 +273,8 @@ void PropertyPanel::showLightProperties(const LightInfo& info) {
     if (m_baseColorPicker) m_baseColorPicker->setVisible(false);
     if (m_metallicSlider) m_metallicSlider->setVisible(false);
     if (m_roughnessSlider) m_roughnessSlider->setVisible(false);
+    if (m_glassToggle) m_glassToggle->setVisible(false);
+    if (m_iorSlider) m_iorSlider->setVisible(false);
     if (m_emissivePicker) m_emissivePicker->setVisible(false);
     if (m_emissiveIntensitySlider) m_emissiveIntensitySlider->setVisible(false);
 
@@ -291,6 +324,8 @@ void PropertyPanel::updateMaterialFromSliders() {
     }
     if (m_metallicSlider) m_instanceInfo.metallic = m_metallicSlider->getValue();
     if (m_roughnessSlider) m_instanceInfo.roughness = m_roughnessSlider->getValue();
+    if (m_glassToggle) m_instanceInfo.transmission = m_glassToggle->isToggled() ? 1.0f : 0.0f;
+    if (m_iorSlider) m_instanceInfo.ior = m_iorSlider->getValue();
     if (m_emissivePicker && m_emissiveIntensitySlider) {
         float3 c = m_emissivePicker->getColor();
         float i = m_emissiveIntensitySlider->getValue();
@@ -298,12 +333,16 @@ void PropertyPanel::updateMaterialFromSliders() {
     }
 
     if (m_onMaterialEdit) {
+        // Only the fields MaterialManager::updateMaterial merges matter here;
+        // everything else (textures, alpha settings, attenuation) is
+        // preserved from the loaded material.
         GpuMaterial mat = {};
         mat.baseColor = m_instanceInfo.baseColor;
         mat.metallic = m_instanceInfo.metallic;
         mat.roughness = m_instanceInfo.roughness;
         mat.emissive = m_instanceInfo.emissive;
-        mat.ior = 1.5f;
+        mat.transmission = m_instanceInfo.transmission;
+        mat.ior = m_instanceInfo.ior;
         mat.alphaCutoff = 0.5f;
         m_onMaterialEdit(m_instanceInfo.instanceId, mat);
     }
@@ -325,8 +364,10 @@ void PropertyPanel::getEditableWidgets(Widget* out[EDITABLE_WIDGET_COUNT]) const
     out[11] = m_baseColorPicker.get();
     out[12] = m_metallicSlider.get();
     out[13] = m_roughnessSlider.get();
-    out[14] = m_emissivePicker.get();
-    out[15] = m_emissiveIntensitySlider.get();
+    out[14] = m_glassToggle.get();
+    out[15] = m_iorSlider.get();
+    out[16] = m_emissivePicker.get();
+    out[17] = m_emissiveIntensitySlider.get();
 }
 
 void PropertyPanel::updatePanelAndTheme() {
@@ -630,6 +671,12 @@ void PropertyPanel::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLay
         addSpacing(2.0f);
 
         addWidget(m_roughnessSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(4.0f);
+
+        // Glass: toggle + IOR (slider only visible while glass is on)
+        addWidget(m_glassToggle.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_iorSlider.get(), ROW_HEIGHT, outQuads, textLayout);
         addSpacing(4.0f);
 
         // Emissive picker (needs full height for 3 RGB sliders)

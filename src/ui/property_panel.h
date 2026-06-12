@@ -4,6 +4,7 @@
 #include "panel.h"
 #include "label.h"
 #include "slider.h"
+#include "button.h"
 #include "color_picker.h"
 #include "scroll_view.h"
 #include "../scene/scene_hierarchy.h"
@@ -54,6 +55,8 @@ struct InstanceInfo {
     float metallic;
     float roughness;
     float3 emissive;
+    float transmission = 0.0f;  // > 0 = glass (dielectric transmission)
+    float ior = 1.5f;
 
     // Texture paths (full paths for display)
     std::string baseColorTexPath;
@@ -160,7 +163,7 @@ private:
     void addSpacing(float amount) { m_contentY += amount; }
 
     // Get all editable widgets for input forwarding
-    static constexpr size_t EDITABLE_WIDGET_COUNT = 16;
+    static constexpr size_t EDITABLE_WIDGET_COUNT = 18;
     void getEditableWidgets(Widget* out[EDITABLE_WIDGET_COUNT]) const;
 
     // Section rendering helpers
@@ -217,6 +220,8 @@ private:
     std::unique_ptr<ColorPicker> m_baseColorPicker;
     std::unique_ptr<Slider> m_metallicSlider;
     std::unique_ptr<Slider> m_roughnessSlider;
+    std::unique_ptr<Button> m_glassToggle;   // toggle: transmission 0 <-> 1
+    std::unique_ptr<Slider> m_iorSlider;     // visible while glass is on
     std::unique_ptr<ColorPicker> m_emissivePicker;
     std::unique_ptr<Slider> m_emissiveIntensitySlider;
 

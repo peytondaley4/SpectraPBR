@@ -511,13 +511,20 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
     // Alpha-masked materials get the anyhit-enabled hit groups so MASK
     // cutouts work for both visibility and shadows; opaque materials use the
     // anyhit-free groups (and their GASes set GEOMETRY_FLAG_DISABLE_ANYHIT).
+    // Transmissive (glass) materials additionally take the SHADOW anyhit
+    // group so shadow rays pass through them (transparent shadows) — shadow
+    // rays trace with ENFORCE_ANYHIT, which overrides the per-GAS disable,
+    // so this works even when a material turns transmissive at runtime.
     size_t numRecords = materials.size() * RAY_TYPE_COUNT;
     std::vector<HitGroupRecord> records(numRecords);
     m_materialAlphaModes.resize(materials.size());
+    m_materialShadowAnyhit.resize(materials.size());
 
     for (size_t i = 0; i < materials.size(); ++i) {
         bool masked = (materials[i].alphaMode == ALPHA_MODE_MASK);
+        bool shadowAnyhit = masked || (materials[i].transmission > 0.0f);
         m_materialAlphaModes[i] = materials[i].alphaMode;
+        m_materialShadowAnyhit[i] = shadowAnyhit ? 1u : 0u;
 
         size_t radianceIdx = i * RAY_TYPE_COUNT + RAY_TYPE_RADIANCE;
         OPTIX_CHECK(optixSbtRecordPackHeader(
@@ -527,7 +534,7 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
 
         size_t shadowIdx = i * RAY_TYPE_COUNT + RAY_TYPE_SHADOW;
         OPTIX_CHECK(optixSbtRecordPackHeader(
-            masked ? m_hitgroupShadowAlphaPG : m_hitgroupShadowPG, &records[shadowIdx]));
+            shadowAnyhit ? m_hitgroupShadowAlphaPG : m_hitgroupShadowPG, &records[shadowIdx]));
         records[shadowIdx].material = materials[i];
         records[shadowIdx].geometryIndex = geometryIndices[i];
     }
@@ -587,9 +594,12 @@ bool OptixEngine::updateMaterialRecord(uint32_t materialSlot, const GpuMaterial&
     if ((size_t)materialSlot >= m_materialAlphaModes.size()) return false;
     if ((size_t)(materialSlot + 1) * RAY_TYPE_COUNT > m_hitgroupRecordCount) return false;
 
-    // A change of alphaMode switches hit-group program headers — needs a full
-    // SBT rebuild (caller falls back).
+    // A change of alphaMode — or of the transmissive class (glass toggled
+    // on/off changes the shadow hit-group) — switches hit-group program
+    // headers; needs a full SBT rebuild (caller falls back).
     if (material.alphaMode != m_materialAlphaModes[materialSlot]) return false;
+    bool shadowAnyhit = (material.alphaMode == ALPHA_MODE_MASK) || (material.transmission > 0.0f);
+    if ((shadowAnyhit ? 1u : 0u) != m_materialShadowAnyhit[materialSlot]) return false;
 
     // Patch the material payload of both ray-type records in place. The SBT
     // header (program selection) is unchanged, so this is safe to do

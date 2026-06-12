@@ -119,9 +119,14 @@ __forceinline__ __device__ bool traceShadowRay(
     float3 offsetOrigin = origin + offsetNormal * SHADOW_NORMAL_EPS;
 
     // Init to 1 (occluded). Miss program sets 0 (visible).
-    // DISABLE_CLOSESTHIT: no shader runs on a confirmed hit. Anyhit stays
-    // ENABLED so alpha-masked geometry (foliage) gets cut-out shadows;
-    // opaque geometry opts out per-GAS via OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT.
+    // DISABLE_CLOSESTHIT: no shader runs on a confirmed hit.
+    // ENFORCE_ANYHIT: ray flags override the per-GAS DISABLE_ANYHIT, so the
+    // shadow anyhit runs even for geometry whose GAS was built opaque — this
+    // is what lets transmissive (glass) materials pass shadow rays without a
+    // GAS rebuild when a material is toggled to glass at runtime. Materials
+    // bound to the no-anyhit shadow hit group (opaque) still block with no
+    // program invocation; alpha-masked and transmissive materials carry
+    // __anyhit__shadow_alpha (cut-out shadows / transparent glass shadows).
     unsigned int occluded = 1;
     float safeTmax = fmaxf(tmax - RAY_EPS, RAY_EPS * 2.0f);
 
@@ -130,7 +135,8 @@ __forceinline__ __device__ bool traceShadowRay(
         offsetOrigin, direction,
         RAY_EPS, safeTmax, 0.0f,
         0xFF,
-        OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
+        OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
+            OPTIX_RAY_FLAG_ENFORCE_ANYHIT,
         RAY_TYPE_SHADOW,
         RAY_TYPE_COUNT,
         RAY_TYPE_SHADOW,

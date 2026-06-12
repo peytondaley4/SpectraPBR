@@ -68,11 +68,25 @@ extern "C" __global__ void __anyhit__alpha() {
 }
 
 //------------------------------------------------------------------------------
-// Anyhit for shadow rays - also handles alpha masking
+// Anyhit for shadow rays - alpha masking + transparent shadows through glass
 //------------------------------------------------------------------------------
 extern "C" __global__ void __anyhit__shadow_alpha() {
     const HitGroupData* sbtData = reinterpret_cast<HitGroupData*>(optixGetSbtDataPointer());
     const GpuMaterial& material = sbtData->material;
+
+    // Transmissive surfaces do not occlude NEE shadow rays ("transparent
+    // shadows"). A straight shadow ray cannot follow the refracted light
+    // path, so the choice is between treating glass as fully opaque (NEE
+    // behind glass is zero, and delta lights are unreachable by path
+    // sampling -> interiors go black) or letting the shadow ray pass and
+    // ignoring refraction/Fresnel. The pass-through approximation is the
+    // standard production compromise; base-color tinting and absorption are
+    // intentionally not applied here. Caustic-accurate transport through
+    // glass still arrives via the path sampler's emission/env MIS leg.
+    if (material.transmission > 0.0f) {
+        optixIgnoreIntersection();
+        return;
+    }
 
     // Only process alpha mask materials
     if (material.alphaMode != ALPHA_MODE_MASK) {

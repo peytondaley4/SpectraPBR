@@ -50,6 +50,20 @@
 #define PG_TRAIN_PROB        0.25f
 #define PG_TRAIN_WEIGHT_SCALE 4.0f   // 1 / PG_TRAIN_PROB
 
+// Max share of the continuation budget the guide may claim on a surface the
+// BSDF-selection logic considers fully specular (pSpec == 1, i.e. metallic
+// metals). Gated by roughness so it only applies to ROUGH metals, where the
+// incident-radiance guide is the only variance reduction for caustics /
+// emissive-via-glossy transport; smooth metals keep it at ~0 (the guide vMF
+// barely overlaps a near-mirror lobe).
+#define PG_SPEC_GUIDE_FLOOR  0.5f
+
+// Hermite smoothstep on [e0, e1].
+__forceinline__ __device__ float smoothstep01(float e0, float e1, float x) {
+    float t = clamp((x - e0) / fmaxf(e1 - e0, 1e-8f), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
 // Far distance for secondary rays and unbounded shadow rays. Tied to the
 // camera far plane (which the host scales to the scene size) so very large
 // scenes don't get clipped by a hardcoded constant.
@@ -859,13 +873,38 @@ __forceinline__ __device__ float3 tracePath(
                             // same auxiliary-variable conditioning as the
                             // cell jitter, so using that lobe's pdf in every
                             // MIS denominator stays unbiased.
+                            // Soft eligibility: ramp the kappa>=2 and
+                            // weight>=0.05 gates with smoothstep instead of hard
+                            // cliffs. A lobe whose kappa or weight straddles the
+                            // threshold between adjacent cells no longer flips
+                            // eligSum (and thus alpha) discontinuously across a
+                            // boundary. The lower edges (kappa 1.5, weight 0.03)
+                            // still exclude wide lobes and kappa=1 exploratory
+                            // re-seeds (training-only), preserving the original
+                            // intent. Eligibility scales alpha only, so it stays
+                            // unbiased.
                             float eligW[PG_NUM_LOBES];
                             float eligSum = 0.0f;
+                            const float3& sn = s.shadingNormal;
                             for (int k = 0; k < PG_NUM_LOBES; k++) {
                                 const float* l = cell + k * PG_LOBE_STRIDE;
-                                bool elig = (l[PG_L_KAPPA] >= 2.0f) &&
-                                            (l[PG_L_WEIGHT] >= 0.05f);
-                                eligW[k] = elig ? l[PG_L_WEIGHT] : 0.0f;
+                                float ke = smoothstep01(1.5f, 3.0f, l[PG_L_KAPPA]);
+                                float we = smoothstep01(0.03f, 0.07f, l[PG_L_WEIGHT]);
+                                // Normal-alignment factor: a lobe whose mean
+                                // points along/into the surface spends most of
+                                // its (full-sphere) vMF mass below the horizon,
+                                // where the guide draw is wasted (zero
+                                // contribution, path terminates). Down-weighting
+                                // it here reduces that waste UNBIASEDLY — it only
+                                // reshapes the proposal (eligSum scales alpha,
+                                // and the pick + combinedPdf condition on the
+                                // realized eligibility). It is NOT a below-
+                                // horizon resample: resampling would add an
+                                // alpha*P(below)*pBsdf term the combinedPdf
+                                // divisor does not account for, which biases.
+                                float mn = l[PG_L_MU_X]*sn.x + l[PG_L_MU_Y]*sn.y + l[PG_L_MU_Z]*sn.z;
+                                float ne = smoothstep01(-0.30f, 0.20f, mn);
+                                eligW[k] = l[PG_L_WEIGHT] * ke * we * ne;
                                 eligSum += eligW[k];
                             }
                             // Alpha scales by the eligible mixture mass: a

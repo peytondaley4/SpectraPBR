@@ -129,6 +129,28 @@ __forceinline__ __device__ unsigned int topDownCellLookup(
     return idx;
 }
 
+// Single-level lookup: the cell containing a position AT EXACTLY `level`
+// (one Morton encode + one hash probe, no descent). Returns PG_INVALID_CELL
+// when out of bounds or no cell exists at that level. Used by the guide's
+// box-filter jitter: the home cell's level is already known, and the jitter
+// stays within +-0.5 cell of it, so the jittered sample must be resolved at
+// the SAME level — descending into a finer child on one side of a subdivision
+// face is exactly the level mismatch that cracked the filter at boundaries.
+__forceinline__ __device__ unsigned int pathGuideCellAtLevel(
+    const SparsePathGuideDescriptorDevice& grid,
+    float px, float py, float pz,
+    unsigned int level)
+{
+    float nx, ny, nz;
+    worldToNormalized(grid, px, py, pz, nx, ny, nz);
+    if (nx < 0.0f || nx > 1.0f || ny < 0.0f || ny > 1.0f || nz < 0.0f || nz > 1.0f)
+        return PG_INVALID_CELL;
+    int ix, iy, iz;
+    normalizedToCell(nx, ny, nz, level, grid, ix, iy, iz);
+    return pgTableLookup(grid.table, level,
+        pgMortonEncode64((unsigned int)ix, (unsigned int)iy, (unsigned int)iz));
+}
+
 // First-touch allocation of the base-level cell containing a position.
 // Bounds-checked (out-of-grid positions never allocate). Returns the cell
 // index, or PG_INVALID_CELL while another thread's insert is pending or the

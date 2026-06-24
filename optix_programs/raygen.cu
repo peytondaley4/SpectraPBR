@@ -712,10 +712,12 @@ __forceinline__ __device__ float3 tracePath(
         }
 
         //── Depth cap ────────────────────────────────────────────────────────
-        // Path truncation past max_bounce_depth: biased, host raises the cap
-        // for accurate/offline renders; RR usually terminates paths first.
-        // The cap vertex still gets NEE (with full weight — see
-        // sampleDirectLight's finalVertex), only the continuation is dropped.
+        // Path truncation past max_bounce_depth is biased, so the cap scales
+        // with quality (setQualityMode: 8 FAST/BALANCED, 16 HIGH, 32 ACCURATE)
+        // — high enough in ACCURATE that RR (from depth 3) terminates paths
+        // first and the cap only backstops pathological mirror chains. The cap
+        // vertex still gets NEE (with full weight — see sampleDirectLight's
+        // finalVertex), only the continuation is dropped.
         const bool atCap = (depth >= maxDepth);
 
         //── Transmission (stochastic dielectric event, delta lobes) ─────────

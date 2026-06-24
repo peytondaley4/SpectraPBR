@@ -841,14 +841,32 @@ void OptixEngine::setEnvironmentCDF(cudaTextureObject_t conditionalCDF,
 
 void OptixEngine::setQualityMode(QualityMode mode) {
     m_launchParams.quality_mode = mode;
-    // Firefly clamp scales with the quality goal: real-time modes trade a
-    // little (downward) bias for stability; ACCURATE is fully unbiased.
+    // Firefly clamp AND depth cap scale with the quality goal. The depth cap is
+    // a BIASED path truncation (raygen drops the continuation past it with no RR
+    // compensation), so ACCURATE — which advertises unbiasedness — must run a
+    // cap high enough that Russian roulette (from depth 3) terminates paths
+    // first in practice. Real-time modes keep a tight cap as a deliberate
+    // perf/bias tradeoff. (Previously the cap stayed at its init value of 8 in
+    // every mode because setMaxBounceDepth was never called — ACCURATE silently
+    // truncated multiply-scattered specular/glass GI.)
     switch (mode) {
         case QUALITY_FAST:
-        case QUALITY_BALANCED: m_launchParams.firefly_clamp = 100.0f;  break;
-        case QUALITY_HIGH:     m_launchParams.firefly_clamp = 1000.0f; break;
-        case QUALITY_ACCURATE: m_launchParams.firefly_clamp = FLT_MAX; break;
-        default:               m_launchParams.firefly_clamp = 100.0f;  break;
+        case QUALITY_BALANCED:
+            m_launchParams.firefly_clamp = 100.0f;
+            m_launchParams.max_bounce_depth = 8;
+            break;
+        case QUALITY_HIGH:
+            m_launchParams.firefly_clamp = 1000.0f;
+            m_launchParams.max_bounce_depth = 16;
+            break;
+        case QUALITY_ACCURATE:
+            m_launchParams.firefly_clamp = FLT_MAX;
+            m_launchParams.max_bounce_depth = 32;  // RR bounds cost; cap only backstops pathological mirror chains
+            break;
+        default:
+            m_launchParams.firefly_clamp = 100.0f;
+            m_launchParams.max_bounce_depth = 8;
+            break;
     }
 }
 

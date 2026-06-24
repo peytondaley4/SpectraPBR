@@ -985,6 +985,43 @@ __forceinline__ __device__ float3 tracePath(
                                 pgParallaxReproject(ccx, ccy, ccz, l[PG_L_MEAN_DIST],
                                     s.pos.x, s.pos.y, s.pos.z,
                                     guideLobe.mux, guideLobe.muy, guideLobe.muz);
+
+                                // Product (BSDF x incident) guiding. The pure
+                                // incident-radiance lobe ignores the
+                                // view-dependent BSDF peak, so on a glossy
+                                // receiver most guide samples land where the
+                                // BSDF is ~0. Multiply it by a vMF approximation
+                                // of the specular BSDF lobe — centered on the
+                                // reflection direction R, concentration kb from
+                                // roughness and scaled by pSpec — so the guide
+                                // concentrates where BOTH incident radiance and
+                                // the BSDF are high. Product of two vMFs is a
+                                // vMF: r = kg*mu_g + kb*R, kappa_p = |r|, mu_p =
+                                // r/|r|. Diffuse/rough surfaces get kb ~ 0 =>
+                                // product ~ the incident lobe (unchanged). The
+                                // product lobe replaces guideLobe BEFORE the
+                                // sampler, the combined PDF, and NEE MIS read
+                                // it, so all three condition on it — unbiased.
+                                // (kb's roughness mapping is heuristic and a
+                                // tuning knob; validate on a glossy-receiver
+                                // scene.)
+                                float alphaR = fmaxf(s.roughness * s.roughness, 1e-3f);
+                                float kb = pSpec * fminf(2.0f / (alphaR * alphaR), 2000.0f);
+                                if (kb > 1.0f) {
+                                    float3 Rd = reflect(rayDir, s.shadingNormal);
+                                    float rx = guideLobe.kappa * guideLobe.mux + kb * Rd.x;
+                                    float ry = guideLobe.kappa * guideLobe.muy + kb * Rd.y;
+                                    float rz = guideLobe.kappa * guideLobe.muz + kb * Rd.z;
+                                    float kp = sqrtf(rx * rx + ry * ry + rz * rz);
+                                    if (kp > 1e-4f) {
+                                        float invkp = 1.0f / kp;
+                                        guideLobe.mux = rx * invkp;
+                                        guideLobe.muy = ry * invkp;
+                                        guideLobe.muz = rz * invkp;
+                                        guideLobe.kappa = fminf(kp, 2000.0f);
+                                        guideLobe.expNeg2K = expf(-2.0f * guideLobe.kappa);
+                                    }
+                                }
                                 guideAlpha = alpha;
                             }
                         }

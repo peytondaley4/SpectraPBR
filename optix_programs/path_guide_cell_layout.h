@@ -14,39 +14,47 @@
 // subdivision is reserved for actual spatial variation (sample-count
 // criterion in the subdivision kernel).
 //
-// === Cell data layout (64 floats = 256 bytes per cell) ===
+// === Cell data layout (72 floats = 288 bytes per cell) ===
 //
-//  [0..23]  PG_NUM_LOBES=4 lobes x PG_LOBE_STRIDE=6 floats:
+//  [0..27]  PG_NUM_LOBES=4 lobes x PG_LOBE_STRIDE=7 floats:
 //             +0..2  mu (unit mean direction)     — written by refit kernel
 //             +3     kappa (<= 0: lobe untrained) — written by refit kernel
 //             +4     exp(-2*kappa) cache          — written by refit kernel
 //             +5     weight pi_k (mixture weight, normalized) — refit kernel
-//           The sampling hot data is the leading 96B segment.
-//  [24..39] per-lobe interval sums {sx, sy, sz, sw} — atomicAdd by shaders
-//           into the hard-assigned lobe, consumed/zeroed by the refit kernel
-//  [40..55] per-lobe cumulative sums — EMA-decayed, owned by the refit kernel
-//  [56]     lastHitFrame — atomicMax (positive floats sort like ints)
-//  [57]     interval deposit count — atomicAdd 1 per deposit
-//  [58]     cumulative deposit count (EMA) — owned by refit kernel; drives
+//             +6     meanDist — mean distance to the incident radiance along
+//                    mu, used for PARALLAX-AWARE reprojection at lookup
+//                    (Ruppert et al. 2020). 0 = untrained / treat as distant.
+//           The sampling hot data is the leading 112B segment.
+//  [28..47] per-lobe interval sums {sx, sy, sz, sw, sDist} (PG_SUM_STRIDE=5) —
+//           atomicAdd by shaders into the hard-assigned lobe, consumed/zeroed
+//           by the refit kernel. sDist = sum of weight*hitDistance.
+//  [48..67] per-lobe cumulative sums {sx,sy,sz,sw,sDist} — EMA-decayed, owned
+//           by the refit kernel
+//  [68]     lastHitFrame — atomicMax (positive floats sort like ints)
+//  [69]     interval deposit count — atomicAdd 1 per deposit
+//  [70]     cumulative deposit count (EMA) — owned by refit kernel; drives
 //           the guide confidence ramp and the subdivision criterion
-//  [59..63] reserved
+//  [71]     reserved
 //------------------------------------------------------------------------------
 
 #define PG_NUM_LOBES         4
-#define PG_LOBE_STRIDE       6
+#define PG_LOBE_STRIDE       7
 #define PG_L_MU_X            0   // lobe-relative offsets (base = k * PG_LOBE_STRIDE)
 #define PG_L_MU_Y            1
 #define PG_L_MU_Z            2
 #define PG_L_KAPPA           3
 #define PG_L_EXP_NEG2K       4
 #define PG_L_WEIGHT          5
+#define PG_L_MEAN_DIST       6
 
-#define PG_INT_BASE          24  // + k*4: {sumX, sumY, sumZ, sumW}
-#define PG_CUMS_BASE         40  // + k*4: {sumX, sumY, sumZ, sumW}
-#define PG_LAST_HIT_FRAME    56
-#define PG_INT_COUNT         57
-#define PG_CUM_COUNT         58
-#define PG_ENTRY_STRIDE      64
+#define PG_SUM_STRIDE        5   // per-lobe sum group: {sx, sy, sz, sw, sDist}
+#define PG_S_DIST            4   // distance sub-offset within a sum group
+#define PG_INT_BASE          28  // + k*PG_SUM_STRIDE
+#define PG_CUMS_BASE         48  // + k*PG_SUM_STRIDE
+#define PG_LAST_HIT_FRAME    68
+#define PG_INT_COUNT         69
+#define PG_CUM_COUNT         70
+#define PG_ENTRY_STRIDE      72
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 // Initialize a cell's lobes to the tetrahedral starting configuration:
@@ -70,6 +78,7 @@ __forceinline__ __device__ void pgInitCellLobes(float* cell)
         l[PG_L_KAPPA] = 0.0f;
         l[PG_L_EXP_NEG2K] = 1.0f;   // exp(-2*0)
         l[PG_L_WEIGHT] = 1.0f / PG_NUM_LOBES;
+        l[PG_L_MEAN_DIST] = 0.0f;   // untrained: no parallax reprojection
     }
 }
 #endif

@@ -602,6 +602,8 @@ struct TrainRecord {
     // pair; the deposit is still one scalar (lum of the RGB Lo).
     float3 local;           // RGB radiance emitted from this vertex (emission + NEE)
     float3 beta;            // RGB local throughput factor f*cos/pdf (incl. 1/RR)
+    float dist;             // distance to the next vertex along dir (parallax fit);
+                            // patched from the next segment's hit.t after the trace
 };
 
 //------------------------------------------------------------------------------
@@ -662,11 +664,23 @@ __forceinline__ __device__ float3 tracePath(
     TrainRecord train[MAX_TRAIN_VERTICES];
     int trainCount = 0;
     float3 terminalEnv = make_float3(0.0f, 0.0f, 0.0f);  // (unweighted) RGB radiance entering the last segment
+    // Index of the continuation deposit awaiting its parallax distance — the
+    // distance to where its radiance came from is the NEXT segment's hit.t,
+    // only known after the next trace, so we patch it retroactively.
+    int pendingDistRecord = -1;
 
     const unsigned int maxDepth = params.max_bounce_depth;
 
     for (unsigned int depth = 0; ; ++depth) {
         HitInfo hit = traceRadianceRay(rayOrigin, rayDir, tmin, tmax);
+
+        // Fill in the previous continuation deposit's parallax distance: hit.t
+        // for a surface hit, or a far distance on env miss (distant => no
+        // reprojection). Training reads this only for cellIdx != INVALID.
+        if (pendingDistRecord >= 0) {
+            train[pendingDistRecord].dist = (hit.t >= 0.0f) ? hit.t : sceneFarDistance();
+            pendingDistRecord = -1;
+        }
 
         //── Miss: environment (MIS-weighted against env NEE) ────────────────
         if (hit.t < 0.0f) {
@@ -957,6 +971,20 @@ __forceinline__ __device__ float3 tracePath(
                                 guideLobe.muz = l[PG_L_MU_Z];
                                 guideLobe.kappa = l[PG_L_KAPPA];
                                 guideLobe.expNeg2K = l[PG_L_EXP_NEG2K];
+                                // Parallax-aware reprojection: swing the lobe
+                                // mean toward where its radiance actually comes
+                                // from (cellCenter + mu*meanDist), reducing
+                                // within-cell directional error and giving
+                                // neighbouring cells a consistent aim near
+                                // shared faces. Reprojects mu in place; the
+                                // cached vMF kappa/pdf are evaluated around the
+                                // reprojected mean by sampler/PDF/NEE alike, so
+                                // the estimator stays consistent and unbiased.
+                                float ccx, ccy, ccz;
+                                pgCellCenter(grid, ctxCellIdx, ccx, ccy, ccz);
+                                pgParallaxReproject(ccx, ccy, ccz, l[PG_L_MEAN_DIST],
+                                    s.pos.x, s.pos.y, s.pos.z,
+                                    guideLobe.mux, guideLobe.muy, guideLobe.muz);
                                 guideAlpha = alpha;
                             }
                         }
@@ -1092,6 +1120,8 @@ __forceinline__ __device__ float3 tracePath(
             tr.pdf = combinedPdf;
             tr.local = localRGB;
             tr.beta = beta;
+            tr.dist = sceneFarDistance();   // patched to the next segment's hit.t
+            if (trainCellIdx != PG_INVALID_CELL) pendingDistRecord = trainCount - 1;
         }
 
         // Continue the path
@@ -1130,7 +1160,7 @@ __forceinline__ __device__ float3 tracePath(
                     // suppress exactly the bright signals worth learning).
                     float w = fminf(loLum / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
                             * PG_TRAIN_WEIGHT_SCALE;
-                    pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, params.frame_index);
+                    pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, tr.dist, params.frame_index);
                 }
             }
             lo = tr.local + tr.beta * lo;

@@ -1480,7 +1480,7 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                 // Cumulative (EMA lifetime) stats, summed over all lobes
                 float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f, sumW = 0.0f;
                 for (int k = 0; k < PG_NUM_LOBES; k++) {
-                    const float* cs = cellResult.data + PG_CUMS_BASE + k * 4;
+                    const float* cs = cellResult.data + PG_CUMS_BASE + k * PG_SUM_STRIDE;
                     sumX += cs[0]; sumY += cs[1]; sumZ += cs[2]; sumW += cs[3];
                 }
                 info.sumW = sumW;

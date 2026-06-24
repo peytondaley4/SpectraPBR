@@ -43,14 +43,15 @@ __global__ void refitCellsKernel(float* data,
     float lobeW[PG_NUM_LOBES];
     float totalW = 0.0f;
     for (int k = 0; k < PG_NUM_LOBES; k++) {
-        float* intS = c + PG_INT_BASE + k * 4;
-        float* cumS = c + PG_CUMS_BASE + k * 4;
+        float* intS = c + PG_INT_BASE + k * PG_SUM_STRIDE;
+        float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
         float cumX = emaDecay * cumS[0] + intS[0];
         float cumY = emaDecay * cumS[1] + intS[1];
         float cumZ = emaDecay * cumS[2] + intS[2];
         float cumW = emaDecay * cumS[3] + intS[3];
-        cumS[0] = cumX; cumS[1] = cumY; cumS[2] = cumZ; cumS[3] = cumW;
-        intS[0] = 0.0f; intS[1] = 0.0f; intS[2] = 0.0f; intS[3] = 0.0f;
+        float cumD = emaDecay * cumS[PG_S_DIST] + intS[PG_S_DIST];  // sum of weight*dist
+        cumS[0] = cumX; cumS[1] = cumY; cumS[2] = cumZ; cumS[3] = cumW; cumS[PG_S_DIST] = cumD;
+        intS[0] = 0.0f; intS[1] = 0.0f; intS[2] = 0.0f; intS[3] = 0.0f; intS[PG_S_DIST] = 0.0f;
         lobeW[k] = cumW;
         totalW += cumW;
     }
@@ -72,7 +73,7 @@ __global__ void refitCellsKernel(float* data,
             if (pi > strongestPi) { strongestPi = pi; strongest = k; }
 
             if (lobeW[k] >= 0.5f) {
-                const float* cumS = c + PG_CUMS_BASE + k * 4;
+                const float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
                 float len = sqrtf(cumS[0] * cumS[0] + cumS[1] * cumS[1] + cumS[2] * cumS[2]);
                 if (len > 1e-9f) {
                     float invLen = 1.0f / len;
@@ -96,6 +97,11 @@ __global__ void refitCellsKernel(float* data,
                     // Cache the vMF normalization term: halves the expf count
                     // in the shader's PDF/sampler hot path.
                     l[PG_L_EXP_NEG2K] = expf(-2.0f * kappa);
+                    // Weighted mean distance to the incident radiance, for
+                    // parallax-aware reprojection at lookup. cumS[PG_S_DIST] is
+                    // the EMA sum of weight*dist; dividing by the weight sum
+                    // (lobeW[k]) gives the mean — decay-invariant like rbar.
+                    l[PG_L_MEAN_DIST] = cumS[PG_S_DIST] / lobeW[k];
                 }
             }
         }
@@ -145,14 +151,16 @@ __global__ void refitCellsKernel(float* data,
                 l[PG_L_KAPPA] = 1.0f;                 // exploratory: below the
                 l[PG_L_EXP_NEG2K] = 0.13533528f;      // sampling gate; exp(-2)
                 l[PG_L_WEIGHT] = 0.02f;
+                l[PG_L_MEAN_DIST] = 0.0f;             // no distance evidence yet
                 // Small synthetic evidence so the re-seed survives a few
                 // refits while it competes for deposits.
-                float* cumS = c + PG_CUMS_BASE + k * 4;
+                float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
                 float seedW = 0.02f * totalW;
                 cumS[0] = l[PG_L_MU_X] * seedW * 0.5f;
                 cumS[1] = l[PG_L_MU_Y] * seedW * 0.5f;
                 cumS[2] = l[PG_L_MU_Z] * seedW * 0.5f;
                 cumS[3] = seedW;
+                cumS[PG_S_DIST] = 0.0f;               // distant-light default until trained
             }
         }
     }
@@ -211,12 +219,13 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                 d[f] = c[f];
             }
             for (int lk = 0; lk < PG_NUM_LOBES; lk++) {
-                const float* pc = c + PG_CUMS_BASE + lk * 4;
-                float* dc = d + PG_CUMS_BASE + lk * 4;
+                const float* pc = c + PG_CUMS_BASE + lk * PG_SUM_STRIDE;
+                float* dc = d + PG_CUMS_BASE + lk * PG_SUM_STRIDE;
                 dc[0] = pc[0] * 0.125f;
                 dc[1] = pc[1] * 0.125f;
                 dc[2] = pc[2] * 0.125f;
                 dc[3] = pc[3] * 0.125f;
+                dc[PG_S_DIST] = pc[PG_S_DIST] * 0.125f;  // scale distance sum with the rest
             }
             d[PG_CUM_COUNT] = c[PG_CUM_COUNT] * 0.125f;
             d[PG_LAST_HIT_FRAME] = currentFrame;

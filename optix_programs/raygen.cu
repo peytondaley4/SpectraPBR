@@ -594,8 +594,14 @@ struct TrainRecord {
     unsigned int cellIdx;   // deposit target (0xFFFFFFFF = chain-only entry)
     float dirX, dirY, dirZ; // sampled continuation direction
     float pdf;              // combined sampling pdf of that direction
-    float localLum;         // lum(emission + NEE) emitted from this vertex
-    float betaLum;          // lum of the local throughput factor f*cos/pdf (incl. 1/RR)
+    // RGB (not luminance) so the backward recurrence reconstructs the true
+    // incident radiance: lum(prod beta_i) != prod lum(beta_i) for chromatic
+    // bounces (red wall then green wall over-estimates a direction's importance
+    // ~3-4x), which skews the learned guide in colored interreflection — the
+    // common photoreal case. Costs ~4 extra floats/record vs the old scalar
+    // pair; the deposit is still one scalar (lum of the RGB Lo).
+    float3 local;           // RGB radiance emitted from this vertex (emission + NEE)
+    float3 beta;            // RGB local throughput factor f*cos/pdf (incl. 1/RR)
 };
 
 //------------------------------------------------------------------------------
@@ -655,7 +661,7 @@ __forceinline__ __device__ float3 tracePath(
     }
     TrainRecord train[MAX_TRAIN_VERTICES];
     int trainCount = 0;
-    float terminalEnvLum = 0.0f;   // lum of (unweighted) radiance entering the last segment
+    float3 terminalEnv = make_float3(0.0f, 0.0f, 0.0f);  // (unweighted) RGB radiance entering the last segment
 
     const unsigned int maxDepth = params.max_bounce_depth;
 
@@ -783,8 +789,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;          // delta vertex: chain only
                 tr.dirX = newDir.x; tr.dirY = newDir.y; tr.dirZ = newDir.z;
                 tr.pdf = 0.0f;
-                tr.localLum = luminance3(emissionContrib);
-                tr.betaLum = luminance3(tint);
+                tr.local = emissionContrib;
+                tr.beta = tint;
             }
 
             rayOrigin = s.pos + (reflected ? gN : -gN) * RAY_EPS;
@@ -965,7 +971,19 @@ __forceinline__ __device__ float3 tracePath(
             guideLobe, seed, atCap);
         radiance = radiance + clampContribution(throughput * neeContrib);
 
-        float localLum = luminance3(emissionContrib + neeContrib);
+        // RGB local emission for this vertex = surface emission + the NEE
+        // contribution. Two deliberate, load-bearing choices live here:
+        //   - UNCLAMPED on purpose: the image accumulates clampContribution()ed
+        //     values (above), but the guide must learn the TRUE high-variance
+        //     target the firefly clamp exists to tame, not the clamped proxy.
+        //     The deposit is separately bounded by TRAIN_WEIGHT_CLAMP below.
+        //   - delta-light NEE is intentionally included: it is folded into THIS
+        //     vertex's reconstructed lo and deposited at the PREVIOUS vertex
+        //     along the incoming direction ("this surface is bright from that
+        //     direction"). Delta/transmission vertices set cellIdx=0xFFFFFFFF,
+        //     so no lobe is ever aimed at a delta's own unreproducible
+        //     direction. Do not "fix" either by clamping or excluding NEE.
+        float3 localRGB = emissionContrib + neeContrib;
 
         //── Depth cap: no continuation past this vertex ─────────────────────
         if (atCap) {
@@ -974,8 +992,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
-                tr.localLum = localLum;
-                tr.betaLum = 0.0f;
+                tr.local = localRGB;
+                tr.beta = make_float3(0.0f, 0.0f, 0.0f);
             }
             break;
         }
@@ -997,8 +1015,8 @@ __forceinline__ __device__ float3 tracePath(
                     tr.cellIdx = 0xFFFFFFFFu;
                     tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                     tr.pdf = 0.0f;
-                    tr.localLum = localLum;
-                    tr.betaLum = 0.0f;   // chain ends here
+                    tr.local = localRGB;
+                    tr.beta = make_float3(0.0f, 0.0f, 0.0f);   // chain ends here
                 }
                 break;
             }
@@ -1032,8 +1050,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
-                tr.localLum = localLum;
-                tr.betaLum = 0.0f;
+                tr.local = localRGB;
+                tr.beta = make_float3(0.0f, 0.0f, 0.0f);
             }
             break;
         }
@@ -1054,8 +1072,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
-                tr.localLum = localLum;
-                tr.betaLum = 0.0f;
+                tr.local = localRGB;
+                tr.beta = make_float3(0.0f, 0.0f, 0.0f);
             }
             break;
         }
@@ -1073,8 +1091,8 @@ __forceinline__ __device__ float3 tracePath(
             tr.cellIdx = trainCellIdx;
             tr.dirX = L.x; tr.dirY = L.y; tr.dirZ = L.z;
             tr.pdf = combinedPdf;
-            tr.localLum = localLum;
-            tr.betaLum = luminance3(beta);
+            tr.local = localRGB;
+            tr.beta = beta;
         }
 
         // Continue the path
@@ -1096,22 +1114,27 @@ __forceinline__ __device__ float3 tracePath(
     // unbiasedness never depends on it. Subsampled per path (PG_TRAIN_PROB)
     // with compensating weight to cut contended atomic traffic.
     if (guidingActive && trainCount > 0 && randomFloat(seed) < PG_TRAIN_PROB) {
-        float lo = terminalEnvLum;
+        // RGB recurrence: lo(k) = local(k) + beta(k) ⊙ lo(k+1). The deposit is
+        // the LUMINANCE of this true RGB incident radiance — element-wise RGB
+        // accumulation avoids the chromatic over/under-estimation a scalar
+        // luminance recurrence produces across colored bounces.
+        float3 lo = terminalEnv;
         for (int k = trainCount - 1; k >= 0; --k) {
             const TrainRecord& tr = train[k];
-            if (tr.cellIdx != 0xFFFFFFFFu && lo > 1e-6f && tr.pdf > 1e-8f) {
+            float loLum = luminance3(lo);
+            if (tr.cellIdx != 0xFFFFFFFFu && loLum > 1e-6f && tr.pdf > 1e-8f) {
                 float* cell = sparseCellDataPtr(grid, tr.cellIdx);
                 if (cell != nullptr) {
                     // Clamp BEFORE the subsampling compensation so the
                     // effective per-estimate clamp matches the unsubsampled
                     // semantics (clamp-after-scale would tighten it 4x and
                     // suppress exactly the bright signals worth learning).
-                    float w = fminf(lo / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
+                    float w = fminf(loLum / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
                             * PG_TRAIN_WEIGHT_SCALE;
                     pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, params.frame_index);
                 }
             }
-            lo = tr.localLum + tr.betaLum * lo;
+            lo = tr.local + tr.beta * lo;
         }
     }
 

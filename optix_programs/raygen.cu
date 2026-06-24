@@ -551,11 +551,11 @@ __forceinline__ __device__ float3 sampleDirectLight(
     } else if (kind == LIGHT_KIND_ENV) {
         float selProb = params.env_selection_weight / grandTotal;
         if (selProb > 0.0f && params.environment_map != 0 &&
-            params.env_conditional_cdf != 0 && params.env_marginal_cdf != 0) {
+            params.env_alias_prob != nullptr && params.env_pmf != nullptr) {
             float envPdf;
             float3 L = sampleEnvironmentDirection(
-                randomFloat(seed), randomFloat(seed),
-                params.env_marginal_cdf, params.env_conditional_cdf,
+                randomFloat(seed), randomFloat(seed), randomFloat(seed),
+                params.env_alias_prob, params.env_alias_idx, params.env_pmf,
                 params.env_width, params.env_height, envPdf);
             float NdotL = dot(N, L);
             if (NdotL > 0.0f && envPdf > 1e-12f) {
@@ -675,16 +675,15 @@ __forceinline__ __device__ float3 tracePath(
                     rayDir, params.environment_map, params.environment_intensity);
                 float w = 1.0f;
                 if (!prevDelta && params.env_selection_weight > 0.0f &&
-                    params.env_conditional_cdf != 0 && params.env_marginal_cdf != 0) {
+                    params.env_pmf != nullptr) {
                     float grandTotal = params.total_light_luminance + params.env_selection_weight;
                     float selProbEnv = params.env_selection_weight / grandTotal;
                     float pLight = selProbEnv * environmentPdf(rayDir,
-                        params.env_marginal_cdf, params.env_conditional_cdf,
-                        params.env_width, params.env_height);
+                        params.env_pmf, params.env_width, params.env_height);
                     w = prevPdf / (prevPdf + pLight);
                 }
                 radiance = radiance + clampContribution(throughput * envRadiance * w);
-                terminalEnvLum = luminance3(envRadiance);
+                terminalEnv = envRadiance;
             }
             break;
         }

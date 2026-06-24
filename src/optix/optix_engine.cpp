@@ -105,8 +105,9 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.environment_intensity = 1.0f;
 
     // Initialize environment CDF (for importance sampling)
-    m_launchParams.env_conditional_cdf = 0;
-    m_launchParams.env_marginal_cdf = 0;
+    m_launchParams.env_alias_prob = nullptr;
+    m_launchParams.env_alias_idx = nullptr;
+    m_launchParams.env_pmf = nullptr;
     m_launchParams.env_width = 0;
     m_launchParams.env_height = 0;
     m_launchParams.env_total_luminance = 0.0f;
@@ -828,12 +829,14 @@ void OptixEngine::setEnvironmentMap(cudaTextureObject_t envMap, float intensity)
     m_launchParams.environment_intensity = intensity;
 }
 
-void OptixEngine::setEnvironmentCDF(cudaTextureObject_t conditionalCDF,
-                                    cudaTextureObject_t marginalCDF,
-                                    uint32_t width, uint32_t height,
-                                    float totalLuminance) {
-    m_launchParams.env_conditional_cdf = conditionalCDF;
-    m_launchParams.env_marginal_cdf = marginalCDF;
+void OptixEngine::setEnvironmentImportance(const float* aliasProb,
+                                           const unsigned int* aliasIdx,
+                                           const float* pmf,
+                                           uint32_t width, uint32_t height,
+                                           float totalLuminance) {
+    m_launchParams.env_alias_prob = aliasProb;
+    m_launchParams.env_alias_idx = aliasIdx;
+    m_launchParams.env_pmf = pmf;
     m_launchParams.env_width = width;
     m_launchParams.env_height = height;
     m_launchParams.env_total_luminance = totalLuminance;

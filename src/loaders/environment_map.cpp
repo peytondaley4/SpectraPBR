@@ -13,33 +13,20 @@ EnvironmentMap::~EnvironmentMap() {
 }
 
 void EnvironmentMap::clear() {
-    // Destroy texture objects
+    // Destroy the env radiance texture
     if (m_texture) {
         cudaDestroyTextureObject(m_texture);
         m_texture = 0;
     }
-    if (m_conditionalCDF) {
-        cudaDestroyTextureObject(m_conditionalCDF);
-        m_conditionalCDF = 0;
-    }
-    if (m_marginalCDF) {
-        cudaDestroyTextureObject(m_marginalCDF);
-        m_marginalCDF = 0;
-    }
-
-    // Free CUDA arrays
     if (m_textureArray) {
         cudaFreeArray(m_textureArray);
         m_textureArray = nullptr;
     }
-    if (m_conditionalCDFArray) {
-        cudaFreeArray(m_conditionalCDFArray);
-        m_conditionalCDFArray = nullptr;
-    }
-    if (m_marginalCDFArray) {
-        cudaFreeArray(m_marginalCDFArray);
-        m_marginalCDFArray = nullptr;
-    }
+
+    // Free importance-sampling device buffers
+    if (m_d_aliasProb) { cudaFree(m_d_aliasProb); m_d_aliasProb = nullptr; }
+    if (m_d_aliasIdx)  { cudaFree(m_d_aliasIdx);  m_d_aliasIdx  = nullptr; }
+    if (m_d_pmf)       { cudaFree(m_d_pmf);       m_d_pmf       = nullptr; }
 
     m_width = 0;
     m_height = 0;
@@ -75,8 +62,8 @@ bool EnvironmentMap::loadFromFile(const std::string& path) {
         return false;
     }
 
-    // Build importance sampling CDFs
-    if (!buildCDFs(data)) {
+    // Build importance-sampling alias table
+    if (!buildAliasTable(data)) {
         stbi_image_free(data);
         clear();
         return false;
@@ -134,142 +121,86 @@ bool EnvironmentMap::createTexture(const float* rgbData) {
     return true;
 }
 
-bool EnvironmentMap::buildCDFs(const float* rgbData) {
-    // Compute luminance for each pixel, weighted by solid angle (sin theta)
-    // For equirectangular maps, each row represents a different latitude
-    
-    std::vector<float> luminance(m_width * m_height);
-    std::vector<float> rowSums(m_height, 0.0f);
-
+bool EnvironmentMap::buildAliasTable(const float* rgbData) {
+    // Per-texel sin(theta)-weighted luminance = the unnormalized selection mass
+    // (identical weighting to the old CDF path: each equirectangular row spans a
+    // different latitude, weighted by its solid angle).
+    const uint32_t n = m_width * m_height;
     const float PI = 3.14159265358979323846f;
 
+    std::vector<float> weighted(n);
+    m_totalLuminance = 0.0f;
     for (uint32_t y = 0; y < m_height; y++) {
-        // Compute sin(theta) weight for this row
-        // v goes from 0 (top) to 1 (bottom)
-        // theta goes from 0 (north pole) to PI (south pole)
-        float v = (y + 0.5f) / m_height;
-        float theta = v * PI;
-        float sinTheta = std::sin(theta);
-
+        float v = (y + 0.5f) / m_height;          // 0 (top) .. 1 (bottom)
+        float sinTheta = std::sin(v * PI);
         for (uint32_t x = 0; x < m_width; x++) {
             uint32_t idx = y * m_width + x;
             float r = rgbData[idx * 3 + 0];
             float g = rgbData[idx * 3 + 1];
             float b = rgbData[idx * 3 + 2];
-
-            // Compute luminance using standard coefficients
-            float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-
-            // Weight by solid angle
-            float weightedLum = lum * sinTheta;
-            luminance[idx] = weightedLum;
-            rowSums[y] += weightedLum;
+            float w = (0.2126f * r + 0.7152f * g + 0.0722f * b) * sinTheta;
+            weighted[idx] = w;
+            m_totalLuminance += w;
         }
     }
-
-    // Compute total luminance
-    m_totalLuminance = 0.0f;
-    for (uint32_t y = 0; y < m_height; y++) {
-        m_totalLuminance += rowSums[y];
-    }
-
     if (m_totalLuminance <= 0.0f) {
-        std::cerr << "[EnvironmentMap] Warning: Environment map has zero luminance\n";
-        m_totalLuminance = 1.0f;  // Avoid division by zero
+        std::cerr << "[EnvironmentMap] Warning: environment map has zero luminance\n";
+        m_totalLuminance = 1.0f;  // avoid division by zero
     }
 
-    // Build conditional CDF (per row) - P(u|v)
-    // Each row stores the CDF of selecting column u given we're in row v
-    std::vector<float> conditionalCDF(m_width * m_height);
+    // Per-texel selection probability (normalized). This is exactly the
+    // marginalPdf*conditionalPdf product the old CDF environmentPdf computed, so
+    // the device PDF formula pmf[texel]*(W*H)/(2*pi^2*sin theta) is unchanged.
+    std::vector<float> pmf(n);
+    const float invTotal = 1.0f / m_totalLuminance;
+    for (uint32_t i = 0; i < n; i++) pmf[i] = weighted[i] * invTotal;
 
-    for (uint32_t y = 0; y < m_height; y++) {
-        float rowSum = rowSums[y];
-        if (rowSum <= 0.0f) rowSum = 1.0f;  // Avoid division by zero
-
-        float cumulative = 0.0f;
-        for (uint32_t x = 0; x < m_width; x++) {
-            uint32_t idx = y * m_width + x;
-            cumulative += luminance[idx] / rowSum;
-            conditionalCDF[idx] = cumulative;
-        }
-        // Ensure last element is exactly 1.0
-        conditionalCDF[y * m_width + m_width - 1] = 1.0f;
+    // Walker/Vose alias construction. scaled[i] = pmf[i]*n; pair light buckets
+    // (<1) with heavy ones (>=1) until every bucket holds <=2 outcomes.
+    std::vector<float> prob(n);
+    std::vector<uint32_t> alias(n);
+    std::vector<float> scaled(n);
+    std::vector<uint32_t> small, large;
+    small.reserve(n);
+    large.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        scaled[i] = pmf[i] * static_cast<float>(n);
+        (scaled[i] < 1.0f ? small : large).push_back(i);
     }
-
-    // Build marginal CDF - P(v)
-    // Probability of selecting row v based on sum of luminance in that row
-    std::vector<float> marginalCDF(m_height);
-    float cumulative = 0.0f;
-    for (uint32_t y = 0; y < m_height; y++) {
-        cumulative += rowSums[y] / m_totalLuminance;
-        marginalCDF[y] = cumulative;
+    while (!small.empty() && !large.empty()) {
+        uint32_t l = small.back(); small.pop_back();
+        uint32_t g = large.back(); large.pop_back();
+        prob[l] = scaled[l];
+        alias[l] = g;
+        scaled[g] = (scaled[g] + scaled[l]) - 1.0f;   // = scaled[g] - (1 - scaled[l])
+        (scaled[g] < 1.0f ? small : large).push_back(g);
     }
-    // Ensure last element is exactly 1.0
-    marginalCDF[m_height - 1] = 1.0f;
+    // Leftovers from FP drift: accept with probability 1 (self-alias is never
+    // taken because prob==1, but set it so a stray read is harmless).
+    while (!large.empty()) { uint32_t g = large.back(); large.pop_back(); prob[g] = 1.0f; alias[g] = g; }
+    while (!small.empty()) { uint32_t s = small.back(); small.pop_back(); prob[s] = 1.0f; alias[s] = s; }
 
-    // Create CUDA array for conditional CDF (2D texture)
-    {
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
-        cudaError_t err = cudaMallocArray(&m_conditionalCDFArray, &channelDesc, m_width, m_height);
+    // Upload to device linear buffers.
+    auto upload = [](void** dptr, const void* src, size_t bytes, const char* what) -> bool {
+        cudaError_t err = cudaMalloc(dptr, bytes);
         if (err != cudaSuccess) {
-            std::cerr << "[EnvironmentMap] Failed to allocate conditional CDF array: " 
+            std::cerr << "[EnvironmentMap] alias " << what << " malloc failed: "
                       << cudaGetErrorString(err) << "\n";
             return false;
         }
-
-        err = cudaMemcpy2DToArray(
-            m_conditionalCDFArray, 0, 0,
-            conditionalCDF.data(),
-            m_width * sizeof(float),
-            m_width * sizeof(float),
-            m_height,
-            cudaMemcpyHostToDevice
-        );
+        err = cudaMemcpy(*dptr, src, bytes, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
-            std::cerr << "[EnvironmentMap] Failed to copy conditional CDF: " 
+            std::cerr << "[EnvironmentMap] alias " << what << " copy failed: "
                       << cudaGetErrorString(err) << "\n";
             return false;
         }
+        return true;
+    };
+    if (!upload(reinterpret_cast<void**>(&m_d_aliasProb), prob.data(),  (size_t)n * sizeof(float),    "prob")) return false;
+    if (!upload(reinterpret_cast<void**>(&m_d_aliasIdx),  alias.data(), (size_t)n * sizeof(uint32_t), "idx"))  return false;
+    if (!upload(reinterpret_cast<void**>(&m_d_pmf),       pmf.data(),   (size_t)n * sizeof(float),    "pmf"))  return false;
 
-        if (!createCudaTexture(m_conditionalCDF, m_conditionalCDFArray,
-                cudaAddressModeClamp, cudaAddressModeClamp,
-                cudaFilterModePoint, cudaReadModeElementType, false)) {
-            return false;
-        }
-    }
-
-    // Create CUDA array for marginal CDF (1D texture stored as 2D with height=1)
-    {
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
-        cudaError_t err = cudaMallocArray(&m_marginalCDFArray, &channelDesc, m_height, 1);
-        if (err != cudaSuccess) {
-            std::cerr << "[EnvironmentMap] Failed to allocate marginal CDF array: " 
-                      << cudaGetErrorString(err) << "\n";
-            return false;
-        }
-
-        err = cudaMemcpy2DToArray(
-            m_marginalCDFArray, 0, 0,
-            marginalCDF.data(),
-            m_height * sizeof(float),
-            m_height * sizeof(float),
-            1,
-            cudaMemcpyHostToDevice
-        );
-        if (err != cudaSuccess) {
-            std::cerr << "[EnvironmentMap] Failed to copy marginal CDF: " 
-                      << cudaGetErrorString(err) << "\n";
-            return false;
-        }
-
-        if (!createCudaTexture(m_marginalCDF, m_marginalCDFArray,
-                cudaAddressModeClamp, cudaAddressModeClamp,
-                cudaFilterModePoint, cudaReadModeElementType, false)) {
-            return false;
-        }
-    }
-
-    std::cout << "[EnvironmentMap] Built importance sampling CDFs\n";
+    std::cout << "[EnvironmentMap] Built alias table (" << n << " texels)\n";
     return true;
 }
 

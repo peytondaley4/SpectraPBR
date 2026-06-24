@@ -226,12 +226,16 @@ struct LaunchParams {
     float environment_intensity;
     float _pad_env;
 
-    // Environment map importance sampling CDFs
-    cudaTextureObject_t env_conditional_cdf;  // P(u|v) - CDF per row (2D: width x height)
-    cudaTextureObject_t env_marginal_cdf;     // P(v) - CDF for rows (1D: height elements)
+    // Environment map importance sampling — Walker/Vose alias table over the
+    // W*H texels (O(1) sampling vs the old CDF binary search). Same
+    // distribution, so convergence is unchanged — purely a latency win.
+    // MUST match optix_programs/gpu_types.h field-for-field.
+    const float* env_alias_prob;        // [W*H] accept-probability of each bucket
+    const unsigned int* env_alias_idx;  // [W*H] fallback texel of each bucket
+    const float* env_pmf;               // [W*H] per-texel selection probability
     uint32_t env_width;
     uint32_t env_height;
-    float env_total_luminance;              // For PDF normalization
+    float env_total_luminance;              // (host-side selection weight; unused on device)
     float _pad_env_cdf;
 
     // Quality and rendering settings

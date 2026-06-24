@@ -544,129 +544,78 @@ __forceinline__ __device__ float3 equirectangularToDirection(float u, float v) {
 }
 
 //------------------------------------------------------------------------------
-// Environment Map Importance Sampling
+// Environment Map Importance Sampling — Walker/Vose alias table
 //
-// Continuous sub-texel sampling: the CDF inversion finds the texel AND uses
-// the leftover fraction of the random number to position the sample inside
-// it. Always returning texel centers (the previous behavior) makes the set
-// of sampleable directions discrete while the PDF describes a continuous
-// density — a small but real bias. The piecewise-constant PDF below exactly
-// matches this sampling procedure.
+// Sampling is O(1): one bucket pick + one accept/alias compare, replacing the
+// old log2(W)+log2(H) DEPENDENT, point-filtered CDF binary searches (~22
+// serialized texture fetches per sample on a 2K map). The sampled distribution
+// is IDENTICAL — per-texel probability proportional to sin(theta)-weighted
+// luminance, with a uniform sub-texel jitter — so variance/convergence are
+// unchanged; this is purely a latency win. The host (EnvironmentMap) builds the
+// alias tables (prob[], alias[]) and the per-texel pmf once at load.
+//
+// Unbiasedness: environmentPdf() (the MIS density) reads the SAME pmf the
+// sampler uses, so the two stay in exact lockstep. Reusing the fractional part
+// of xi1*N as the accept test is valid — for xi1 uniform, frac(xi1*N) is
+// uniform on [0,1) and independent of the chosen bucket.
 //------------------------------------------------------------------------------
 
-// Binary search in a 1D CDF. Returns the first index with cdf[idx] >= value,
-// plus the CDF segment [lo, hi) covering that index for remainder rescaling.
-__forceinline__ __device__ int searchCDF1D(
-    cudaTextureObject_t cdf, int size, float value, float& outLo, float& outHi)
-{
-    int low = 0;
-    int high = size - 1;
-    while (low < high) {
-        int mid = (low + high) / 2;
-        float cdfVal = tex1D<float>(cdf, mid);
-        if (cdfVal < value) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    outLo = (low > 0) ? tex1D<float>(cdf, low - 1) : 0.0f;
-    outHi = tex1D<float>(cdf, low);
-    return low;
-}
-
-// Binary search in one row of a 2D conditional CDF (same contract as above).
-__forceinline__ __device__ int searchCDF2D(
-    cudaTextureObject_t cdf, int width, int row, float value, float& outLo, float& outHi)
-{
-    int low = 0;
-    int high = width - 1;
-    while (low < high) {
-        int mid = (low + high) / 2;
-        float cdfVal = tex2D<float>(cdf, mid, row);
-        if (cdfVal < value) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    outLo = (low > 0) ? tex2D<float>(cdf, low - 1, row) : 0.0f;
-    outHi = tex2D<float>(cdf, low, row);
-    return low;
-}
-
-// Sample direction from environment map proportional to sin(theta)-weighted
-// luminance. Returns the direction and the solid-angle PDF of the sample.
+// Sample a direction from the environment proportional to sin(theta)-weighted
+// luminance via the alias table. Returns the direction and its solid-angle PDF.
+// xi1 picks the bucket (its fractional part is the accept/alias test); xi2, xi3
+// jitter the sample uniformly inside the chosen texel.
 __forceinline__ __device__ float3 sampleEnvironmentDirection(
-    float xi1, float xi2,
-    cudaTextureObject_t marginalCDF,            // P(v) - marginal CDF for rows
-    cudaTextureObject_t conditionalCDF,         // P(u|v) - conditional CDF per row
+    float xi1, float xi2, float xi3,
+    const float* aliasProb,             // [W*H] bucket accept-probabilities
+    const unsigned int* aliasIdx,       // [W*H] bucket fallback texels
+    const float* pmf,                   // [W*H] per-texel selection probability
     unsigned int envWidth,
     unsigned int envHeight,
     float& outPdf)
 {
-    // Sample row (v) using marginal CDF; rescale the remainder for sub-texel v
-    float mLo, mHi;
-    int row = searchCDF1D(marginalCDF, envHeight, xi1, mLo, mHi);
-    float marginalPdf = fmaxf(mHi - mLo, 0.0f);
-    float dv = (mHi > mLo) ? clamp((xi1 - mLo) / (mHi - mLo), 0.0f, 1.0f) : 0.5f;
+    unsigned int n = envWidth * envHeight;
+    float scaled = xi1 * (float)n;
+    unsigned int bucket = (unsigned int)scaled;
+    if (bucket >= n) bucket = n - 1;
+    float frac = scaled - (float)bucket;        // uniform[0,1), independent of bucket
+    unsigned int texel = (frac < aliasProb[bucket]) ? bucket : aliasIdx[bucket];
 
-    // Sample column (u) using the conditional CDF for this row
-    float cLo, cHi;
-    int col = searchCDF2D(conditionalCDF, envWidth, row, xi2, cLo, cHi);
-    float conditionalPdf = fmaxf(cHi - cLo, 0.0f);
-    float du = (cHi > cLo) ? clamp((xi2 - cLo) / (cHi - cLo), 0.0f, 1.0f) : 0.5f;
+    unsigned int col = texel % envWidth;
+    unsigned int row = texel / envWidth;
 
-    // Continuous UV inside the selected texel
-    float u = (col + du) / envWidth;
-    float v = (row + dv) / envHeight;
+    // Continuous UV inside the selected texel (uniform sub-texel jitter)
+    float u = ((float)col + xi2) / (float)envWidth;
+    float v = ((float)row + xi3) / (float)envHeight;
 
     float3 dir = equirectangularToDirection(u, v);
 
-    // Solid-angle PDF. The discrete texel probability times (W*H) is the
-    // piecewise-constant density over [0,1]^2; dividing by the equirectangular
-    // Jacobian 2*pi^2*sin(theta) converts to solid angle.
+    // Solid-angle PDF: per-texel probability * (W*H) is the piecewise-constant
+    // density over [0,1]^2; dividing by the equirectangular Jacobian
+    // 2*pi^2*sin(theta) converts to solid angle. Identical to the old CDF path
+    // (there pmf == marginalPdf * conditionalPdf).
     float theta = v * M_PI;
     float sinTheta = fmaxf(sinf(theta), 1e-6f);
-    float jointPdf = marginalPdf * conditionalPdf * envWidth * envHeight;
-    outPdf = jointPdf / (2.0f * M_PI * M_PI * sinTheta);
+    outPdf = pmf[texel] * (float)n / (2.0f * M_PI * M_PI * sinTheta);
 
     return dir;
 }
 
-// Solid-angle PDF of sampling a given direction from the environment CDFs.
+// Solid-angle PDF of sampling a given direction from the environment.
 // Must match sampleEnvironmentDirection exactly (used for MIS).
 __forceinline__ __device__ float environmentPdf(
     const float3& dir,
-    cudaTextureObject_t marginalCDF,
-    cudaTextureObject_t conditionalCDF,
+    const float* pmf,
     unsigned int envWidth,
     unsigned int envHeight)
 {
     float2 uv = directionToEquirectangular(dir);
-
     int col = clamp((int)(uv.x * envWidth), 0, (int)envWidth - 1);
     int row = clamp((int)(uv.y * envHeight), 0, (int)envHeight - 1);
-
-    float marginalPdf;
-    if (row == 0) {
-        marginalPdf = tex1D<float>(marginalCDF, 0);
-    } else {
-        marginalPdf = tex1D<float>(marginalCDF, row) - tex1D<float>(marginalCDF, row - 1);
-    }
-
-    float conditionalPdf;
-    if (col == 0) {
-        conditionalPdf = tex2D<float>(conditionalCDF, 0, row);
-    } else {
-        conditionalPdf = tex2D<float>(conditionalCDF, col, row) - tex2D<float>(conditionalCDF, col - 1, row);
-    }
+    unsigned int texel = (unsigned int)row * envWidth + (unsigned int)col;
 
     float theta = uv.y * M_PI;
     float sinTheta = fmaxf(sinf(theta), 1e-6f);
-
-    float jointPdf = marginalPdf * conditionalPdf * envWidth * envHeight;
-    return jointPdf / (2.0f * M_PI * M_PI * sinTheta);
+    return pmf[texel] * (float)(envWidth * envHeight) / (2.0f * M_PI * M_PI * sinTheta);
 }
 
 // Sample environment map radiance for a given direction

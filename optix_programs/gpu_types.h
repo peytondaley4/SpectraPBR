@@ -242,12 +242,19 @@ struct GpuLaunchParams {
     float environment_intensity;
     float _pad_env;
 
-    // Environment map importance sampling CDFs
-    cudaTextureObject_t env_conditional_cdf;  // P(u|v) - CDF per row (2D: width x height)
-    cudaTextureObject_t env_marginal_cdf;     // P(v) - CDF for rows (1D: height elements)
+    // Environment map importance sampling — Walker/Vose alias table over the
+    // W*H texels (O(1) sampling vs the old log2(W)+log2(H) dependent CDF
+    // binary search). Distribution is identical (per-texel selection prob =
+    // sin(theta)-weighted luminance, normalized; uniform sub-texel jitter), so
+    // convergence is unchanged — this is purely a latency win. env_pmf gives
+    // the per-texel probability for environmentPdf() (the MIS density), kept in
+    // lockstep with the sampler so MIS stays exact.
+    const float* env_alias_prob;        // [W*H] accept-probability of each bucket
+    const unsigned int* env_alias_idx;  // [W*H] fallback texel of each bucket
+    const float* env_pmf;               // [W*H] per-texel selection probability
     unsigned int env_width;
     unsigned int env_height;
-    float env_total_luminance;              // For PDF normalization
+    float env_total_luminance;              // (host-side selection weight; unused on device)
     float _pad_env_cdf;
 
     // Quality and rendering settings

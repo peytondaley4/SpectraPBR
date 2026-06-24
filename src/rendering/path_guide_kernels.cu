@@ -76,9 +76,19 @@ __global__ void refitCellsKernel(float* data,
                 float len = sqrtf(cumS[0] * cumS[0] + cumS[1] * cumS[1] + cumS[2] * cumS[2]);
                 if (len > 1e-9f) {
                     float invLen = 1.0f / len;
-                    float rbar = fminf(len / lobeW[k], 0.9999f);
-                    float kappa = rbar * (3.0f - rbar * rbar) / fmaxf(1.0f - rbar * rbar, 0.01f);
-                    kappa = fminf(kappa, 300.0f);
+                    float rbar = fminf(len / lobeW[k], 0.99999f);
+                    float kappa = rbar * (3.0f - rbar * rbar) / fmaxf(1.0f - rbar * rbar, 1e-4f);
+                    // Confidence-gated sharpness ceiling. The old flat 300
+                    // (~5 deg lobe) could not importance-sample compact bright
+                    // emitters (a sun disc is ~0.5 deg; neon/env hotspots
+                    // similar), capping exactly the "hard light" gains. Allow
+                    // tight lobes only once the cell has real evidence: a
+                    // too-tight, slightly miscentered lobe knocked off by the
+                    // +-0.5 cell box-filter jitter has near-zero pdf at the true
+                    // direction and raises its own variance. (Sampler + PDF
+                    // already handle large kappa numerically — vmf_device.h.)
+                    float kappaMax = (cumN >= 64.0f) ? 2000.0f : 300.0f;
+                    kappa = fminf(kappa, kappaMax);
                     l[PG_L_MU_X] = cumS[0] * invLen;
                     l[PG_L_MU_Y] = cumS[1] * invLen;
                     l[PG_L_MU_Z] = cumS[2] * invLen;
@@ -90,20 +100,44 @@ __global__ void refitCellsKernel(float* data,
             }
         }
 
-        // Re-seed dead lobes in mature cells (deterministic perturbation of
-        // the strongest direction; no RNG in this kernel).
+        // Re-seed dead lobes in mature cells toward UNDER-represented parts of
+        // the sphere (deterministic; no RNG in this kernel). The old reseed
+        // perturbed the strongest direction by ~20 deg, so all dead lobes
+        // orbited the dominant mode and a far/opposite second emitter (another
+        // window, a bounce light behind the receiver) was never discovered —
+        // the mixture decayed toward unimodal. Instead, build an orthonormal
+        // frame around the strongest mu and seed dead lobes at the opposite
+        // hemisphere and the tangent directions (~90-180 deg away), spreading
+        // coverage so emerging secondary modes can be captured. kappa stays 1
+        // (below the sampling-eligibility gate) until the lobe earns evidence.
         if (cumN >= 32.0f) {
             const float* ls = c + strongest * PG_LOBE_STRIDE;
-            const float perturb[PG_NUM_LOBES][3] = {
-                { 0.35f, 0.0f, 0.0f }, { 0.0f, 0.35f, 0.0f },
-                { 0.0f, 0.0f, 0.35f }, { -0.25f, -0.25f, 0.0f }
+            float sx = ls[PG_L_MU_X], sy = ls[PG_L_MU_Y], sz = ls[PG_L_MU_Z];
+            // Tangent frame around the strongest direction. up = +Y unless mu
+            // is near-vertical, then +X (avoids a degenerate cross product).
+            float upx = (fabsf(sy) < 0.9f) ? 0.0f : 1.0f;
+            float upy = (fabsf(sy) < 0.9f) ? 1.0f : 0.0f;
+            // T = cross(up, s), with up = (upx, upy, 0)
+            float tx = upy * sz;
+            float ty = -upx * sz;
+            float tz = upx * sy - upy * sx;
+            float tinv = rsqrtf(fmaxf(tx * tx + ty * ty + tz * tz, 1e-12f));
+            tx *= tinv; ty *= tinv; tz *= tinv;
+            float bx = sy * tz - sz * ty;   // cross(s, T)
+            float by = sz * tx - sx * tz;
+            float bz = sx * ty - sy * tx;
+            const float seeds[4][3] = {
+                { -sx, -sy, -sz },   // opposite hemisphere
+                {  tx,  ty,  tz },   // +tangent
+                {  bx,  by,  bz },   // +bitangent
+                { -tx, -ty, -tz },   // -tangent
             };
+            int seedIdx = 0;
             for (int k = 0; k < PG_NUM_LOBES; k++) {
                 if (k == strongest || lobeW[k] >= 0.5f) continue;
                 float* l = c + k * PG_LOBE_STRIDE;
-                float mx = ls[PG_L_MU_X] + perturb[k][0];
-                float my = ls[PG_L_MU_Y] + perturb[k][1];
-                float mz = ls[PG_L_MU_Z] + perturb[k][2];
+                int si = seedIdx & 3; seedIdx++;
+                float mx = seeds[si][0], my = seeds[si][1], mz = seeds[si][2];
                 float invLen = rsqrtf(fmaxf(mx * mx + my * my + mz * mz, 1e-12f));
                 l[PG_L_MU_X] = mx * invLen;
                 l[PG_L_MU_Y] = my * invLen;

@@ -846,22 +846,45 @@ __forceinline__ __device__ float3 tracePath(
                 float jx = s.pos.x + (randomFloat(seed) - 0.5f) * (grid.bounds_max[0] - grid.bounds_min[0]) * invRes;
                 float jy = s.pos.y + (randomFloat(seed) - 0.5f) * (grid.bounds_max[1] - grid.bounds_min[1]) * invRes;
                 float jz = s.pos.z + (randomFloat(seed) - 0.5f) * (grid.bounds_max[2] - grid.bounds_min[2]) * invRes;
-                unsigned int jitterLevel = 0;
-                unsigned int ctxCellIdx = topDownCellLookup(
-                    grid, jx, jy, jz,
-                    params.path_guide_start_level, params.path_guide_max_level, &jitterLevel);
+                // Resolve the jittered sample at the home cell's OWN level (one
+                // hash probe, no descent). The previous full top-down re-lookup
+                // could descend into a FINER child on one side of a subdivision
+                // face while the jitter width was sized for foundLevel — a
+                // support/cell level mismatch that made the box-filtered guide
+                // distribution discontinuous across the face (the dominant
+                // visible grid-boundary seam). Co-leveling removes that and also
+                // cuts the per-vertex guide lookup from two full descents to
+                // one descent (the exact lookup) plus one single-level probe.
+                unsigned int ctxCellIdx = pathGuideCellAtLevel(grid, jx, jy, jz, foundLevel);
                 if (ctxCellIdx == PG_INVALID_CELL) ctxCellIdx = exactCellIdx;  // jitter left coverage
                 trainCellIdx = ctxCellIdx;
 
+                // (1-pSpec) sends near-specular surfaces to pure VNDF, but it
+                // also zeroes guiding on ROUGH metals (pSpec pins to 1 for
+                // metallic>0.95 regardless of roughness) — exactly where the
+                // incident-radiance guide is the only variance reduction for
+                // caustics / emissive-via-glossy chains. Restore a
+                // roughness-proportional floor: smooth metals stay ~0 (guide
+                // barely overlaps the mirror lobe), rough metals regain up to
+                // PG_SPEC_GUIDE_FLOOR. Deterministic in (pSpec, roughness), so
+                // sampler / combined PDF / NEE MIS all derive the same alpha.
+                float guideFrac = fmaxf(1.0f - pSpec,
+                    PG_SPEC_GUIDE_FLOOR * smoothstep01(0.08f, 0.30f, s.roughness));
                 float wantGuide = clamp(params.path_guide_mis_weight, 0.0f, 0.95f)
-                                * (1.0f - pSpec);
+                                * guideFrac;
                 if (wantGuide > 0.02f) {
                     const float* cell = sparseCellDataPtr(grid, ctxCellIdx);
                     if (cell != nullptr) {
                         // Confidence ramp keeps barely-trained mixtures from
-                        // grabbing full weight.
+                        // grabbing full weight. Smoothstep (vs a linear clamp)
+                        // gives zero-derivative ends, so guide weight fades in
+                        // and saturates gently instead of with a kink — this
+                        // softens the alpha discontinuity between a mature cell
+                        // and a freshly-subdivided neighbor (a grid-boundary
+                        // pop). conf only scales alpha, never the estimator, so
+                        // any ramp shape stays unbiased.
                         float cumN = cell[PG_CUM_COUNT];
-                        float conf = fminf(cumN * (1.0f / 32.0f), 1.0f);
+                        float conf = smoothstep01(0.0f, 32.0f, cumN);
                         if (conf > 0.0f) {
                             // Eligible-lobe subset: only narrow lobes (kappa
                             // >= 2) with real mixture weight. Wide lobes are

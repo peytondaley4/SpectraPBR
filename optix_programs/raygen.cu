@@ -50,6 +50,20 @@
 #define PG_TRAIN_PROB        0.25f
 #define PG_TRAIN_WEIGHT_SCALE 4.0f   // 1 / PG_TRAIN_PROB
 
+// Max share of the continuation budget the guide may claim on a surface the
+// BSDF-selection logic considers fully specular (pSpec == 1, i.e. metallic
+// metals). Gated by roughness so it only applies to ROUGH metals, where the
+// incident-radiance guide is the only variance reduction for caustics /
+// emissive-via-glossy transport; smooth metals keep it at ~0 (the guide vMF
+// barely overlaps a near-mirror lobe).
+#define PG_SPEC_GUIDE_FLOOR  0.5f
+
+// Hermite smoothstep on [e0, e1].
+__forceinline__ __device__ float smoothstep01(float e0, float e1, float x) {
+    float t = clamp((x - e0) / fmaxf(e1 - e0, 1e-8f), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
 // Far distance for secondary rays and unbounded shadow rays. Tied to the
 // camera far plane (which the host scales to the scene size) so very large
 // scenes don't get clipped by a hardcoded constant.
@@ -537,11 +551,11 @@ __forceinline__ __device__ float3 sampleDirectLight(
     } else if (kind == LIGHT_KIND_ENV) {
         float selProb = params.env_selection_weight / grandTotal;
         if (selProb > 0.0f && params.environment_map != 0 &&
-            params.env_conditional_cdf != 0 && params.env_marginal_cdf != 0) {
+            params.env_alias_prob != nullptr && params.env_pmf != nullptr) {
             float envPdf;
             float3 L = sampleEnvironmentDirection(
-                randomFloat(seed), randomFloat(seed),
-                params.env_marginal_cdf, params.env_conditional_cdf,
+                randomFloat(seed), randomFloat(seed), randomFloat(seed),
+                params.env_alias_prob, params.env_alias_idx, params.env_pmf,
                 params.env_width, params.env_height, envPdf);
             float NdotL = dot(N, L);
             if (NdotL > 0.0f && envPdf > 1e-12f) {
@@ -580,8 +594,16 @@ struct TrainRecord {
     unsigned int cellIdx;   // deposit target (0xFFFFFFFF = chain-only entry)
     float dirX, dirY, dirZ; // sampled continuation direction
     float pdf;              // combined sampling pdf of that direction
-    float localLum;         // lum(emission + NEE) emitted from this vertex
-    float betaLum;          // lum of the local throughput factor f*cos/pdf (incl. 1/RR)
+    // RGB (not luminance) so the backward recurrence reconstructs the true
+    // incident radiance: lum(prod beta_i) != prod lum(beta_i) for chromatic
+    // bounces (red wall then green wall over-estimates a direction's importance
+    // ~3-4x), which skews the learned guide in colored interreflection — the
+    // common photoreal case. Costs ~4 extra floats/record vs the old scalar
+    // pair; the deposit is still one scalar (lum of the RGB Lo).
+    float3 local;           // RGB radiance emitted from this vertex (emission + NEE)
+    float3 beta;            // RGB local throughput factor f*cos/pdf (incl. 1/RR)
+    float dist;             // distance to the next vertex along dir (parallax fit);
+                            // patched from the next segment's hit.t after the trace
 };
 
 //------------------------------------------------------------------------------
@@ -642,12 +664,24 @@ __forceinline__ __device__ float3 tracePath(
     }
     TrainRecord train[MAX_TRAIN_VERTICES];
     int trainCount = 0;
-    float terminalEnvLum = 0.0f;   // lum of (unweighted) radiance entering the last segment
+    float3 terminalEnv = make_float3(0.0f, 0.0f, 0.0f);  // (unweighted) RGB radiance entering the last segment
+    // Index of the continuation deposit awaiting its parallax distance — the
+    // distance to where its radiance came from is the NEXT segment's hit.t,
+    // only known after the next trace, so we patch it retroactively.
+    int pendingDistRecord = -1;
 
     const unsigned int maxDepth = params.max_bounce_depth;
 
     for (unsigned int depth = 0; ; ++depth) {
         HitInfo hit = traceRadianceRay(rayOrigin, rayDir, tmin, tmax);
+
+        // Fill in the previous continuation deposit's parallax distance: hit.t
+        // for a surface hit, or a far distance on env miss (distant => no
+        // reprojection). Training reads this only for cellIdx != INVALID.
+        if (pendingDistRecord >= 0) {
+            train[pendingDistRecord].dist = (hit.t >= 0.0f) ? hit.t : sceneFarDistance();
+            pendingDistRecord = -1;
+        }
 
         //── Miss: environment (MIS-weighted against env NEE) ────────────────
         if (hit.t < 0.0f) {
@@ -656,16 +690,15 @@ __forceinline__ __device__ float3 tracePath(
                     rayDir, params.environment_map, params.environment_intensity);
                 float w = 1.0f;
                 if (!prevDelta && params.env_selection_weight > 0.0f &&
-                    params.env_conditional_cdf != 0 && params.env_marginal_cdf != 0) {
+                    params.env_pmf != nullptr) {
                     float grandTotal = params.total_light_luminance + params.env_selection_weight;
                     float selProbEnv = params.env_selection_weight / grandTotal;
                     float pLight = selProbEnv * environmentPdf(rayDir,
-                        params.env_marginal_cdf, params.env_conditional_cdf,
-                        params.env_width, params.env_height);
+                        params.env_pmf, params.env_width, params.env_height);
                     w = prevPdf / (prevPdf + pLight);
                 }
                 radiance = radiance + clampContribution(throughput * envRadiance * w);
-                terminalEnvLum = luminance3(envRadiance);
+                terminalEnv = envRadiance;
             }
             break;
         }
@@ -720,10 +753,12 @@ __forceinline__ __device__ float3 tracePath(
         }
 
         //── Depth cap ────────────────────────────────────────────────────────
-        // Path truncation past max_bounce_depth: biased, host raises the cap
-        // for accurate/offline renders; RR usually terminates paths first.
-        // The cap vertex still gets NEE (with full weight — see
-        // sampleDirectLight's finalVertex), only the continuation is dropped.
+        // Path truncation past max_bounce_depth is biased, so the cap scales
+        // with quality (setQualityMode: 8 FAST/BALANCED, 16 HIGH, 32 ACCURATE)
+        // — high enough in ACCURATE that RR (from depth 3) terminates paths
+        // first and the cap only backstops pathological mirror chains. The cap
+        // vertex still gets NEE (with full weight — see sampleDirectLight's
+        // finalVertex), only the continuation is dropped.
         const bool atCap = (depth >= maxDepth);
 
         //── Transmission (stochastic dielectric event, delta lobes) ─────────
@@ -775,8 +810,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;          // delta vertex: chain only
                 tr.dirX = newDir.x; tr.dirY = newDir.y; tr.dirZ = newDir.z;
                 tr.pdf = 0.0f;
-                tr.localLum = luminance3(emissionContrib);
-                tr.betaLum = luminance3(tint);
+                tr.local = emissionContrib;
+                tr.beta = tint;
             }
 
             rayOrigin = s.pos + (reflected ? gN : -gN) * RAY_EPS;
@@ -838,10 +873,16 @@ __forceinline__ __device__ float3 tracePath(
                 float jx = s.pos.x + (randomFloat(seed) - 0.5f) * (grid.bounds_max[0] - grid.bounds_min[0]) * invRes;
                 float jy = s.pos.y + (randomFloat(seed) - 0.5f) * (grid.bounds_max[1] - grid.bounds_min[1]) * invRes;
                 float jz = s.pos.z + (randomFloat(seed) - 0.5f) * (grid.bounds_max[2] - grid.bounds_min[2]) * invRes;
-                unsigned int jitterLevel = 0;
-                unsigned int ctxCellIdx = topDownCellLookup(
-                    grid, jx, jy, jz,
-                    params.path_guide_start_level, params.path_guide_max_level, &jitterLevel);
+                // Resolve the jittered sample at the home cell's OWN level (one
+                // hash probe, no descent). The previous full top-down re-lookup
+                // could descend into a FINER child on one side of a subdivision
+                // face while the jitter width was sized for foundLevel — a
+                // support/cell level mismatch that made the box-filtered guide
+                // distribution discontinuous across the face (the dominant
+                // visible grid-boundary seam). Co-leveling removes that and also
+                // cuts the per-vertex guide lookup from two full descents to
+                // one descent (the exact lookup) plus one single-level probe.
+                unsigned int ctxCellIdx = pathGuideCellAtLevel(grid, jx, jy, jz, foundLevel);
                 if (ctxCellIdx == PG_INVALID_CELL) ctxCellIdx = exactCellIdx;  // jitter left coverage
                 // Train the exact cell (the one that actually contains this
                 // shading point). Using the jittered cell for training scatters
@@ -852,15 +893,32 @@ __forceinline__ __device__ float3 tracePath(
                 // boundary smoothing.
                 trainCellIdx = exactCellIdx;
 
+                // (1-pSpec) sends near-specular surfaces to pure VNDF, but it
+                // also zeroes guiding on ROUGH metals (pSpec pins to 1 for
+                // metallic>0.95 regardless of roughness) — exactly where the
+                // incident-radiance guide is the only variance reduction for
+                // caustics / emissive-via-glossy chains. Restore a
+                // roughness-proportional floor: smooth metals stay ~0 (guide
+                // barely overlaps the mirror lobe), rough metals regain up to
+                // PG_SPEC_GUIDE_FLOOR. Deterministic in (pSpec, roughness), so
+                // sampler / combined PDF / NEE MIS all derive the same alpha.
+                float guideFrac = fmaxf(1.0f - pSpec,
+                    PG_SPEC_GUIDE_FLOOR * smoothstep01(0.08f, 0.30f, s.roughness));
                 float wantGuide = clamp(params.path_guide_mis_weight, 0.0f, 0.95f)
-                                * (1.0f - pSpec);
+                                * guideFrac;
                 if (wantGuide > 0.02f) {
                     const float* cell = sparseCellDataPtr(grid, ctxCellIdx);
                     if (cell != nullptr) {
                         // Confidence ramp keeps barely-trained mixtures from
-                        // grabbing full weight.
+                        // grabbing full weight. Smoothstep (vs a linear clamp)
+                        // gives zero-derivative ends, so guide weight fades in
+                        // and saturates gently instead of with a kink — this
+                        // softens the alpha discontinuity between a mature cell
+                        // and a freshly-subdivided neighbor (a grid-boundary
+                        // pop). conf only scales alpha, never the estimator, so
+                        // any ramp shape stays unbiased.
                         float cumN = cell[PG_CUM_COUNT];
-                        float conf = fminf(cumN * (1.0f / 32.0f), 1.0f);
+                        float conf = smoothstep01(0.0f, 32.0f, cumN);
                         if (conf > 0.0f) {
                             // Eligible-lobe subset: only narrow lobes (kappa
                             // >= 2) with real mixture weight. Wide lobes are
@@ -872,13 +930,38 @@ __forceinline__ __device__ float3 tracePath(
                             // same auxiliary-variable conditioning as the
                             // cell jitter, so using that lobe's pdf in every
                             // MIS denominator stays unbiased.
+                            // Soft eligibility: ramp the kappa>=2 and
+                            // weight>=0.05 gates with smoothstep instead of hard
+                            // cliffs. A lobe whose kappa or weight straddles the
+                            // threshold between adjacent cells no longer flips
+                            // eligSum (and thus alpha) discontinuously across a
+                            // boundary. The lower edges (kappa 1.5, weight 0.03)
+                            // still exclude wide lobes and kappa=1 exploratory
+                            // re-seeds (training-only), preserving the original
+                            // intent. Eligibility scales alpha only, so it stays
+                            // unbiased.
                             float eligW[PG_NUM_LOBES];
                             float eligSum = 0.0f;
+                            const float3& sn = s.shadingNormal;
                             for (int k = 0; k < PG_NUM_LOBES; k++) {
                                 const float* l = cell + k * PG_LOBE_STRIDE;
-                                bool elig = (l[PG_L_KAPPA] >= 2.0f) &&
-                                            (l[PG_L_WEIGHT] >= 0.05f);
-                                eligW[k] = elig ? l[PG_L_WEIGHT] : 0.0f;
+                                float ke = smoothstep01(1.5f, 3.0f, l[PG_L_KAPPA]);
+                                float we = smoothstep01(0.03f, 0.07f, l[PG_L_WEIGHT]);
+                                // Normal-alignment factor: a lobe whose mean
+                                // points along/into the surface spends most of
+                                // its (full-sphere) vMF mass below the horizon,
+                                // where the guide draw is wasted (zero
+                                // contribution, path terminates). Down-weighting
+                                // it here reduces that waste UNBIASEDLY — it only
+                                // reshapes the proposal (eligSum scales alpha,
+                                // and the pick + combinedPdf condition on the
+                                // realized eligibility). It is NOT a below-
+                                // horizon resample: resampling would add an
+                                // alpha*P(below)*pBsdf term the combinedPdf
+                                // divisor does not account for, which biases.
+                                float mn = l[PG_L_MU_X]*sn.x + l[PG_L_MU_Y]*sn.y + l[PG_L_MU_Z]*sn.z;
+                                float ne = smoothstep01(-0.30f, 0.20f, mn);
+                                eligW[k] = l[PG_L_WEIGHT] * ke * we * ne;
                                 eligSum += eligW[k];
                             }
                             // Alpha scales by the eligible mixture mass: a
@@ -903,6 +986,57 @@ __forceinline__ __device__ float3 tracePath(
                                 guideLobe.muz = l[PG_L_MU_Z];
                                 guideLobe.kappa = l[PG_L_KAPPA];
                                 guideLobe.expNeg2K = l[PG_L_EXP_NEG2K];
+                                // Parallax-aware reprojection: swing the lobe
+                                // mean toward where its radiance actually comes
+                                // from (cellCenter + mu*meanDist), reducing
+                                // within-cell directional error and giving
+                                // neighbouring cells a consistent aim near
+                                // shared faces. Reprojects mu in place; the
+                                // cached vMF kappa/pdf are evaluated around the
+                                // reprojected mean by sampler/PDF/NEE alike, so
+                                // the estimator stays consistent and unbiased.
+                                float ccx, ccy, ccz;
+                                pgCellCenter(grid, ctxCellIdx, ccx, ccy, ccz);
+                                pgParallaxReproject(ccx, ccy, ccz, l[PG_L_MEAN_DIST],
+                                    s.pos.x, s.pos.y, s.pos.z,
+                                    guideLobe.mux, guideLobe.muy, guideLobe.muz);
+
+                                // Product (BSDF x incident) guiding. The pure
+                                // incident-radiance lobe ignores the
+                                // view-dependent BSDF peak, so on a glossy
+                                // receiver most guide samples land where the
+                                // BSDF is ~0. Multiply it by a vMF approximation
+                                // of the specular BSDF lobe — centered on the
+                                // reflection direction R, concentration kb from
+                                // roughness and scaled by pSpec — so the guide
+                                // concentrates where BOTH incident radiance and
+                                // the BSDF are high. Product of two vMFs is a
+                                // vMF: r = kg*mu_g + kb*R, kappa_p = |r|, mu_p =
+                                // r/|r|. Diffuse/rough surfaces get kb ~ 0 =>
+                                // product ~ the incident lobe (unchanged). The
+                                // product lobe replaces guideLobe BEFORE the
+                                // sampler, the combined PDF, and NEE MIS read
+                                // it, so all three condition on it — unbiased.
+                                // (kb's roughness mapping is heuristic and a
+                                // tuning knob; validate on a glossy-receiver
+                                // scene.)
+                                float alphaR = fmaxf(s.roughness * s.roughness, 1e-3f);
+                                float kb = pSpec * fminf(2.0f / (alphaR * alphaR), 2000.0f);
+                                if (kb > 1.0f) {
+                                    float3 Rd = reflect(rayDir, s.shadingNormal);
+                                    float rx = guideLobe.kappa * guideLobe.mux + kb * Rd.x;
+                                    float ry = guideLobe.kappa * guideLobe.muy + kb * Rd.y;
+                                    float rz = guideLobe.kappa * guideLobe.muz + kb * Rd.z;
+                                    float kp = sqrtf(rx * rx + ry * ry + rz * rz);
+                                    if (kp > 1e-4f) {
+                                        float invkp = 1.0f / kp;
+                                        guideLobe.mux = rx * invkp;
+                                        guideLobe.muy = ry * invkp;
+                                        guideLobe.muz = rz * invkp;
+                                        guideLobe.kappa = fminf(kp, 2000.0f);
+                                        guideLobe.expNeg2K = expf(-2.0f * guideLobe.kappa);
+                                    }
+                                }
                                 guideAlpha = alpha;
                             }
                         }
@@ -916,7 +1050,19 @@ __forceinline__ __device__ float3 tracePath(
             guideLobe, seed, atCap);
         radiance = radiance + clampContribution(throughput * neeContrib);
 
-        float localLum = luminance3(emissionContrib + neeContrib);
+        // RGB local emission for this vertex = surface emission + the NEE
+        // contribution. Two deliberate, load-bearing choices live here:
+        //   - UNCLAMPED on purpose: the image accumulates clampContribution()ed
+        //     values (above), but the guide must learn the TRUE high-variance
+        //     target the firefly clamp exists to tame, not the clamped proxy.
+        //     The deposit is separately bounded by TRAIN_WEIGHT_CLAMP below.
+        //   - delta-light NEE is intentionally included: it is folded into THIS
+        //     vertex's reconstructed lo and deposited at the PREVIOUS vertex
+        //     along the incoming direction ("this surface is bright from that
+        //     direction"). Delta/transmission vertices set cellIdx=0xFFFFFFFF,
+        //     so no lobe is ever aimed at a delta's own unreproducible
+        //     direction. Do not "fix" either by clamping or excluding NEE.
+        float3 localRGB = emissionContrib + neeContrib;
 
         //── Depth cap: no continuation past this vertex ─────────────────────
         if (atCap) {
@@ -925,8 +1071,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
-                tr.localLum = localLum;
-                tr.betaLum = 0.0f;
+                tr.local = localRGB;
+                tr.beta = make_float3(0.0f, 0.0f, 0.0f);
             }
             break;
         }
@@ -948,8 +1094,8 @@ __forceinline__ __device__ float3 tracePath(
                     tr.cellIdx = 0xFFFFFFFFu;
                     tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                     tr.pdf = 0.0f;
-                    tr.localLum = localLum;
-                    tr.betaLum = 0.0f;   // chain ends here
+                    tr.local = localRGB;
+                    tr.beta = make_float3(0.0f, 0.0f, 0.0f);   // chain ends here
                 }
                 break;
             }
@@ -983,8 +1129,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
-                tr.localLum = localLum;
-                tr.betaLum = 0.0f;
+                tr.local = localRGB;
+                tr.beta = make_float3(0.0f, 0.0f, 0.0f);
             }
             break;
         }
@@ -1005,8 +1151,8 @@ __forceinline__ __device__ float3 tracePath(
                 tr.cellIdx = 0xFFFFFFFFu;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
-                tr.localLum = localLum;
-                tr.betaLum = 0.0f;
+                tr.local = localRGB;
+                tr.beta = make_float3(0.0f, 0.0f, 0.0f);
             }
             break;
         }
@@ -1024,8 +1170,10 @@ __forceinline__ __device__ float3 tracePath(
             tr.cellIdx = trainCellIdx;
             tr.dirX = L.x; tr.dirY = L.y; tr.dirZ = L.z;
             tr.pdf = combinedPdf;
-            tr.localLum = localLum;
-            tr.betaLum = luminance3(beta);
+            tr.local = localRGB;
+            tr.beta = beta;
+            tr.dist = sceneFarDistance();   // patched to the next segment's hit.t
+            if (trainCellIdx != PG_INVALID_CELL) pendingDistRecord = trainCount - 1;
         }
 
         // Continue the path
@@ -1047,22 +1195,27 @@ __forceinline__ __device__ float3 tracePath(
     // unbiasedness never depends on it. Subsampled per path (PG_TRAIN_PROB)
     // with compensating weight to cut contended atomic traffic.
     if (guidingActive && trainCount > 0 && randomFloat(seed) < PG_TRAIN_PROB) {
-        float lo = terminalEnvLum;
+        // RGB recurrence: lo(k) = local(k) + beta(k) ⊙ lo(k+1). The deposit is
+        // the LUMINANCE of this true RGB incident radiance — element-wise RGB
+        // accumulation avoids the chromatic over/under-estimation a scalar
+        // luminance recurrence produces across colored bounces.
+        float3 lo = terminalEnv;
         for (int k = trainCount - 1; k >= 0; --k) {
             const TrainRecord& tr = train[k];
-            if (tr.cellIdx != 0xFFFFFFFFu && lo > 1e-6f && tr.pdf > 1e-8f) {
+            float loLum = luminance3(lo);
+            if (tr.cellIdx != 0xFFFFFFFFu && loLum > 1e-6f && tr.pdf > 1e-8f) {
                 float* cell = sparseCellDataPtr(grid, tr.cellIdx);
                 if (cell != nullptr) {
                     // Clamp BEFORE the subsampling compensation so the
                     // effective per-estimate clamp matches the unsubsampled
                     // semantics (clamp-after-scale would tighten it 4x and
                     // suppress exactly the bright signals worth learning).
-                    float w = fminf(lo / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
+                    float w = fminf(loLum / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
                             * PG_TRAIN_WEIGHT_SCALE;
-                    pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, params.frame_index);
+                    pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, tr.dist, params.frame_index);
                 }
             }
-            lo = tr.localLum + tr.betaLum * lo;
+            lo = tr.local + tr.beta * lo;
         }
     }
 

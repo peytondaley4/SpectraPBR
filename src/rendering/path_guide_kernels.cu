@@ -43,14 +43,15 @@ __global__ void refitCellsKernel(float* data,
     float lobeW[PG_NUM_LOBES];
     float totalW = 0.0f;
     for (int k = 0; k < PG_NUM_LOBES; k++) {
-        float* intS = c + PG_INT_BASE + k * 4;
-        float* cumS = c + PG_CUMS_BASE + k * 4;
+        float* intS = c + PG_INT_BASE + k * PG_SUM_STRIDE;
+        float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
         float cumX = emaDecay * cumS[0] + intS[0];
         float cumY = emaDecay * cumS[1] + intS[1];
         float cumZ = emaDecay * cumS[2] + intS[2];
         float cumW = emaDecay * cumS[3] + intS[3];
-        cumS[0] = cumX; cumS[1] = cumY; cumS[2] = cumZ; cumS[3] = cumW;
-        intS[0] = 0.0f; intS[1] = 0.0f; intS[2] = 0.0f; intS[3] = 0.0f;
+        float cumD = emaDecay * cumS[PG_S_DIST] + intS[PG_S_DIST];  // sum of weight*dist
+        cumS[0] = cumX; cumS[1] = cumY; cumS[2] = cumZ; cumS[3] = cumW; cumS[PG_S_DIST] = cumD;
+        intS[0] = 0.0f; intS[1] = 0.0f; intS[2] = 0.0f; intS[3] = 0.0f; intS[PG_S_DIST] = 0.0f;
         lobeW[k] = cumW;
         totalW += cumW;
     }
@@ -72,13 +73,23 @@ __global__ void refitCellsKernel(float* data,
             if (pi > strongestPi) { strongestPi = pi; strongest = k; }
 
             if (lobeW[k] >= 0.5f) {
-                const float* cumS = c + PG_CUMS_BASE + k * 4;
+                const float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
                 float len = sqrtf(cumS[0] * cumS[0] + cumS[1] * cumS[1] + cumS[2] * cumS[2]);
                 if (len > 1e-9f) {
                     float invLen = 1.0f / len;
-                    float rbar = fminf(len / lobeW[k], 0.9999f);
-                    float kappa = rbar * (3.0f - rbar * rbar) / fmaxf(1.0f - rbar * rbar, 0.01f);
-                    kappa = fminf(kappa, 300.0f);
+                    float rbar = fminf(len / lobeW[k], 0.99999f);
+                    float kappa = rbar * (3.0f - rbar * rbar) / fmaxf(1.0f - rbar * rbar, 1e-4f);
+                    // Confidence-gated sharpness ceiling. The old flat 300
+                    // (~5 deg lobe) could not importance-sample compact bright
+                    // emitters (a sun disc is ~0.5 deg; neon/env hotspots
+                    // similar), capping exactly the "hard light" gains. Allow
+                    // tight lobes only once the cell has real evidence: a
+                    // too-tight, slightly miscentered lobe knocked off by the
+                    // +-0.5 cell box-filter jitter has near-zero pdf at the true
+                    // direction and raises its own variance. (Sampler + PDF
+                    // already handle large kappa numerically — vmf_device.h.)
+                    float kappaMax = (cumN >= 64.0f) ? 2000.0f : 300.0f;
+                    kappa = fminf(kappa, kappaMax);
                     l[PG_L_MU_X] = cumS[0] * invLen;
                     l[PG_L_MU_Y] = cumS[1] * invLen;
                     l[PG_L_MU_Z] = cumS[2] * invLen;
@@ -86,24 +97,53 @@ __global__ void refitCellsKernel(float* data,
                     // Cache the vMF normalization term: halves the expf count
                     // in the shader's PDF/sampler hot path.
                     l[PG_L_EXP_NEG2K] = expf(-2.0f * kappa);
+                    // Weighted mean distance to the incident radiance, for
+                    // parallax-aware reprojection at lookup. cumS[PG_S_DIST] is
+                    // the EMA sum of weight*dist; dividing by the weight sum
+                    // (lobeW[k]) gives the mean — decay-invariant like rbar.
+                    l[PG_L_MEAN_DIST] = cumS[PG_S_DIST] / lobeW[k];
                 }
             }
         }
 
-        // Re-seed dead lobes in mature cells (deterministic perturbation of
-        // the strongest direction; no RNG in this kernel).
+        // Re-seed dead lobes in mature cells toward UNDER-represented parts of
+        // the sphere (deterministic; no RNG in this kernel). The old reseed
+        // perturbed the strongest direction by ~20 deg, so all dead lobes
+        // orbited the dominant mode and a far/opposite second emitter (another
+        // window, a bounce light behind the receiver) was never discovered —
+        // the mixture decayed toward unimodal. Instead, build an orthonormal
+        // frame around the strongest mu and seed dead lobes at the opposite
+        // hemisphere and the tangent directions (~90-180 deg away), spreading
+        // coverage so emerging secondary modes can be captured. kappa stays 1
+        // (below the sampling-eligibility gate) until the lobe earns evidence.
         if (cumN >= 32.0f) {
             const float* ls = c + strongest * PG_LOBE_STRIDE;
-            const float perturb[PG_NUM_LOBES][3] = {
-                { 0.35f, 0.0f, 0.0f }, { 0.0f, 0.35f, 0.0f },
-                { 0.0f, 0.0f, 0.35f }, { -0.25f, -0.25f, 0.0f }
+            float sx = ls[PG_L_MU_X], sy = ls[PG_L_MU_Y], sz = ls[PG_L_MU_Z];
+            // Tangent frame around the strongest direction. up = +Y unless mu
+            // is near-vertical, then +X (avoids a degenerate cross product).
+            float upx = (fabsf(sy) < 0.9f) ? 0.0f : 1.0f;
+            float upy = (fabsf(sy) < 0.9f) ? 1.0f : 0.0f;
+            // T = cross(up, s), with up = (upx, upy, 0)
+            float tx = upy * sz;
+            float ty = -upx * sz;
+            float tz = upx * sy - upy * sx;
+            float tinv = rsqrtf(fmaxf(tx * tx + ty * ty + tz * tz, 1e-12f));
+            tx *= tinv; ty *= tinv; tz *= tinv;
+            float bx = sy * tz - sz * ty;   // cross(s, T)
+            float by = sz * tx - sx * tz;
+            float bz = sx * ty - sy * tx;
+            const float seeds[4][3] = {
+                { -sx, -sy, -sz },   // opposite hemisphere
+                {  tx,  ty,  tz },   // +tangent
+                {  bx,  by,  bz },   // +bitangent
+                { -tx, -ty, -tz },   // -tangent
             };
+            int seedIdx = 0;
             for (int k = 0; k < PG_NUM_LOBES; k++) {
                 if (k == strongest || lobeW[k] >= 0.5f) continue;
                 float* l = c + k * PG_LOBE_STRIDE;
-                float mx = ls[PG_L_MU_X] + perturb[k][0];
-                float my = ls[PG_L_MU_Y] + perturb[k][1];
-                float mz = ls[PG_L_MU_Z] + perturb[k][2];
+                int si = seedIdx & 3; seedIdx++;
+                float mx = seeds[si][0], my = seeds[si][1], mz = seeds[si][2];
                 float invLen = rsqrtf(fmaxf(mx * mx + my * my + mz * mz, 1e-12f));
                 l[PG_L_MU_X] = mx * invLen;
                 l[PG_L_MU_Y] = my * invLen;
@@ -111,14 +151,16 @@ __global__ void refitCellsKernel(float* data,
                 l[PG_L_KAPPA] = 1.0f;                 // exploratory: below the
                 l[PG_L_EXP_NEG2K] = 0.13533528f;      // sampling gate; exp(-2)
                 l[PG_L_WEIGHT] = 0.02f;
+                l[PG_L_MEAN_DIST] = 0.0f;             // no distance evidence yet
                 // Small synthetic evidence so the re-seed survives a few
                 // refits while it competes for deposits.
-                float* cumS = c + PG_CUMS_BASE + k * 4;
+                float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
                 float seedW = 0.02f * totalW;
                 cumS[0] = l[PG_L_MU_X] * seedW * 0.5f;
                 cumS[1] = l[PG_L_MU_Y] * seedW * 0.5f;
                 cumS[2] = l[PG_L_MU_Z] * seedW * 0.5f;
                 cumS[3] = seedW;
+                cumS[PG_S_DIST] = 0.0f;               // distant-light default until trained
             }
         }
     }
@@ -177,12 +219,13 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                 d[f] = c[f];
             }
             for (int lk = 0; lk < PG_NUM_LOBES; lk++) {
-                const float* pc = c + PG_CUMS_BASE + lk * 4;
-                float* dc = d + PG_CUMS_BASE + lk * 4;
+                const float* pc = c + PG_CUMS_BASE + lk * PG_SUM_STRIDE;
+                float* dc = d + PG_CUMS_BASE + lk * PG_SUM_STRIDE;
                 dc[0] = pc[0] * 0.125f;
                 dc[1] = pc[1] * 0.125f;
                 dc[2] = pc[2] * 0.125f;
                 dc[3] = pc[3] * 0.125f;
+                dc[PG_S_DIST] = pc[PG_S_DIST] * 0.125f;  // scale distance sum with the rest
             }
             d[PG_CUM_COUNT] = c[PG_CUM_COUNT] * 0.125f;
             d[PG_LAST_HIT_FRAME] = currentFrame;

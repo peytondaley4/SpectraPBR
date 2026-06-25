@@ -7,12 +7,15 @@
 namespace spectra {
 
 /**
- * EnvironmentMap - Loads HDR environment maps and computes importance sampling CDFs
- * 
+ * EnvironmentMap - Loads HDR environment maps and builds an importance sampler.
+ *
  * Supports equirectangular HDR images (.hdr format via stb_image).
- * Computes 2D CDF for efficient importance sampling:
- * - Conditional CDF: P(u|v) - probability of selecting column u given row v
- * - Marginal CDF: P(v) - probability of selecting row v
+ * Builds a Walker/Vose ALIAS TABLE over the W*H texels for O(1) importance
+ * sampling proportional to sin(theta)-weighted luminance:
+ * - env_alias_prob / env_alias_idx: the alias buckets (one pick + one compare)
+ * - env_pmf: per-texel selection probability, used by environmentPdf() for MIS
+ * (Replaced the old 2D conditional/marginal CDF binary search; same
+ *  distribution, O(1) instead of O(log W + log H) dependent texture fetches.)
  */
 class EnvironmentMap {
 public:
@@ -40,10 +43,12 @@ public:
      */
     bool isLoaded() const { return m_texture != 0; }
 
-    // GPU texture accessors
+    // GPU accessors
     cudaTextureObject_t getTexture() const { return m_texture; }
-    cudaTextureObject_t getConditionalCDF() const { return m_conditionalCDF; }
-    cudaTextureObject_t getMarginalCDF() const { return m_marginalCDF; }
+    // Importance-sampling alias table + per-texel pmf (device linear buffers).
+    const float* getAliasProb() const { return m_d_aliasProb; }
+    const unsigned int* getAliasIdx() const { return m_d_aliasIdx; }
+    const float* getPmf() const { return m_d_pmf; }
 
     // Dimensions
     uint32_t getWidth() const { return m_width; }
@@ -56,8 +61,8 @@ public:
     const std::string& getPath() const { return m_path; }
 
 private:
-    // Build importance sampling CDFs from luminance data
-    bool buildCDFs(const float* rgbData);
+    // Build the Vose alias table + per-texel pmf from luminance data
+    bool buildAliasTable(const float* rgbData);
 
     // Create CUDA texture from float data
     bool createTexture(const float* rgbData);
@@ -66,11 +71,12 @@ private:
     cudaTextureObject_t m_texture = 0;
     cudaArray_t m_textureArray = nullptr;
 
-    cudaTextureObject_t m_conditionalCDF = 0;  // 2D: width x height
-    cudaArray_t m_conditionalCDFArray = nullptr;
-
-    cudaTextureObject_t m_marginalCDF = 0;     // 1D: height elements
-    cudaArray_t m_marginalCDFArray = nullptr;
+    // Importance-sampling: Walker/Vose alias table over W*H texels + per-texel
+    // selection probability. Device linear buffers (random index access, no
+    // filtering — not textures).
+    float*        m_d_aliasProb = nullptr;   // [W*H] bucket accept-probabilities
+    unsigned int* m_d_aliasIdx  = nullptr;   // [W*H] bucket fallback texels
+    float*        m_d_pmf       = nullptr;   // [W*H] per-texel selection probability
 
     // Dimensions
     uint32_t m_width = 0;

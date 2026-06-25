@@ -63,6 +63,27 @@ __forceinline__ __device__ unsigned long long pgMortonEncode64(
     return pgMortonSpread3(ix) | (pgMortonSpread3(iy) << 1) | (pgMortonSpread3(iz) << 2);
 }
 
+// Inverse of pgMortonSpread3 — gathers every 3rd bit back. Mirrors the host
+// compact3() in path_guide_grid.cpp; used to recover a cell's (ix,iy,iz) from
+// its key for parallax cell-center computation.
+__forceinline__ __device__ unsigned long long pgMortonCompact3(unsigned long long x) {
+    x &= 0x1249249249249249ull;
+    x = (x | x >> 2)  & 0x10c30c30c30c30c3ull;
+    x = (x | x >> 4)  & 0x010f00f00f00f00full;
+    x = (x | x >> 8)  & 0x001f0000ff0000ffull;
+    x = (x | x >> 16) & 0x001f00000000ffffull;
+    x = (x | x >> 32) & 0x1fffffull;
+    return x;
+}
+
+__forceinline__ __device__ void pgMortonDecode64(
+    unsigned long long morton, unsigned int& ix, unsigned int& iy, unsigned int& iz)
+{
+    ix = (unsigned int)pgMortonCompact3(morton);
+    iy = (unsigned int)pgMortonCompact3(morton >> 1);
+    iz = (unsigned int)pgMortonCompact3(morton >> 2);
+}
+
 __forceinline__ __device__ unsigned long long pgPackKey(
     unsigned int level, unsigned long long morton)
 {

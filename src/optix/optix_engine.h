@@ -129,11 +129,12 @@ public:
     // Set environment map
     void setEnvironmentMap(cudaTextureObject_t envMap, float intensity);
 
-    // Set environment map importance sampling CDFs
-    void setEnvironmentCDF(cudaTextureObject_t conditionalCDF, 
-                          cudaTextureObject_t marginalCDF,
-                          uint32_t width, uint32_t height,
-                          float totalLuminance);
+    // Set environment map importance sampling (Vose alias table + per-texel pmf)
+    void setEnvironmentImportance(const float* aliasProb,
+                                  const unsigned int* aliasIdx,
+                                  const float* pmf,
+                                  uint32_t width, uint32_t height,
+                                  float totalLuminance);
 
     // Set quality mode
     void setQualityMode(QualityMode mode);

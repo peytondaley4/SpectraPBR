@@ -93,6 +93,25 @@ __forceinline__ __device__ float* sparseCellDataPtr(
     return grid.table.data + (unsigned long long)global_index * grid.table.entry_stride;
 }
 
+// World-space center of an allocated cell, recovered from its packed key. The
+// fixed reference point for parallax-aware lobe reprojection (a lobe's pivot is
+// cellCenter + mu*meanDist).
+__forceinline__ __device__ void pgCellCenter(
+    const SparsePathGuideDescriptorDevice& grid, unsigned int cellIdx,
+    float& cx, float& cy, float& cz)
+{
+    unsigned long long key = grid.table.cell_keys[cellIdx];
+    unsigned int level = (unsigned int)(key >> 48);
+    unsigned long long morton = key & ((1ull << 48) - 1);
+    unsigned int ix, iy, iz;
+    pgMortonDecode64(morton, ix, iy, iz);
+    float res = sparseResolutionAtLevel(grid, level);
+    float inv = 1.0f / res;
+    cx = grid.bounds_min[0] + ((float)ix + 0.5f) * inv * (grid.bounds_max[0] - grid.bounds_min[0]);
+    cy = grid.bounds_min[1] + ((float)iy + 0.5f) * inv * (grid.bounds_max[1] - grid.bounds_min[1]);
+    cz = grid.bounds_min[2] + ((float)iz + 0.5f) * inv * (grid.bounds_max[2] - grid.bounds_min[2]);
+}
+
 // Top-down lookup: probe the base level, descend while a finer cell exists.
 // Returns the deepest cell index (level via *outLevel), or PG_INVALID_CELL
 // when the position is outside the grid bounds or the base cell does not
@@ -129,6 +148,28 @@ __forceinline__ __device__ unsigned int topDownCellLookup(
     return idx;
 }
 
+// Single-level lookup: the cell containing a position AT EXACTLY `level`
+// (one Morton encode + one hash probe, no descent). Returns PG_INVALID_CELL
+// when out of bounds or no cell exists at that level. Used by the guide's
+// box-filter jitter: the home cell's level is already known, and the jitter
+// stays within +-0.5 cell of it, so the jittered sample must be resolved at
+// the SAME level — descending into a finer child on one side of a subdivision
+// face is exactly the level mismatch that cracked the filter at boundaries.
+__forceinline__ __device__ unsigned int pathGuideCellAtLevel(
+    const SparsePathGuideDescriptorDevice& grid,
+    float px, float py, float pz,
+    unsigned int level)
+{
+    float nx, ny, nz;
+    worldToNormalized(grid, px, py, pz, nx, ny, nz);
+    if (nx < 0.0f || nx > 1.0f || ny < 0.0f || ny > 1.0f || nz < 0.0f || nz > 1.0f)
+        return PG_INVALID_CELL;
+    int ix, iy, iz;
+    normalizedToCell(nx, ny, nz, level, grid, ix, iy, iz);
+    return pgTableLookup(grid.table, level,
+        pgMortonEncode64((unsigned int)ix, (unsigned int)iy, (unsigned int)iz));
+}
+
 // First-touch allocation of the base-level cell containing a position.
 // Bounds-checked (out-of-grid positions never allocate). Returns the cell
 // index, or PG_INVALID_CELL while another thread's insert is pending or the
@@ -160,9 +201,12 @@ __forceinline__ __device__ unsigned int pathGuideInsertBaseCell(
 // folds these into the cumulative sums and refits each lobe (stepwise EM
 // with hard assignment) — shaders never write the fields the sampling path
 // reads, so sampling PDFs stay consistent within a launch.
+// `dist` is the distance from this vertex to where the deposited radiance came
+// from (the continuation hit distance), accumulated weight-weighted so the
+// refit kernel can fit a per-lobe mean distance for parallax-aware reprojection.
 __forceinline__ __device__ void pathGuideTrainCell(
     float* cell,
-    float dx, float dy, float dz, float weight,
+    float dx, float dy, float dz, float weight, float dist,
     unsigned int frameIndex)
 {
     // Reject non-finite or non-positive weights — atomicAdd of Inf/NaN
@@ -170,6 +214,7 @@ __forceinline__ __device__ void pathGuideTrainCell(
     if (!(weight > 0.0f) || !isfinite(weight) ||
         !isfinite(dx) || !isfinite(dy) || !isfinite(dz))
         return;
+    if (!isfinite(dist) || dist < 0.0f) dist = 0.0f;
 
     int best = 0;
     float bestScore = -1.0f;
@@ -186,16 +231,40 @@ __forceinline__ __device__ void pathGuideTrainCell(
         if (score > bestScore) { bestScore = score; best = k; }
     }
 
-    float* sums = cell + PG_INT_BASE + best * 4;
+    float* sums = cell + PG_INT_BASE + best * PG_SUM_STRIDE;
     atomicAdd(&sums[0], dx * weight);
     atomicAdd(&sums[1], dy * weight);
     atomicAdd(&sums[2], dz * weight);
     atomicAdd(&sums[3], weight);
+    atomicAdd(&sums[PG_S_DIST], dist * weight);
     atomicAdd(&cell[PG_INT_COUNT], 1.0f);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);
     atomicMax((int*)&cell[PG_LAST_HIT_FRAME], frameAsInt);
+}
+
+// Parallax-aware reprojection of a lobe mean toward the actual query vertex.
+// A distant-light lobe (meanDist large or 0) keeps its mu; a near-field lobe's
+// pivot = cellCenter + mu*meanDist swings the apparent direction as the vertex
+// moves across the cell, so neighbouring cells whose lobes encode the same
+// source agree near shared faces (Ruppert et al. 2020). Reprojection is a pure
+// rotation of the proposal — the vMF kappa/pdf are evaluated around the same
+// mu', so sampler/PDF/MIS stay consistent and unbiased.
+__forceinline__ __device__ void pgParallaxReproject(
+    float cx, float cy, float cz,           // cell center
+    float meanDist,
+    float px, float py, float pz,           // query vertex
+    float& mux, float& muy, float& muz)     // in/out: lobe mean (reprojected in place)
+{
+    if (!(meanDist > 1e-4f)) return;        // untrained / degenerate: keep mu
+    float pvx = cx + mux * meanDist - px;
+    float pvy = cy + muy * meanDist - py;
+    float pvz = cz + muz * meanDist - pz;
+    float len2 = pvx * pvx + pvy * pvy + pvz * pvz;
+    if (len2 < 1e-8f) return;               // vertex sits on the pivot: keep mu
+    float inv = rsqrtf(len2);
+    mux = pvx * inv; muy = pvy * inv; muz = pvz * inv;
 }
 
 // Sampling and PDF evaluation read the per-vertex GuideLobe cached in

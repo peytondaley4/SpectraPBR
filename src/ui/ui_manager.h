@@ -142,6 +142,10 @@ public:
     using MaterialEditCallback = std::function<void(uint32_t instanceId, const GpuMaterial& material)>;
     void setOnMaterialEdit(MaterialEditCallback callback);
 
+    // Transform edit callback
+    using TransformEditCallback = std::function<void(uint32_t instanceId, float3 scale, float3 translation, float3 rotation)>;
+    void setOnTransformEdit(TransformEditCallback callback);
+
     //--------------------------------------------------------------------------
     // Top Bar
     //--------------------------------------------------------------------------
@@ -281,6 +285,7 @@ private:
     LightInfoRequestCallback m_lightInfoRequestCallback;
     InstanceInfoRequestCallback m_instanceInfoRequestCallback;
     MaterialEditCallback m_materialEditCallback;
+    TransformEditCallback m_transformEditCallback;
 
     // Preview textures for UI texture previews
     std::vector<cudaTextureObject_t> m_previewTextures;

@@ -3,6 +3,7 @@
 #include "model_loader.h"
 #include "log.h"
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <iostream>
 #include <chrono>
@@ -10,6 +11,70 @@
 #include <cmath>
 
 namespace spectra {
+
+//------------------------------------------------------------------------------
+// Transform helpers: compose/decompose a 3x4 row-major matrix from TRS
+//------------------------------------------------------------------------------
+
+// Compose: T = Translate * RotZ * RotY * RotX * Scale (row-major 3x4)
+static void composeTransform(const float3& scale, const float3& translation,
+                             const float3& rotDeg, float out[12]) {
+    constexpr float DEG2RAD = 3.14159265358979f / 180.0f;
+    float cx = std::cos(rotDeg.x * DEG2RAD), sx = std::sin(rotDeg.x * DEG2RAD);
+    float cy = std::cos(rotDeg.y * DEG2RAD), sy = std::sin(rotDeg.y * DEG2RAD);
+    float cz = std::cos(rotDeg.z * DEG2RAD), sz = std::sin(rotDeg.z * DEG2RAD);
+
+    // Rotation = Rz * Ry * Rx (intrinsic XYZ)
+    float r00 = cy * cz;
+    float r01 = cz * sx * sy - cx * sz;
+    float r02 = sx * sz + cx * cz * sy;
+    float r10 = cy * sz;
+    float r11 = cx * cz + sx * sy * sz;
+    float r12 = cx * sy * sz - cz * sx;
+    float r20 = -sy;
+    float r21 = cy * sx;
+    float r22 = cx * cy;
+
+    // Row-major 3x4: each row is [Rx*S, Ry*S, Rz*S, T]
+    out[0]  = r00 * scale.x;  out[1]  = r01 * scale.y;  out[2]  = r02 * scale.z;  out[3]  = translation.x;
+    out[4]  = r10 * scale.x;  out[5]  = r11 * scale.y;  out[6]  = r12 * scale.z;  out[7]  = translation.y;
+    out[8]  = r20 * scale.x;  out[9]  = r21 * scale.y;  out[10] = r22 * scale.z;  out[11] = translation.z;
+}
+
+// Decompose a 3x4 row-major matrix into scale, translation, euler (degrees)
+static void decomposeTransform(const float transform[12], float3& scale,
+                               float3& translation, float3& rotDeg) {
+    // Translation is column 3
+    translation = make_float3(transform[3], transform[7], transform[11]);
+
+    // Scale = length of each column of the 3x3 sub-matrix
+    float sx = std::sqrt(transform[0]*transform[0] + transform[4]*transform[4] + transform[8]*transform[8]);
+    float sy = std::sqrt(transform[1]*transform[1] + transform[5]*transform[5] + transform[9]*transform[9]);
+    float sz = std::sqrt(transform[2]*transform[2] + transform[6]*transform[6] + transform[10]*transform[10]);
+    scale = make_float3(sx, sy, sz);
+
+    // Rotation matrix (columns normalized)
+    float r00 = transform[0] / sx, r01 = transform[1] / sy, r02 = transform[2] / sz;
+    float r10 = transform[4] / sx, r11 = transform[5] / sy, r12 = transform[6] / sz;
+    float r20 = transform[8] / sx, r21 = transform[9] / sy, r22 = transform[10] / sz;
+
+    constexpr float RAD2DEG = 180.0f / 3.14159265358979f;
+    // Extract euler XYZ (intrinsic) from rotation matrix
+    float sy_val = -r20;
+    if (sy_val >= 1.0f) {
+        rotDeg.y = 90.0f;
+        rotDeg.x = std::atan2(r01, r11) * RAD2DEG;
+        rotDeg.z = 0.0f;
+    } else if (sy_val <= -1.0f) {
+        rotDeg.y = -90.0f;
+        rotDeg.x = std::atan2(-r01, r11) * RAD2DEG;
+        rotDeg.z = 0.0f;
+    } else {
+        rotDeg.y = std::asin(sy_val) * RAD2DEG;
+        rotDeg.x = std::atan2(r21, r22) * RAD2DEG;
+        rotDeg.z = std::atan2(r10, r00) * RAD2DEG;
+    }
+}
 
 Application* Application::s_instance = nullptr;
 
@@ -70,6 +135,22 @@ bool Application::init() {
     cudaMalloc(reinterpret_cast<void**>(&m_accumulationBuffer), bufferSize);
     cudaMemset(m_accumulationBuffer, 0, bufferSize);
     m_optixEngine->setAccumulationBuffer(m_accumulationBuffer);
+
+    // Denoiser AOV buffers
+    cudaMalloc(reinterpret_cast<void**>(&m_aovAlbedoBuffer), bufferSize);
+    cudaMalloc(reinterpret_cast<void**>(&m_aovNormalBuffer), bufferSize);
+    cudaMemset(m_aovAlbedoBuffer, 0, bufferSize);
+    cudaMemset(m_aovNormalBuffer, 0, bufferSize);
+    m_optixEngine->setAOVBuffers(m_aovAlbedoBuffer, m_aovNormalBuffer);
+
+    // OptiX AI denoiser (HDR, albedo+normal guides)
+    m_denoiser = std::make_unique<OptixDenoiserWrapper>();
+    if (!m_denoiser->init(m_optixEngine->getContext())) {
+        std::cerr << "[App] Denoiser init failed, denoising disabled\n";
+        m_denoiser.reset();
+    } else {
+        m_denoiser->resize(m_glContext->getWidth(), m_glContext->getHeight());
+    }
 
     // Sparse multi-res path guide grid (device-resident cell table:
     // shaders allocate cells on first touch, no CPU build pipeline)
@@ -758,7 +839,37 @@ void Application::wireUICallbacks() {
 
         m_uiManager->setPreviewTextures(previewTextures);
         info.modelName = "Instance " + std::to_string(instanceId);
+
+        // Decompose the instance's current transform for the UI sliders
+        const auto& instances = m_sceneManager->getInstances();
+        if (instanceId < instances.size()) {
+            decomposeTransform(instances[instanceId].transform,
+                               info.scale, info.translation, info.rotation);
+        }
+
         return info;
+    });
+
+    // Transform edit: recompose matrix, update instance, rebuild IAS
+    m_uiManager->setOnTransformEdit([this](uint32_t instanceId, float3 scale, float3 translation, float3 rotation) {
+        float transform[12];
+        composeTransform(scale, translation, rotation, transform);
+        m_sceneManager->updateInstanceTransform(instanceId, transform);
+
+        m_cudaInterop->synchronize();
+        m_sceneManager->buildIAS();
+        m_sceneManager->updateSBT();
+
+        m_optixEngine->setSceneHandle(m_sceneManager->getSceneHandle());
+        m_optixEngine->setGeometryBuffers(m_sceneManager->getVertexBuffers(),
+                                           m_sceneManager->getIndexBuffers());
+        m_optixEngine->setInstanceData(
+            m_sceneManager->getInstanceTransforms(),
+            m_sceneManager->getInstanceNormalTransforms(),
+            m_sceneManager->getInstanceMaterialIndices());
+
+        m_optixEngine->resetAccumulation();
+        resetPathGuideTraining();
     });
 }
 
@@ -798,6 +909,16 @@ void Application::setupCallbacks() {
         cudaMalloc(reinterpret_cast<void**>(&m_accumulationBuffer), bufferSize);
         cudaMemset(m_accumulationBuffer, 0, bufferSize);
         m_optixEngine->setAccumulationBuffer(m_accumulationBuffer);
+
+        if (m_aovAlbedoBuffer) cudaFree(m_aovAlbedoBuffer);
+        if (m_aovNormalBuffer) cudaFree(m_aovNormalBuffer);
+        cudaMalloc(reinterpret_cast<void**>(&m_aovAlbedoBuffer), bufferSize);
+        cudaMalloc(reinterpret_cast<void**>(&m_aovNormalBuffer), bufferSize);
+        cudaMemset(m_aovAlbedoBuffer, 0, bufferSize);
+        cudaMemset(m_aovNormalBuffer, 0, bufferSize);
+        m_optixEngine->setAOVBuffers(m_aovAlbedoBuffer, m_aovNormalBuffer);
+        if (m_denoiser) m_denoiser->resize(width, height);
+
         m_optixEngine->resetAccumulation();
         m_optixEngine->setDimensions(width, height);
         resetPathGuideTraining();
@@ -1086,6 +1207,16 @@ void Application::renderFrame() {
 
     m_optixEngine->render(devicePtr, m_cudaInterop->getStream());
 
+    // Denoise the display copy (PBO); accumulation buffer stays untouched
+    if (m_denoiserEnabled && m_denoiser) {
+        m_denoiser->denoise(
+            devicePtr, devicePtr,
+            m_aovAlbedoBuffer, m_aovNormalBuffer,
+            m_glContext->getWidth(), m_glContext->getHeight(),
+            m_denoiserBlend,
+            m_cudaInterop->getStream());
+    }
+
     // [DIAG] render
     { auto tNow = diagT(); diagAccum[7] += diagMs(tPrev, tNow); tPrev = tNow; }
 
@@ -1146,10 +1277,13 @@ void Application::shutdown() {
     if (m_fontAtlas) m_fontAtlas->release();
     if (m_sceneManager) m_sceneManager->clear();
 
+    if (m_denoiser) { m_denoiser->shutdown(); m_denoiser.reset(); }
     if (m_accumulationBuffer) {
         cudaFree(m_accumulationBuffer);
         m_accumulationBuffer = nullptr;
     }
+    if (m_aovAlbedoBuffer) { cudaFree(m_aovAlbedoBuffer); m_aovAlbedoBuffer = nullptr; }
+    if (m_aovNormalBuffer) { cudaFree(m_aovNormalBuffer); m_aovNormalBuffer = nullptr; }
     if (m_areaLightTris) {
         cudaFree(m_areaLightTris);
         m_areaLightTris = nullptr;
@@ -1319,6 +1453,17 @@ void Application::keyCallback(GLFWwindow* window, int key, int scancode, int act
                 bool dark = app->m_uiManager->isDarkTheme();
                 app->m_sceneSerializer->saveScene(path, app->m_camera.get(),
                     app->m_sceneManager.get(), app->m_qualityMode, dark);
+            }
+            break;
+
+        case GLFW_KEY_N:
+            if (mods & GLFW_MOD_CONTROL) {
+                app->m_denoiserBlend += 0.25f;
+                if (app->m_denoiserBlend > 0.99f) app->m_denoiserBlend = 0.0f;
+                std::cout << "[Denoise] Blend: " << app->m_denoiserBlend << "\n";
+            } else {
+                app->m_denoiserEnabled = !app->m_denoiserEnabled;
+                std::cout << "[Denoise] " << (app->m_denoiserEnabled ? "ON" : "OFF") << "\n";
             }
             break;
 

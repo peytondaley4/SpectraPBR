@@ -112,6 +112,28 @@ void PropertyPanel::createWidgets() {
     m_dirElevationSlider->setParent(this);
     m_dirElevationSlider->setOnValueChanged([this](Slider*, float) { updateLightFromSliders(); });
 
+    // Transform editing sliders
+    auto makeTransformSlider = [this](const char* label, float min, float max, const char* fmt) {
+        auto s = std::make_unique<Slider>();
+        s->setLabel(label);
+        s->setLabelWidth(30.0f);
+        s->setRange(min, max);
+        s->setValueFormat(fmt);
+        s->setParent(this);
+        s->setOnValueChanged([this](Slider*, float) { updateTransformFromSliders(); });
+        return s;
+    };
+
+    m_scaleXSlider = makeTransformSlider("X", 0.01f, 10.0f, "%.2f");
+    m_scaleYSlider = makeTransformSlider("Y", 0.01f, 10.0f, "%.2f");
+    m_scaleZSlider = makeTransformSlider("Z", 0.01f, 10.0f, "%.2f");
+    m_translateXSlider = makeTransformSlider("X", -50.0f, 50.0f, "%.1f");
+    m_translateYSlider = makeTransformSlider("Y", -50.0f, 50.0f, "%.1f");
+    m_translateZSlider = makeTransformSlider("Z", -50.0f, 50.0f, "%.1f");
+    m_rotateXSlider = makeTransformSlider("X", -180.0f, 180.0f, "%.0f");
+    m_rotateYSlider = makeTransformSlider("Y", -180.0f, 180.0f, "%.0f");
+    m_rotateZSlider = makeTransformSlider("Z", -180.0f, 180.0f, "%.0f");
+
     // Material editing widgets
     m_baseColorPicker = std::make_unique<ColorPicker>();
     m_baseColorPicker->setShowPreview(true);
@@ -184,6 +206,9 @@ void PropertyPanel::showInstanceProperties(const InstanceInfo& info) {
     m_instanceInfo = info;
     m_displayMode = DisplayMode::Instance;
 
+    // Suppress edit callbacks — we're loading values, not editing them
+    m_suppressCallbacks = true;
+
     // Update material widgets
     if (m_baseColorPicker) {
         m_baseColorPicker->setColor(make_float3(info.baseColor.x, info.baseColor.y, info.baseColor.z));
@@ -215,6 +240,19 @@ void PropertyPanel::showInstanceProperties(const InstanceInfo& info) {
         m_emissiveIntensitySlider->setVisible(true);
     }
 
+    // Update transform sliders
+    if (m_scaleXSlider) { m_scaleXSlider->setValue(info.scale.x); m_scaleXSlider->setVisible(true); }
+    if (m_scaleYSlider) { m_scaleYSlider->setValue(info.scale.y); m_scaleYSlider->setVisible(true); }
+    if (m_scaleZSlider) { m_scaleZSlider->setValue(info.scale.z); m_scaleZSlider->setVisible(true); }
+    if (m_translateXSlider) { m_translateXSlider->setValue(info.translation.x); m_translateXSlider->setVisible(true); }
+    if (m_translateYSlider) { m_translateYSlider->setValue(info.translation.y); m_translateYSlider->setVisible(true); }
+    if (m_translateZSlider) { m_translateZSlider->setValue(info.translation.z); m_translateZSlider->setVisible(true); }
+    if (m_rotateXSlider) { m_rotateXSlider->setValue(info.rotation.x); m_rotateXSlider->setVisible(true); }
+    if (m_rotateYSlider) { m_rotateYSlider->setValue(info.rotation.y); m_rotateYSlider->setVisible(true); }
+    if (m_rotateZSlider) { m_rotateZSlider->setValue(info.rotation.z); m_rotateZSlider->setVisible(true); }
+
+    m_suppressCallbacks = false;
+
     // Hide light widgets
     if (m_posXSlider) m_posXSlider->setVisible(false);
     if (m_posYSlider) m_posYSlider->setVisible(false);
@@ -232,6 +270,9 @@ void PropertyPanel::showInstanceProperties(const InstanceInfo& info) {
 void PropertyPanel::showLightProperties(const LightInfo& info) {
     m_lightInfo = info;
     m_displayMode = DisplayMode::Light;
+
+    // Suppress edit callbacks — we're loading values, not editing them
+    m_suppressCallbacks = true;
 
     // Update light widgets
     if (m_posXSlider) { m_posXSlider->setValue(info.position.x); m_posXSlider->setVisible(true); }
@@ -269,6 +310,8 @@ void PropertyPanel::showLightProperties(const LightInfo& info) {
         m_dirElevationSlider->setVisible(isDirectional);
     }
 
+    m_suppressCallbacks = false;
+
     // Hide material widgets
     if (m_baseColorPicker) m_baseColorPicker->setVisible(false);
     if (m_metallicSlider) m_metallicSlider->setVisible(false);
@@ -277,6 +320,17 @@ void PropertyPanel::showLightProperties(const LightInfo& info) {
     if (m_iorSlider) m_iorSlider->setVisible(false);
     if (m_emissivePicker) m_emissivePicker->setVisible(false);
     if (m_emissiveIntensitySlider) m_emissiveIntensitySlider->setVisible(false);
+
+    // Hide transform widgets
+    if (m_scaleXSlider) m_scaleXSlider->setVisible(false);
+    if (m_scaleYSlider) m_scaleYSlider->setVisible(false);
+    if (m_scaleZSlider) m_scaleZSlider->setVisible(false);
+    if (m_translateXSlider) m_translateXSlider->setVisible(false);
+    if (m_translateYSlider) m_translateYSlider->setVisible(false);
+    if (m_translateZSlider) m_translateZSlider->setVisible(false);
+    if (m_rotateXSlider) m_rotateXSlider->setVisible(false);
+    if (m_rotateYSlider) m_rotateYSlider->setVisible(false);
+    if (m_rotateZSlider) m_rotateZSlider->setVisible(false);
 
     markDirty();
 }
@@ -287,6 +341,7 @@ void PropertyPanel::clearProperties() {
 }
 
 void PropertyPanel::updateLightFromSliders() {
+    if (m_suppressCallbacks) return;
     if (m_displayMode != DisplayMode::Light) return;
 
     m_lightInfo.position = make_float3(m_posXSlider->getValue(), m_posYSlider->getValue(), m_posZSlider->getValue());
@@ -315,7 +370,26 @@ void PropertyPanel::updateLightFromSliders() {
     markDirty();
 }
 
+void PropertyPanel::updateTransformFromSliders() {
+    if (m_suppressCallbacks) return;
+    if (m_displayMode != DisplayMode::Instance) return;
+
+    float3 scale = make_float3(m_scaleXSlider->getValue(), m_scaleYSlider->getValue(), m_scaleZSlider->getValue());
+    float3 translation = make_float3(m_translateXSlider->getValue(), m_translateYSlider->getValue(), m_translateZSlider->getValue());
+    float3 rotation = make_float3(m_rotateXSlider->getValue(), m_rotateYSlider->getValue(), m_rotateZSlider->getValue());
+
+    m_instanceInfo.scale = scale;
+    m_instanceInfo.translation = translation;
+    m_instanceInfo.rotation = rotation;
+
+    if (m_onTransformEdit) {
+        m_onTransformEdit(m_instanceInfo.instanceId, scale, translation, rotation);
+    }
+    markDirty();
+}
+
 void PropertyPanel::updateMaterialFromSliders() {
+    if (m_suppressCallbacks) return;
     if (m_displayMode != DisplayMode::Instance) return;
 
     if (m_baseColorPicker) {
@@ -368,6 +442,15 @@ void PropertyPanel::getEditableWidgets(Widget* out[EDITABLE_WIDGET_COUNT]) const
     out[15] = m_iorSlider.get();
     out[16] = m_emissivePicker.get();
     out[17] = m_emissiveIntensitySlider.get();
+    out[18] = m_scaleXSlider.get();
+    out[19] = m_scaleYSlider.get();
+    out[20] = m_scaleZSlider.get();
+    out[21] = m_translateXSlider.get();
+    out[22] = m_translateYSlider.get();
+    out[23] = m_translateZSlider.get();
+    out[24] = m_rotateXSlider.get();
+    out[25] = m_rotateYSlider.get();
+    out[26] = m_rotateZSlider.get();
 }
 
 void PropertyPanel::updatePanelAndTheme() {
@@ -655,6 +738,31 @@ void PropertyPanel::collectGeometry(std::vector<UIQuad>& outQuads, text::TextLay
         if (!m_instanceInfo.meshName.empty()) {
             drawPropertyRow(outQuads, textLayout, "Mesh", m_instanceInfo.meshName, theme, depth);
         }
+
+        // Transform section
+        drawSeparator(outQuads, theme, depth);
+        drawHeader(outQuads, textLayout, "Transform", theme, depth);
+        addSpacing(4.0f);
+        drawLabel(outQuads, textLayout, "Scale", theme, depth);
+        addWidget(m_scaleXSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_scaleYSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_scaleZSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(4.0f);
+        drawLabel(outQuads, textLayout, "Translate", theme, depth);
+        addWidget(m_translateXSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_translateYSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_translateZSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(4.0f);
+        drawLabel(outQuads, textLayout, "Rotate", theme, depth);
+        addWidget(m_rotateXSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_rotateYSlider.get(), ROW_HEIGHT, outQuads, textLayout);
+        addSpacing(2.0f);
+        addWidget(m_rotateZSlider.get(), ROW_HEIGHT, outQuads, textLayout);
 
         // Material section
         drawSeparator(outQuads, theme, depth);

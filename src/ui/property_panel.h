@@ -58,6 +58,11 @@ struct InstanceInfo {
     float transmission = 0.0f;  // > 0 = glass (dielectric transmission)
     float ior = 1.5f;
 
+    // Transform (decomposed for UI round-tripping)
+    float3 scale = make_float3(1.0f, 1.0f, 1.0f);
+    float3 translation = make_float3(0.0f, 0.0f, 0.0f);
+    float3 rotation = make_float3(0.0f, 0.0f, 0.0f);  // euler degrees
+
     // Texture paths (full paths for display)
     std::string baseColorTexPath;
     std::string normalTexPath;
@@ -104,6 +109,10 @@ public:
     using MaterialEditCallback = std::function<void(uint32_t instanceId, const GpuMaterial& material)>;
     void setOnMaterialEdit(MaterialEditCallback callback) { m_onMaterialEdit = callback; }
 
+    // Transform edit callback (scale, translation, rotation in euler degrees)
+    using TransformEditCallback = std::function<void(uint32_t instanceId, float3 scale, float3 translation, float3 rotation)>;
+    void setOnTransformEdit(TransformEditCallback callback) { m_onTransformEdit = callback; }
+
     // Close callback
     using CloseCallback = std::function<void()>;
     void setOnClose(CloseCallback callback) { m_onClose = callback; }
@@ -130,6 +139,7 @@ private:
     void updatePanelAndTheme();
     void updateLightFromSliders();
     void updateMaterialFromSliders();
+    void updateTransformFromSliders();
 
     // Layout state - tracks current Y position during collectGeometry
     float m_contentY = 0.0f;
@@ -163,7 +173,7 @@ private:
     void addSpacing(float amount) { m_contentY += amount; }
 
     // Get all editable widgets for input forwarding
-    static constexpr size_t EDITABLE_WIDGET_COUNT = 18;
+    static constexpr size_t EDITABLE_WIDGET_COUNT = 27;
     void getEditableWidgets(Widget* out[EDITABLE_WIDGET_COUNT]) const;
 
     // Section rendering helpers
@@ -203,6 +213,10 @@ private:
     InstanceInfo m_instanceInfo;
     LightInfo m_lightInfo;
 
+    // Suppress edit callbacks while programmatically setting slider values
+    // (e.g. during showInstanceProperties / showLightProperties)
+    bool m_suppressCallbacks = false;
+
     // Light editing sliders
     std::unique_ptr<Slider> m_posXSlider;
     std::unique_ptr<Slider> m_posYSlider;
@@ -216,6 +230,17 @@ private:
     std::unique_ptr<Slider> m_dirAzimuthSlider;
     std::unique_ptr<Slider> m_dirElevationSlider;
 
+    // Transform editing sliders
+    std::unique_ptr<Slider> m_scaleXSlider;
+    std::unique_ptr<Slider> m_scaleYSlider;
+    std::unique_ptr<Slider> m_scaleZSlider;
+    std::unique_ptr<Slider> m_translateXSlider;
+    std::unique_ptr<Slider> m_translateYSlider;
+    std::unique_ptr<Slider> m_translateZSlider;
+    std::unique_ptr<Slider> m_rotateXSlider;
+    std::unique_ptr<Slider> m_rotateYSlider;
+    std::unique_ptr<Slider> m_rotateZSlider;
+
     // Material editing sliders
     std::unique_ptr<ColorPicker> m_baseColorPicker;
     std::unique_ptr<Slider> m_metallicSlider;
@@ -228,6 +253,7 @@ private:
     // Callbacks
     LightEditCallback m_onLightEdit;
     MaterialEditCallback m_onMaterialEdit;
+    TransformEditCallback m_onTransformEdit;
     CloseCallback m_onClose;
 
     // Layout constants

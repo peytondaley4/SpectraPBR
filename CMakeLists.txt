@@ -23,6 +23,12 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_definitions(_DEBUG)
 endif()
 
+# MSVC: opt in to correct std::aligned_storage behavior for types with
+# alignment > alignof(max_align_t) (e.g. UIQuad which contains float4).
+if(MSVC)
+    add_compile_definitions(_ENABLE_EXTENDED_ALIGNED_STORAGE)
+endif()
+
 #------------------------------------------------------------------------------
 # CUDA Configuration
 #------------------------------------------------------------------------------
@@ -272,6 +278,7 @@ add_executable(SpectraPBR
     src/cuda/cuda_interop.cpp
     # OptiX
     src/optix/optix_engine.cpp
+    src/optix/optix_denoiser.cpp
     # Rendering
     src/rendering/camera.cpp
     src/rendering/scene_manager.cpp

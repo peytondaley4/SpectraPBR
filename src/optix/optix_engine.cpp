@@ -69,6 +69,8 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams = {};
     m_launchParams.output_buffer = nullptr;
     m_launchParams.accumulation_buffer = nullptr;
+    m_launchParams.aov_albedo_buffer = nullptr;
+    m_launchParams.aov_normal_buffer = nullptr;
     m_launchParams.accumulated_frames = 0;
     m_launchParams.scene_handle = 0;
     m_launchParams.vertex_buffers = nullptr;
@@ -141,7 +143,7 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.path_guide_cell_counter = nullptr;
     m_launchParams.path_guide_cell_capacity = 0;
     m_launchParams.path_guide_enabled = 0;     // Disabled by default
-    m_launchParams.path_guide_mis_weight = 0.3f;  // Conservative: guide needs time to converge
+    m_launchParams.path_guide_mis_weight = 0.5f;  // Conservative: guide needs time to converge
     // Adaptive level parameters (defaults, updated when grid is set)
     m_launchParams.path_guide_start_level = 2;
     m_launchParams.path_guide_min_level = 1;
@@ -866,6 +868,11 @@ void OptixEngine::setSelectedInstanceId(uint32_t instanceId) {
 
 void OptixEngine::setAccumulationBuffer(float4* buffer) {
     m_launchParams.accumulation_buffer = buffer;
+}
+
+void OptixEngine::setAOVBuffers(float4* albedo, float4* normal) {
+    m_launchParams.aov_albedo_buffer = albedo;
+    m_launchParams.aov_normal_buffer = normal;
 }
 
 void OptixEngine::resetAccumulation() {

@@ -300,6 +300,10 @@ struct GpuLaunchParams {
     float tan_half_fov_x;               // tan_half_fov_y * camera.aspectRatio
     float pixel_world_size;             // (2 * tan_half_fov_y) / height
     float _pad_tail;
+
+    // Denoiser AOV guide buffers (progressive average, same frame counter)
+    float4* aov_albedo_buffer;          // First-hit baseColor
+    float4* aov_normal_buffer;          // First-hit camera-space normal
 };
 
 //------------------------------------------------------------------------------

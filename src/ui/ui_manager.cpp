@@ -795,6 +795,13 @@ void UIManager::setOnMaterialEdit(MaterialEditCallback callback) {
     }
 }
 
+void UIManager::setOnTransformEdit(TransformEditCallback callback) {
+    m_transformEditCallback = callback;
+    if (m_propertyPanel) {
+        m_propertyPanel->setOnTransformEdit(callback);
+    }
+}
+
 void UIManager::clearTreeSelection(Widget* widget, TreeNode* except) {
     if (auto* node = dynamic_cast<TreeNode*>(widget)) {
         if (node != except) {

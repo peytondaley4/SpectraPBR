@@ -5,6 +5,7 @@
 #include "gl_context.h"
 #include "cuda_interop.h"
 #include "optix_engine.h"
+#include "optix_denoiser.h"
 #include "camera.h"
 #include "scene_manager.h"
 #include "geometry_manager.h"
@@ -142,6 +143,11 @@ private:
 
     // Buffers
     float4* m_accumulationBuffer = nullptr;
+    float4* m_aovAlbedoBuffer = nullptr;        // Denoiser guide: first-hit albedo
+    float4* m_aovNormalBuffer = nullptr;        // Denoiser guide: first-hit normal
+    std::unique_ptr<OptixDenoiserWrapper> m_denoiser;
+    bool m_denoiserEnabled = false;
+    float m_denoiserBlend = 0.0f;               // 0 = full denoise, 1 = passthrough
     float4* m_areaLightTris = nullptr;          // Mesh-light triangles (device)
     uint32_t* m_instanceLightIndices = nullptr; // instance -> area light index (device)
 

@@ -11,9 +11,9 @@ namespace spectra {
 inline bool createCudaTexture(
     cudaTextureObject_t& outTex,
     cudaArray_t array,
-    cudaAddressMode addressMode0 = cudaAddressModeClamp,
-    cudaAddressMode addressMode1 = cudaAddressModeClamp,
-    cudaFilterMode filterMode = cudaFilterModeLinear,
+    cudaTextureAddressMode addressMode0 = cudaAddressModeClamp,
+    cudaTextureAddressMode addressMode1 = cudaAddressModeClamp,
+    cudaTextureFilterMode filterMode = cudaFilterModeLinear,
     cudaTextureReadMode readMode = cudaReadModeNormalizedFloat,
     bool normalizedCoords = true)
 {

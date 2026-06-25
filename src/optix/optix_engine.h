@@ -156,6 +156,9 @@ public:
     void resetAccumulation();
     uint32_t getAccumulatedFrames() const;
 
+    // Denoiser AOV buffers (device pointers, same size as output_buffer)
+    void setAOVBuffers(float4* albedo, float4* normal);
+
     // Path guide grid (device-resident cell table)
     void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse);
     void setPathGuideEnabled(bool enabled);

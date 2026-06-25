@@ -78,6 +78,11 @@ uint32_t SceneManager::addInstance(uint32_t gasIndex, const float* transform) {
     return instanceIndex;
 }
 
+void SceneManager::updateInstanceTransform(uint32_t instanceId, const float* transform12) {
+    if (instanceId >= m_instances.size()) return;
+    memcpy(m_instances[instanceId].transform, transform12, 12 * sizeof(float));
+}
+
 bool SceneManager::buildGAS(const GpuGeometry* geom, GasInfo& gas) {
     OptixDeviceContext context = m_optixEngine->getContext();
 

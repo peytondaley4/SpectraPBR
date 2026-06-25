@@ -50,6 +50,9 @@ public:
     // Add instance of a GAS
     uint32_t addInstance(uint32_t gasIndex, const float* transform);
 
+    // Update a single instance's 3x4 row-major transform (call buildIAS after)
+    void updateInstanceTransform(uint32_t instanceId, const float* transform12);
+
     // Build IAS from all instances
     bool buildIAS();
 

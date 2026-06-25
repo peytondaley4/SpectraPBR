@@ -600,7 +600,8 @@ __forceinline__ __device__ float3 clampContribution(const float3& c) {
 //------------------------------------------------------------------------------
 __forceinline__ __device__ float3 tracePath(
     float3 rayOrigin, float3 rayDir, unsigned int& seed,
-    unsigned int* outFirstInstance, float* outSelectionRim)
+    unsigned int* outFirstInstance, float* outSelectionRim,
+    float3* outFirstAlbedo, float3* outFirstNormal)
 {
     float3 radiance = make_float3(0.0f, 0.0f, 0.0f);
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
@@ -681,13 +682,20 @@ __forceinline__ __device__ float3 tracePath(
                 expf(-mediumSigma.z * hit.t));
         }
 
-        if (depth == 0 && outFirstInstance) {
-            *outFirstInstance = s.instanceId;
-            if (s.instanceId == params.selected_instance_id && outSelectionRim) {
-                float3 V0 = -rayDir;
-                float rim = 1.0f - fmaxf(0.0f, dot(s.shadingNormal, V0));
-                *outSelectionRim = rim * rim * 0.5f;
+        if (depth == 0) {
+            if (outFirstInstance) {
+                *outFirstInstance = s.instanceId;
+                if (s.instanceId == params.selected_instance_id && outSelectionRim) {
+                    float3 V0 = -rayDir;
+                    float rim = 1.0f - fmaxf(0.0f, dot(s.shadingNormal, V0));
+                    *outSelectionRim = rim * rim * 0.5f;
+                }
             }
+            // Denoiser AOVs: first-hit albedo and world-space normal
+            if (outFirstAlbedo)
+                *outFirstAlbedo = s.baseColor;
+            if (outFirstNormal)
+                *outFirstNormal = s.shadingNormal;
         }
 
         float3 V = -rayDir;
@@ -835,7 +843,14 @@ __forceinline__ __device__ float3 tracePath(
                     grid, jx, jy, jz,
                     params.path_guide_start_level, params.path_guide_max_level, &jitterLevel);
                 if (ctxCellIdx == PG_INVALID_CELL) ctxCellIdx = exactCellIdx;  // jitter left coverage
-                trainCellIdx = ctxCellIdx;
+                // Train the exact cell (the one that actually contains this
+                // shading point). Using the jittered cell for training scatters
+                // deposits across neighboring cells unevenly — cells near
+                // subdivision boundaries or bright features accumulate deposits
+                // at different rates, creating visible grid-aligned brightness
+                // patches. Jitter still affects sampling/PDF (ctxCellIdx) for
+                // boundary smoothing.
+                trainCellIdx = exactCellIdx;
 
                 float wantGuide = clamp(params.path_guide_mis_weight, 0.0f, 0.95f)
                                 * (1.0f - pSpec);
@@ -1109,6 +1124,8 @@ extern "C" __global__ void __raygen__simple() {
     }
 
     float3 accumulatedColor = make_float3(0.0f, 0.0f, 0.0f);
+    float3 accumulatedAlbedo = make_float3(0.0f, 0.0f, 0.0f);
+    float3 accumulatedNormal = make_float3(0.0f, 0.0f, 0.0f);
 
     for (unsigned int sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
         unsigned int seed = mixSeed(pixelX, pixelY, params.frame_index, sampleIdx);
@@ -1149,8 +1166,10 @@ extern "C" __global__ void __raygen__simple() {
 
         unsigned int firstInstance = 0xFFFFFFFFu;
         float selectionRim = 0.0f;
+        float3 sampleAlbedo = make_float3(0.0f, 0.0f, 0.0f);
+        float3 sampleNormal = make_float3(0.0f, 0.0f, 0.0f);
         float3 sample = tracePath(params.camera.position, rayDir, seed,
-            &firstInstance, &selectionRim);
+            &firstInstance, &selectionRim, &sampleAlbedo, &sampleNormal);
 
         // Editor selection highlight (display-only tint, not physical)
         if (firstInstance != 0xFFFFFFFFu && firstInstance == params.selected_instance_id) {
@@ -1167,10 +1186,14 @@ extern "C" __global__ void __raygen__simple() {
         }
 
         accumulatedColor = accumulatedColor + sample;
+        accumulatedAlbedo = accumulatedAlbedo + sampleAlbedo;
+        accumulatedNormal = accumulatedNormal + sampleNormal;
     }
 
     float invSpp = 1.0f / (float)spp;
     float3 newColor = accumulatedColor * invSpp;
+    float3 newAlbedo = accumulatedAlbedo * invSpp;
+    float3 newNormal = accumulatedNormal * invSpp;
 
     if (params.accumulated_frames > 0 && params.accumulation_buffer != nullptr) {
         float4 accumulated = params.accumulation_buffer[linear_idx];
@@ -1188,5 +1211,31 @@ extern "C" __global__ void __raygen__simple() {
             params.accumulation_buffer[linear_idx] = make_float4(newColor.x, newColor.y, newColor.z, 1.0f);
         }
         params.output_buffer[linear_idx] = make_float4(newColor.x, newColor.y, newColor.z, 1.0f);
+    }
+
+    // Denoiser AOV progressive accumulation (same frame counter as radiance)
+    if (params.aov_albedo_buffer != nullptr) {
+        if (params.accumulated_frames > 0) {
+            float4 prev = params.aov_albedo_buffer[linear_idx];
+            float n = (float)(params.accumulated_frames + 1);
+            params.aov_albedo_buffer[linear_idx] = make_float4(
+                prev.x + (newAlbedo.x - prev.x) / n,
+                prev.y + (newAlbedo.y - prev.y) / n,
+                prev.z + (newAlbedo.z - prev.z) / n, 1.0f);
+        } else {
+            params.aov_albedo_buffer[linear_idx] = make_float4(newAlbedo.x, newAlbedo.y, newAlbedo.z, 1.0f);
+        }
+    }
+    if (params.aov_normal_buffer != nullptr) {
+        if (params.accumulated_frames > 0) {
+            float4 prev = params.aov_normal_buffer[linear_idx];
+            float n = (float)(params.accumulated_frames + 1);
+            params.aov_normal_buffer[linear_idx] = make_float4(
+                prev.x + (newNormal.x - prev.x) / n,
+                prev.y + (newNormal.y - prev.y) / n,
+                prev.z + (newNormal.z - prev.z) / n, 1.0f);
+        } else {
+            params.aov_normal_buffer[linear_idx] = make_float4(newNormal.x, newNormal.y, newNormal.z, 1.0f);
+        }
     }
 }

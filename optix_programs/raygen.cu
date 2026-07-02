@@ -46,9 +46,15 @@
 
 // Training deposits are subsampled per path with compensating weight: the
 // learned distribution is unchanged in expectation, the contended per-cell
-// atomic traffic drops by 1/PG_TRAIN_PROB.
-#define PG_TRAIN_PROB        0.25f
-#define PG_TRAIN_WEIGHT_SCALE 4.0f   // 1 / PG_TRAIN_PROB
+// atomic traffic drops by 1/PG_TRAIN_PROB. The probability also sets how fast
+// every cell matures: at 0.25 only a quarter of paths ever train the guide, so
+// cells accumulate evidence 4x slower than the renderer samples — the dominant
+// limit on how fast the guide subdivides and its mixtures converge (a wide view
+// gives each world-cell little traffic, so cells stay coarse/noisy unless the
+// camera concentrates rays on them). Raised to 0.5 to halve maturity time at
+// the cost of ~2x the training atomic traffic. WEIGHT_SCALE must stay 1/PROB.
+#define PG_TRAIN_PROB        0.5f
+#define PG_TRAIN_WEIGHT_SCALE 2.0f   // 1 / PG_TRAIN_PROB
 
 // Max share of the continuation budget the guide may claim on a surface the
 // BSDF-selection logic considers fully specular (pSpec == 1, i.e. metallic
@@ -604,6 +610,9 @@ struct TrainRecord {
     float3 beta;            // RGB local throughput factor f*cos/pdf (incl. 1/RR)
     float dist;             // distance to the next vertex along dir (parallax fit);
                             // patched from the next segment's hit.t after the trace
+    float relX, relY, relZ; // deposit position within the training cell, [-1,1]
+                            // from cell center; feeds the spatial (barrier)
+                            // subdivision criterion
 };
 
 //------------------------------------------------------------------------------
@@ -841,6 +850,7 @@ __forceinline__ __device__ float3 tracePath(
         // estimator stays consistent.
         float guideAlpha = 0.0f;
         unsigned int trainCellIdx = PG_INVALID_CELL;
+        float trainRelX = 0.0f, trainRelY = 0.0f, trainRelZ = 0.0f;
         GuideLobe guideLobe = {};
         if (guidingActive && !atCap) {
             incrementGuideStat(GUIDE_STAT_ATTEMPTS);
@@ -884,14 +894,33 @@ __forceinline__ __device__ float3 tracePath(
                 // one descent (the exact lookup) plus one single-level probe.
                 unsigned int ctxCellIdx = pathGuideCellAtLevel(grid, jx, jy, jz, foundLevel);
                 if (ctxCellIdx == PG_INVALID_CELL) ctxCellIdx = exactCellIdx;  // jitter left coverage
-                // Train the exact cell (the one that actually contains this
-                // shading point). Using the jittered cell for training scatters
-                // deposits across neighboring cells unevenly — cells near
-                // subdivision boundaries or bright features accumulate deposits
-                // at different rates, creating visible grid-aligned brightness
-                // patches. Jitter still affects sampling/PDF (ctxCellIdx) for
-                // boundary smoothing.
-                trainCellIdx = exactCellIdx;
+                // Train the JITTERED cell — the same co-leveled box-filter cell
+                // used for sampling/PDF — so training and sampling share one
+                // stochastic support (Müller 2017). Marginalized over the ±0.5
+                // cell jitter this spreads each deposit across the box
+                // neighborhood, which (a) smooths the spatial deposit
+                // distribution so adjacent cells converge at similar rates
+                // instead of forming hard clean/noisy seams, and (b) spreads the
+                // subdivision deposit-count so the grid stops over-concentrating
+                // on the exact bright cells. The earlier exact-cell training was
+                // a workaround for jitter landing in a wrong-LEVEL neighbor; the
+                // co-leveled single-probe box filter above already fixes that at
+                // the root, so the workaround is no longer needed.
+                trainCellIdx = ctxCellIdx;
+
+                // Position of the (jittered) deposit within its training cell,
+                // normalized to [-1,1] from the cell center (cell size =
+                // extent/res, so 1/halfSize = 2*res/extent). Using the jittered
+                // position keeps it genuinely inside ctxCellIdx and consistent
+                // with the box-filter support. Feeds the spatial first moments
+                // whose centroid drives barrier-only subdivision.
+                {
+                    float tcx, tcy, tcz;
+                    pgCellCenter(grid, ctxCellIdx, tcx, tcy, tcz);
+                    trainRelX = clamp((jx - tcx) * 2.0f * res / (grid.bounds_max[0] - grid.bounds_min[0]), -1.0f, 1.0f);
+                    trainRelY = clamp((jy - tcy) * 2.0f * res / (grid.bounds_max[1] - grid.bounds_min[1]), -1.0f, 1.0f);
+                    trainRelZ = clamp((jz - tcz) * 2.0f * res / (grid.bounds_max[2] - grid.bounds_min[2]), -1.0f, 1.0f);
+                }
 
                 // (1-pSpec) sends near-specular surfaces to pure VNDF, but it
                 // also zeroes guiding on ROUGH metals (pSpec pins to 1 for
@@ -1173,6 +1202,7 @@ __forceinline__ __device__ float3 tracePath(
             tr.local = localRGB;
             tr.beta = beta;
             tr.dist = sceneFarDistance();   // patched to the next segment's hit.t
+            tr.relX = trainRelX; tr.relY = trainRelY; tr.relZ = trainRelZ;
             if (trainCellIdx != PG_INVALID_CELL) pendingDistRecord = trainCount - 1;
         }
 
@@ -1212,7 +1242,8 @@ __forceinline__ __device__ float3 tracePath(
                     // suppress exactly the bright signals worth learning).
                     float w = fminf(loLum / fmaxf(tr.pdf, 1e-4f), TRAIN_WEIGHT_CLAMP)
                             * PG_TRAIN_WEIGHT_SCALE;
-                    pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, tr.dist, params.frame_index);
+                    pathGuideTrainCell(cell, tr.dirX, tr.dirY, tr.dirZ, w, tr.dist,
+                                       tr.relX, tr.relY, tr.relZ, params.frame_index);
                 }
             }
             lo = tr.local + tr.beta * lo;

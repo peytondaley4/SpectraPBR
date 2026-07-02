@@ -30,8 +30,11 @@ void launchRefitCells(float* data,
                       float emaDecay, uint32_t currentFrame,
                       cudaStream_t stream);
 
-// Subdivide well-fed cells: for every cell with level < maxLevel whose EMA
-// deposit count is >= countThreshold, insert its 8 children into the table.
+// Subdivide cells straddling a spatial barrier: for every cell with level <
+// maxLevel that has >= minCount deposits and whose radiance centroid is
+// off-center (|centroid|^2 = sum_a S_a^2 / W^2 >= contrastThreshold), insert its
+// 8 children into the table. The scale-invariant centroid test refines only the
+// boundary of a difference (caustic edge, shadow line), not uniform regions.
 // Children warm-start with the parent's mixture and 1/8 of its cumulative
 // statistics so guiding (and the confidence ramp) survive the split.
 // Idempotent: existing children are left untouched, so re-running on an
@@ -48,7 +51,7 @@ void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
                           uint64_t* cellKeys, uint32_t* cellCounter, uint32_t cellCapacity,
                           const uint32_t* countSnapshot,
                           float* data, uint32_t entryStride,
-                          uint32_t maxLevel, float countThreshold,
+                          uint32_t maxLevel, float minCount, float contrastThreshold,
                           uint32_t currentFrame,
                           cudaStream_t stream);
 

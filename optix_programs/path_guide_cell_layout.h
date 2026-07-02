@@ -33,8 +33,19 @@
 //  [68]     lastHitFrame — atomicMax (positive floats sort like ints)
 //  [69]     interval deposit count — atomicAdd 1 per deposit
 //  [70]     cumulative deposit count (EMA) — owned by refit kernel; drives
-//           the guide confidence ramp and the subdivision criterion
-//  [71]     reserved
+//           the guide confidence ramp and the min-count gate of subdivision
+//  [71..73] interval spatial first moments {Sum(w*relX), Sum(w*relY),
+//           Sum(w*relZ)} — atomicAdd per deposit, rel in [-1,1] = deposit
+//           position within the cell from its center. Folded to the EMA below.
+//  [74..76] cumulative spatial first moments (EMA) — owned by refit kernel.
+//           With the cumulative weight sum W (sum over lobes of per-lobe sw)
+//           these give the weighted radiance CENTROID c_a = S_a / W. The
+//           subdivision kernel splits a cell when |centroid|^2 = sum_a S_a^2/W^2
+//           exceeds a threshold: i.e. only where the radiance is spatially
+//           OFF-CENTER (a barrier / edge inside the cell), independent of
+//           absolute brightness. A uniform cell (bright OR dark) has centroid
+//           ~0 and is never split; only the boundary of a difference (a caustic
+//           edge, a shadow line) is refined.
 //------------------------------------------------------------------------------
 
 #define PG_NUM_LOBES         4
@@ -54,7 +65,13 @@
 #define PG_LAST_HIT_FRAME    68
 #define PG_INT_COUNT         69
 #define PG_CUM_COUNT         70
-#define PG_ENTRY_STRIDE      72
+#define PG_INT_SR_X          71   // interval  Sum(w*relX) (atomicAdd by shaders)
+#define PG_INT_SR_Y          72   // interval  Sum(w*relY)
+#define PG_INT_SR_Z          73   // interval  Sum(w*relZ)
+#define PG_CUM_SR_X          74   // cumulative EMA Sum(w*relX) (refit kernel)
+#define PG_CUM_SR_Y          75   // cumulative EMA Sum(w*relY)
+#define PG_CUM_SR_Z          76   // cumulative EMA Sum(w*relZ)
+#define PG_ENTRY_STRIDE      77
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 // Initialize a cell's lobes to the tetrahedral starting configuration:

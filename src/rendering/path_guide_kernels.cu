@@ -60,6 +60,16 @@ __global__ void refitCellsKernel(float* data,
     c[PG_CUM_COUNT] = cumN;
     c[PG_INT_COUNT] = 0.0f;
 
+    // Fold the interval spatial first moments into their EMA totals on the same
+    // decay footing as the weight sums, so the centroid the subdivision kernel
+    // reads (c_a = S_a / W) stays consistent.
+    c[PG_CUM_SR_X] = emaDecay * c[PG_CUM_SR_X] + c[PG_INT_SR_X];
+    c[PG_CUM_SR_Y] = emaDecay * c[PG_CUM_SR_Y] + c[PG_INT_SR_Y];
+    c[PG_CUM_SR_Z] = emaDecay * c[PG_CUM_SR_Z] + c[PG_INT_SR_Z];
+    c[PG_INT_SR_X] = 0.0f;
+    c[PG_INT_SR_Y] = 0.0f;
+    c[PG_INT_SR_Z] = 0.0f;
+
     // M-step: refit every lobe with evidence; normalize mixture weights
     if (totalW >= 1.0f) {
         float invTotal = 1.0f / totalW;
@@ -173,19 +183,29 @@ __global__ void refitCellsKernel(float* data,
 }
 
 //------------------------------------------------------------------------------
-// Subdivision: insert the 8 children of any cell whose EMA deposit count
-// crossed the threshold (sample-count criterion, PPG-flavored — spatial
-// refinement follows where the samples are; directional complexity is the
-// mixture's job, not subdivision's).
+// Subdivision: insert the 8 children of any cell that contains a spatial
+// BARRIER. A pure sample-count criterion refines wherever the most samples
+// land — but under uniform primary visibility every floor cell gets equal
+// traffic, so the grid subdivides uniformly and gives almost no benefit over
+// no guiding, while a high-VARIANCE feature like a caustic (same count, very
+// different radiance) is ignored. Instead split only where the radiance varies
+// SPATIALLY across the cell: with the weighted centroid c_a = S_a / W of the
+// deposit positions (S_a = EMA Sum(w*rel_a), W = EMA weight sum, rel in
+// [-1,1]), |centroid|^2 = sum_a S_a^2 / W^2 measures how off-center the
+// radiance is. It is scale-INVARIANT (W cancels), so a uniform cell — bright or
+// dark — has centroid ~0 and is never split, while the boundary of a difference
+// (a caustic edge, a shadow line) has a large centroid and is refined. Count is
+// kept only as a min-sample gate so the centroid estimate is meaningful.
 //
 // Once children exist, the top-down lookup targets them, the parent stops
-// receiving deposits, and its EMA count decays below the threshold within a
-// few refits — so re-examining subdivided parents costs only hash probes
-// until then (pgTableInsert is idempotent).
+// receiving deposits, and its EMA evidence decays within a few refits — so
+// re-examining subdivided parents costs only hash probes (pgTableInsert is
+// idempotent).
 //------------------------------------------------------------------------------
 __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                                      const uint32_t* countSnapshot,
-                                     uint32_t maxLevel, float countThreshold,
+                                     uint32_t maxLevel, float minCount,
+                                     float contrastThreshold,
                                      float currentFrame)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -198,7 +218,16 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     if (idx >= totalCells) return;
 
     float* c = table.data + (size_t)idx * table.entry_stride;
-    if (c[PG_CUM_COUNT] < countThreshold) return;
+    // Min-sample gate: the centroid is only meaningful with enough deposits.
+    if (c[PG_CUM_COUNT] < minCount) return;
+    // Scale-invariant spatial-contrast criterion: |centroid|^2 = sum S_a^2 / W^2.
+    float sumW = 0.0f;
+    for (uint32_t lk = 0; lk < PG_NUM_LOBES; lk++)
+        sumW += c[PG_CUMS_BASE + lk * PG_SUM_STRIDE + 3];   // per-lobe weight sum W
+    if (!(sumW > 1e-8f)) return;
+    float sx = c[PG_CUM_SR_X], sy = c[PG_CUM_SR_Y], sz = c[PG_CUM_SR_Z];
+    float contrast = (sx * sx + sy * sy + sz * sz) / (sumW * sumW);   // |centroid|^2
+    if (!(contrast > contrastThreshold)) return;
 
     unsigned long long key = table.cell_keys[idx];
     uint32_t level = (uint32_t)(key >> 48);
@@ -228,6 +257,12 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                 dc[PG_S_DIST] = pc[PG_S_DIST] * 0.125f;  // scale distance sum with the rest
             }
             d[PG_CUM_COUNT] = c[PG_CUM_COUNT] * 0.125f;
+            // Spatial moments are measured relative to the PARENT's center and
+            // half-size, so they don't carry into a child's own frame — reset
+            // them. A zero centroid also blocks an immediate cascade re-split
+            // before the child gathers its own evidence.
+            d[PG_CUM_SR_X] = 0.0f; d[PG_CUM_SR_Y] = 0.0f; d[PG_CUM_SR_Z] = 0.0f;
+            d[PG_INT_SR_X] = 0.0f; d[PG_INT_SR_Y] = 0.0f; d[PG_INT_SR_Z] = 0.0f;
             d[PG_LAST_HIT_FRAME] = currentFrame;
         }
     }
@@ -267,7 +302,7 @@ void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
                           uint64_t* cellKeys, uint32_t* cellCounter, uint32_t cellCapacity,
                           const uint32_t* countSnapshot,
                           float* data, uint32_t entryStride,
-                          uint32_t maxLevel, float countThreshold,
+                          uint32_t maxLevel, float minCount, float contrastThreshold,
                           uint32_t currentFrame,
                           cudaStream_t stream)
 {
@@ -285,7 +320,8 @@ void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
 
     uint32_t blocks = (cellCapacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
     subdivideCellsKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
-        table, countSnapshot, maxLevel, countThreshold, static_cast<float>(currentFrame));
+        table, countSnapshot, maxLevel, minCount, contrastThreshold,
+        static_cast<float>(currentFrame));
 }
 
 void launchInitCells(float* data,

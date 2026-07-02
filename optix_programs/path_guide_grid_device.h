@@ -207,6 +207,7 @@ __forceinline__ __device__ unsigned int pathGuideInsertBaseCell(
 __forceinline__ __device__ void pathGuideTrainCell(
     float* cell,
     float dx, float dy, float dz, float weight, float dist,
+    float relX, float relY, float relZ,
     unsigned int frameIndex)
 {
     // Reject non-finite or non-positive weights — atomicAdd of Inf/NaN
@@ -238,6 +239,13 @@ __forceinline__ __device__ void pathGuideTrainCell(
     atomicAdd(&sums[3], weight);
     atomicAdd(&sums[PG_S_DIST], dist * weight);
     atomicAdd(&cell[PG_INT_COUNT], 1.0f);
+    // Weighted spatial first moments. rel in [-1,1] is the deposit's position
+    // within the cell; the weighted centroid S/W locates where the radiance
+    // concentrates. Subdivision splits only when this is off-center (a barrier
+    // inside the cell), independent of brightness — see the layout header.
+    atomicAdd(&cell[PG_INT_SR_X], relX * weight);
+    atomicAdd(&cell[PG_INT_SR_Y], relY * weight);
+    atomicAdd(&cell[PG_INT_SR_Z], relZ * weight);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);

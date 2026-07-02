@@ -71,12 +71,29 @@ struct PathGuideGridConfig {
     uint32_t max_level = 6;                // Finest allowed level (subdivision cap)
     uint32_t refine_interval_frames = 30;  // Subdivision kernel cadence
 
-    // Subdivide a cell once its EMA deposit count crosses this threshold
-    // (sample-count criterion; spatial refinement follows the samples).
-    // NOTE: counts are in DEPOSIT units — deposits are subsampled 1/4 in
-    // raygen (PG_TRAIN_PROB), so 8192 deposits ~ 32k path-vertex visits.
-    // The guide confidence ramp (cumN/32 in raygen) uses the same units.
-    float subdivide_count_threshold = 8192.0f;
+    // Subdivision is spatial-contrast driven, not raw sample count: a cell
+    // splits only when the radiance is spatially OFF-CENTER inside it, i.e. it
+    // straddles a barrier (caustic edge, shadow line). The trigger is the
+    // scale-invariant |centroid|^2 = sum_a S_a^2 / W^2 (S_a = EMA Sum(w*rel_a),
+    // W = EMA weight sum, rel in [-1,1]) exceeding subdivide_contrast_threshold,
+    // gated by at least subdivide_count_threshold deposits so the centroid is
+    // meaningful. Because |centroid|^2 is independent of brightness, a uniform
+    // cell (bright OR dark) is never split and the grid no longer subdivides
+    // uniformly under flat primary visibility. Counts are in DEPOSIT units —
+    // deposits are subsampled 1/4 in raygen (PG_TRAIN_PROB). The contrast
+    // threshold is dimensionless in [0,3]; ~0.1 catches sharp edges while
+    // staying above the ~3/N centroid noise floor. Both are empirical — tune.
+    //
+    // The count gate is also a MATURITY gate: a cell must be well-sampled before
+    // it splits, because (a) the centroid is only trustworthy with enough
+    // deposits and (b) each of the 8 children inherits just 1/8 of the parent's
+    // cumulative evidence — split too early and the children are born below the
+    // confidence ramp (cumN/32) and stay noisy until they re-accumulate. At
+    // 2048, children start at ~256 cumN, comfortably trained. (EMA window is
+    // ~1/(1-decay) ≈ 6.7 refits, and cells reached the old 8192 rule, so 2048 is
+    // well within reach.)
+    float subdivide_count_threshold = 2048.0f;      // min-sample / maturity gate
+    float subdivide_contrast_threshold = 0.12f;     // |centroid|^2 trigger, [0,3]
 
     // Device refit: EMA decay applied to cumulative sums per refit. The
     // effective averaging window is refit_interval / (1 - decay) frames.

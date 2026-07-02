@@ -206,6 +206,7 @@ void PathGuideGrid::runSubdivisionPass(uint32_t currentFrame, cudaStream_t strea
                          m_counterSnapshot,
                          m_data, m_entryStride,
                          m_config.max_level, m_config.subdivide_count_threshold,
+                         m_config.subdivide_contrast_threshold,
                          currentFrame, stream);
 }
 

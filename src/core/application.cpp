@@ -1637,10 +1637,19 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
 
                 // Determine subdivision/coarsening status (display heuristic)
                 const auto& config = app->m_pathGuideGrid->getConfig();
-                // Subdivision is count-based (matches subdivideCellsKernel);
-                // coarsening is retired (cell indices are stable).
+                // Subdivision is spatial-contrast driven (mirrors
+                // subdivideCellsKernel): |centroid|^2 = sum_a S_a^2 / W^2 must
+                // clear the threshold, gated by a min deposit count. Coarsening
+                // is retired (cell indices are stable).
+                float srx = cellResult.data[PG_CUM_SR_X];
+                float sry = cellResult.data[PG_CUM_SR_Y];
+                float srz = cellResult.data[PG_CUM_SR_Z];
+                float contrast = (sumW > 1e-8f)
+                    ? (srx * srx + sry * sry + srz * srz) / (sumW * sumW)
+                    : 0.0f;
                 info.wouldSubdivide = (cellResult.level < config.max_level &&
-                    cellResult.data[PG_CUM_COUNT] >= config.subdivide_count_threshold);
+                    cellResult.data[PG_CUM_COUNT] >= config.subdivide_count_threshold &&
+                    contrast > config.subdivide_contrast_threshold);
                 info.wouldCoarsen = false;
             }
 

@@ -78,15 +78,17 @@ __global__ void refitCellsKernel(float* data,
     // decay footing as the weight sums, so the centroid the subdivision kernel
     // reads (c_a = S_a / W) stays consistent. Sum(w^2) folds with decay^2: an
     // old deposit's weight is decay^k * w, so its SQUARE is decay^(2k) * w^2 —
-    // this makes nEff = W^2/Sum(w^2) exactly the Kish effective sample size of
+    // this makes nEff = MW^2/Sum(mw^2) exactly the Kish effective sample size of
     // the same exponentially-decayed population the centroid is estimated from.
     c[PG_CUM_SR_X] = emaDecay * c[PG_CUM_SR_X] + c[PG_INT_SR_X];
     c[PG_CUM_SR_Y] = emaDecay * c[PG_CUM_SR_Y] + c[PG_INT_SR_Y];
     c[PG_CUM_SR_Z] = emaDecay * c[PG_CUM_SR_Z] + c[PG_INT_SR_Z];
+    c[PG_CUM_SMW]  = emaDecay * c[PG_CUM_SMW] + c[PG_INT_SMW];
     c[PG_CUM_SW2]  = emaDecay * emaDecay * c[PG_CUM_SW2] + c[PG_INT_SW2];
     c[PG_INT_SR_X] = 0.0f;
     c[PG_INT_SR_Y] = 0.0f;
     c[PG_INT_SR_Z] = 0.0f;
+    c[PG_INT_SMW]  = 0.0f;
     c[PG_INT_SW2]  = 0.0f;
 
     // M-step: refit every lobe with evidence; normalize mixture weights
@@ -272,7 +274,15 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     // its children each inherit ~1/8 of the traffic and never reach the hatch
     // again — at most one surplus level, in exchange for never deadlocking
     // real-but-symmetric structure at coarse resolution.
-    constexpr float COUNT_HATCH_MULT = 8.0f;
+    //
+    // CALIBRATION: the hatch reads MATURITY, whose steady state is
+    // rate/(1-0.98) = 50*rate, vs the min gate's fast count at
+    // rate/(1-0.85) = 6.67*rate. To mean "~8x hotter than the gate" the
+    // multiplier must carry the window ratio (50/6.67 = 7.5): 8 * 7.5 = 60.
+    // A naive 8 here would fire at only ~7% above the gate rate — every
+    // sustained-traffic cell would eventually split once, re-creating the
+    // uniform subdivision the contrast criterion exists to prevent.
+    constexpr float COUNT_HATCH_MULT = 60.0f;
 
     float* c = table.data + (size_t)idx * table.entry_stride;
     // Min-sample gate: affordability + maturity — children inherit 1/8 of the
@@ -280,20 +290,24 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     // the centroid is only meaningful with enough deposits.
     if (c[PG_CUM_COUNT] < minCount) return;
 
-    // (minCount <= 0 disables the hatch rather than the contrast test: with a
-    // zero gate, `cumN < 8*0` would be false for every cell and the whole grid
-    // would split unconditionally each pass.)
-    if (minCount <= 0.0f || c[PG_CUM_COUNT] < COUNT_HATCH_MULT * minCount) {
-        // Scale-invariant spatial-contrast criterion: |centroid|^2 = sum S_a^2 / W^2,
-        // accepted only if it clears BOTH the absolute threshold and the
-        // nEff-based noise floor.
-        float sumW = 0.0f;
-        for (uint32_t lk = 0; lk < PG_NUM_LOBES; lk++)
-            sumW += c[PG_CUMS_BASE + lk * PG_SUM_STRIDE + 3];   // per-lobe weight sum W
-        if (!(sumW > 1e-8f)) return;
+    // Escape hatch reads MATURITY (slow-decayed evidence), not the fast EMA
+    // count: the fast count is a deposit RATE, and 8x the gate in rate units
+    // is only reachable by ultra-hot cells — evidence is what the hatch is
+    // actually about. (minCount <= 0 disables the hatch rather than the
+    // contrast test: with a zero gate the whole grid would split
+    // unconditionally each pass.)
+    if (minCount <= 0.0f || c[PG_MATURITY] < COUNT_HATCH_MULT * minCount) {
+        // Scale-invariant spatial-contrast criterion using the LOG-TAMED
+        // weight statistics (mw = log1p(w)): contrast = |centroid|^2 =
+        // sum_a S_a^2 / MW^2, accepted only if it clears BOTH the absolute
+        // threshold and the nEff noise floor. The normalizer MUST be the
+        // Sum(mw) that matches the moments — the per-lobe radiance weight
+        // sums use raw w and would mis-scale the centroid.
+        float sumMW = c[PG_CUM_SMW];
+        if (!(sumMW > 1e-8f)) return;
         float sx = c[PG_CUM_SR_X], sy = c[PG_CUM_SR_Y], sz = c[PG_CUM_SR_Z];
-        float contrast = (sx * sx + sy * sy + sz * sz) / (sumW * sumW);   // |centroid|^2
-        float nEff = (sumW * sumW) / fmaxf(c[PG_CUM_SW2], 1e-12f);
+        float contrast = (sx * sx + sy * sy + sz * sz) / (sumMW * sumMW);   // |centroid|^2
+        float nEff = (sumMW * sumMW) / fmaxf(c[PG_CUM_SW2], 1e-12f);
         float gate = fmaxf(contrastThreshold, CONTRAST_NOISE_LAMBDA / fmaxf(nEff, 1.0f));
         if (!(contrast > gate)) return;
     }
@@ -342,6 +356,7 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
             d[PG_CUM_SR_X] = 0.0f; d[PG_CUM_SR_Y] = 0.0f; d[PG_CUM_SR_Z] = 0.0f;
             d[PG_INT_SR_X] = 0.0f; d[PG_INT_SR_Y] = 0.0f; d[PG_INT_SR_Z] = 0.0f;
             d[PG_CUM_SW2] = 0.0f;  d[PG_INT_SW2] = 0.0f;
+            d[PG_CUM_SMW] = 0.0f;  d[PG_INT_SMW] = 0.0f;
             d[PG_LAST_HIT_FRAME] = currentFrame;
         }
     }

@@ -846,6 +846,11 @@ void OptixEngine::setEnvironmentImportance(const float* aliasProb,
 
 void OptixEngine::setQualityMode(QualityMode mode) {
     m_launchParams.quality_mode = mode;
+    // firefly_clamp is the INITIAL clamp: the device grows the effective
+    // threshold as clamp * sqrt(accumulated_frames + 1) (see raygen.cu
+    // clampContribution), so every mode is CONSISTENT — early frames get
+    // firefly suppression, and the clamp bias vanishes as the image
+    // accumulates instead of converging to flat clamped patches.
     // Firefly clamp AND depth cap scale with the quality goal. The depth cap is
     // a BIASED path truncation (raygen drops the continuation past it with no RR
     // compensation), so ACCURATE — which advertises unbiasedness — must run a

@@ -74,22 +74,25 @@ struct PathGuideGridConfig {
     // Subdivision is spatial-contrast driven, not raw sample count: a cell
     // splits only when the radiance is spatially OFF-CENTER inside it, i.e. it
     // straddles a barrier (caustic edge, shadow line). The trigger is the
-    // scale-invariant |centroid|^2 = sum_a S_a^2 / W^2 (S_a = EMA Sum(w*rel_a),
-    // W = EMA weight sum, rel in [-1,1]) exceeding subdivide_contrast_threshold,
+    // scale-invariant |centroid|^2 = sum_a S_a^2 / MW^2 (S_a = EMA
+    // Sum(mw*rel_a), MW = EMA Sum(mw), mw = log1p(w) — log-tamed so caustic-
+    // grade heavy tails neither block nor fake structure, rel in [-1,1])
+    // exceeding subdivide_contrast_threshold,
     // gated by at least subdivide_count_threshold deposits so the centroid is
     // meaningful. Because |centroid|^2 is independent of brightness, a uniform
     // cell (bright OR dark) is never split and the grid no longer subdivides
     // uniformly under flat primary visibility. Counts are in DEPOSIT units —
-    // deposits are subsampled 1/4 in raygen (PG_TRAIN_PROB). The contrast
+    // deposits are subsampled by PG_TRAIN_PROB in raygen (currently 1/2). The contrast
     // threshold is dimensionless in [0,3]; ~0.1 catches sharp edges. The
     // kernel ALSO requires contrast to clear a per-cell noise floor ~4/nEff,
-    // nEff = W^2/Sum(w^2) (Kish effective sample size): the centroid's noise
-    // is governed by nEff, not deposit count — one heavy Li/pdf firefly can
-    // collapse nEff to a handful while the count stays in the thousands, and
-    // would otherwise fake spatial structure in a uniform cell. Cells past 8x
-    // the count gate split regardless of contrast (first-moment centroids are
-    // blind to even-symmetric variation; costs at most one surplus level on
-    // hot uniform cells). Both thresholds are empirical — tune.
+    // nEff = MW^2/Sum(mw^2) (Kish effective sample size on the log-tamed
+    // weights): the centroid's noise is governed by nEff, not deposit count —
+    // an untamed firefly would otherwise fake spatial structure in a uniform
+    // cell, while caustic-grade heavy tails would collapse nEff and block
+    // real structure; log1p resolves both. Cells whose slow MATURITY passes
+    // 8x the count gate split regardless of contrast (first-moment centroids
+    // are blind to even-symmetric variation; costs at most one surplus level
+    // on hot uniform cells). Both thresholds are empirical — tune.
     //
     // The count gate is also a WELL-FED gate: a cell must be well-sampled
     // before it splits, because (a) the centroid is only trustworthy with

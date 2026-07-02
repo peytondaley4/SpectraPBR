@@ -37,14 +37,17 @@ void launchRefitCells(float* data, const uint64_t* cellKeys,
 
 // Subdivide cells straddling a spatial barrier: for every cell with level <
 // maxLevel that has >= minCount deposits and whose radiance centroid is
-// off-center (|centroid|^2 = sum_a S_a^2 / W^2 above BOTH contrastThreshold and
-// a noise floor ~4/nEff, nEff = W^2/Sum(w^2) — so heavy-tailed Li/pdf weight
-// spikes cannot fake spatial structure), insert its 8 children into the table.
-// Cells far past maturity (8x minCount) split regardless of contrast: a
-// first-moment centroid is blind to even-symmetric variation, and the hatch
-// costs at most one surplus level on genuinely uniform hot cells. The
-// scale-invariant centroid test refines only the boundary of a difference
-// (caustic edge, shadow line), not uniform regions.
+// off-center (|centroid|^2 = sum_a S_a^2 / MW^2 above BOTH contrastThreshold
+// and a noise floor ~4/nEff, nEff = MW^2/Sum(mw^2)), insert its 8 children.
+// All spatial statistics use the log-tamed weight mw = log1p(w): raw Li/pdf
+// weights are heavy-tailed by nature exactly where refinement matters
+// (caustics), which would collapse nEff and block splitting forever, while a
+// single firefly could otherwise fake structure. Cells whose slow-decayed
+// MATURITY passes 8x minCount split regardless of contrast: a first-moment
+// centroid is blind to even-symmetric variation, and the hatch costs at most
+// one surplus level on genuinely uniform hot cells. The scale-invariant
+// centroid test refines only the boundary of a difference (caustic edge,
+// shadow line), not uniform regions.
 // Children warm-start with the parent's mixture and 1/8 of its cumulative
 // statistics so guiding (and the confidence ramp) survive the split.
 // Idempotent: existing children are left untouched, so re-running on an

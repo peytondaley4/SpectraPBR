@@ -243,14 +243,20 @@ __forceinline__ __device__ void pathGuideTrainCell(
     // within the cell; the weighted centroid S/W locates where the radiance
     // concentrates. Subdivision splits only when this is off-center (a barrier
     // inside the cell), independent of brightness — see the layout header.
-    atomicAdd(&cell[PG_INT_SR_X], relX * weight);
-    atomicAdd(&cell[PG_INT_SR_Y], relY * weight);
-    atomicAdd(&cell[PG_INT_SR_Z], relZ * weight);
-    // Sum of squared weights: with W this gives the Kish effective sample size
-    // nEff = W^2/Sum(w^2), the denominator of the centroid's noise floor in the
-    // subdivision test. Heavy-tailed Li/pdf weights make nEff << deposit count
-    // whenever a firefly lands — exactly when the centroid cannot be trusted.
-    atomicAdd(&cell[PG_INT_SW2], weight * weight);
+    // Spatial statistics use a LOG-TAMED weight, not the raw Li/pdf weight:
+    // raw weights are heavy-tailed by nature exactly where refinement matters
+    // (caustics, near-field pools — the tail is the signal, not noise), which
+    // collapses nEff and blocks subdivision forever. log1p compresses a
+    // 1000:1 weight range to ~7:1 while keeping the bright-vs-dark asymmetry
+    // the centroid detects. mw, the moments, Sum(mw^2), and the Sum(mw)
+    // normalizer must all use the SAME weighting or the contrast is
+    // mis-scaled.
+    float mw = log1pf(weight);
+    atomicAdd(&cell[PG_INT_SR_X], relX * mw);
+    atomicAdd(&cell[PG_INT_SR_Y], relY * mw);
+    atomicAdd(&cell[PG_INT_SR_Z], relZ * mw);
+    atomicAdd(&cell[PG_INT_SW2], mw * mw);
+    atomicAdd(&cell[PG_INT_SMW], mw);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);

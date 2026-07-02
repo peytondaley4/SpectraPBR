@@ -1647,24 +1647,30 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                 // for even-symmetric variation). Constants mirror the kernel.
                 // Coarsening is retired (cell indices are stable).
                 constexpr float kContrastNoiseLambda = 4.0f;
-                constexpr float kCountHatchMult = 8.0f;
+                constexpr float kCountHatchMult = 60.0f;  // 8x gate rate, in maturity units (x7.5 window ratio)
+                // Spatial stats are log1p(w)-weighted; the matching Sum(mw)
+                // normalizer lives at PG_CUM_SMW (the per-lobe radiance sums
+                // use raw w and would mis-scale the centroid). Hatch reads
+                // the slow maturity, mirroring subdivideCellsKernel.
                 float srx = cellResult.data[PG_CUM_SR_X];
                 float sry = cellResult.data[PG_CUM_SR_Y];
                 float srz = cellResult.data[PG_CUM_SR_Z];
-                float contrast = (sumW > 1e-8f)
-                    ? (srx * srx + sry * sry + srz * srz) / (sumW * sumW)
+                float sumMW = cellResult.data[PG_CUM_SMW];
+                float contrast = (sumMW > 1e-8f)
+                    ? (srx * srx + sry * sry + srz * srz) / (sumMW * sumMW)
                     : 0.0f;
-                float nEff = (sumW > 1e-8f)
-                    ? (sumW * sumW) / std::max(cellResult.data[PG_CUM_SW2], 1e-12f)
+                float nEff = (sumMW > 1e-8f)
+                    ? (sumMW * sumMW) / std::max(cellResult.data[PG_CUM_SW2], 1e-12f)
                     : 0.0f;
                 float gate = std::max(config.subdivide_contrast_threshold,
                                       kContrastNoiseLambda / std::max(nEff, 1.0f));
                 float cumN = cellResult.data[PG_CUM_COUNT];
+                float maturityN = cellResult.data[PG_MATURITY];
                 info.wouldSubdivide = (cellResult.level < config.max_level &&
                     cumN >= config.subdivide_count_threshold &&
                     (contrast > gate ||
                      (config.subdivide_count_threshold > 0.0f &&
-                      cumN >= kCountHatchMult * config.subdivide_count_threshold)));
+                      maturityN >= kCountHatchMult * config.subdivide_count_threshold)));
                 info.wouldCoarsen = false;
             }
 

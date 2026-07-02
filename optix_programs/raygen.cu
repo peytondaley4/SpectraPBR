@@ -616,14 +616,30 @@ struct TrainRecord {
 };
 
 //------------------------------------------------------------------------------
-// Luminance-relative firefly clamp. Scales the contribution so its luminance
-// does not exceed params.firefly_clamp; preserves hue. FLT_MAX disables
-// (QUALITY_ACCURATE → unbiased).
+// CONSISTENT firefly clamp: the threshold GROWS with accumulation,
+// limit = firefly_clamp * sqrt(accumulated_frames + 1), so early frames get
+// firefly suppression but the clamp bias provably vanishes as the image
+// accumulates (average bias ~ sum b_i / N -> 0 when per-frame bias b_i -> 0).
+//
+// A FIXED clamp is not just biased — with guiding it is CELL-STRUCTURED bias:
+// near a small bright light essentially every sample exceeds the threshold,
+// so every sample is scaled to the same luminance and the pixel CONVERGES to
+// a flat clamped value. alpha, lobe fit, and the NEE MIS weights vary per
+// guide cell, so the clamp bites differently per cell — the visible artifact
+// is noise-free, wrong-brightness, cell-shaped patches at the lit pool that
+// accumulation never removes (it converges TO them). Growing the threshold
+// restores the invariant the whole engine is built on: any long-accumulated
+// image is correct, regardless of proposal quality.
+//
+// FLT_MAX still disables entirely (QUALITY_ACCURATE: limit = inf).
 //------------------------------------------------------------------------------
 __forceinline__ __device__ float3 clampContribution(const float3& c) {
     float lum = luminance3(c);
-    if (lum <= params.firefly_clamp || lum <= 0.0f) return c;
-    return c * (params.firefly_clamp / lum);
+    if (lum <= 0.0f) return c;
+    float limit = params.firefly_clamp
+                * sqrtf((float)(params.accumulated_frames + 1u));
+    if (lum <= limit) return c;
+    return c * (limit / lum);
 }
 
 //------------------------------------------------------------------------------

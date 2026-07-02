@@ -22,12 +22,17 @@ namespace spectra {
 
 // Fold per-lobe interval sums into EMA cumulative sums and refit the cell's
 // vMF mixture (hard-assignment stepwise EM M-step; Banerjee/Sra kappa
-// approximation; dead-lobe re-seeding). Must run on the render stream so it
-// is ordered against optixLaunch (shaders and the refit never touch the cell
-// data concurrently).
-void launchRefitCells(float* data,
+// approximation; dead-lobe re-seeding). kappa is capped geometry-aware:
+// a lobe fit over a cell of edge `cellSize` (derived from cellKeys level +
+// baseCellSize, halving per level) and consumed up to ~1 cell away by the
+// box-filter jitter must not be narrower than the borrowing error
+// cellSize/meanDist — so kappa <= (2*meanDist/cellSize)^2, with the flat
+// 2000 ceiling unlocked only past the slow-decayed maturity count. Must run
+// on the render stream so it is ordered against optixLaunch (shaders and the
+// refit never touch the cell data concurrently).
+void launchRefitCells(float* data, const uint64_t* cellKeys,
                       const uint32_t* cellCounter, uint32_t cellCapacity,
-                      float emaDecay, uint32_t currentFrame,
+                      float emaDecay, float baseCellSize, uint32_t currentFrame,
                       cudaStream_t stream);
 
 // Subdivide cells straddling a spatial barrier: for every cell with level <

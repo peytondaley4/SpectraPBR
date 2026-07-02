@@ -56,7 +56,18 @@
 //           also clear a noise floor ~ 1/nEff, so weight spikes can never
 //           masquerade as spatial structure. (The count gate alone cannot see
 //           this — it counts deposits, not effective weight mass.)
-//  [79]     reserved
+//  [79]     maturity — SLOW-decayed deposit count (decay 0.98/refit vs 0.85
+//           for cumCount), owned by the refit kernel. Drives the guide
+//           confidence ramp and the kappa evidence gate INSTEAD of the fast
+//           EMA count: cumCount measures recent deposit RATE, which starves
+//           exactly the cells that need guiding most — in dim regions lit by
+//           a small/hard light, deposits only occur when a path FINDS light,
+//           which is rare under BSDF sampling, so rate-based confidence never
+//           rises, guiding never activates, and successes stay rare (a
+//           feedback deadlock; the visible symptom is one resolved region
+//           around the light while everywhere else stays noisy). Maturity
+//           accumulates evidence over a ~50-refit window, so consistent
+//           trickle deposits eventually activate guiding and break the loop.
 //------------------------------------------------------------------------------
 
 #define PG_NUM_LOBES         4
@@ -84,7 +95,8 @@
 #define PG_CUM_SR_Z          76   // cumulative EMA Sum(w*relZ)
 #define PG_INT_SW2           77   // interval  Sum(w^2) (atomicAdd by shaders)
 #define PG_CUM_SW2           78   // cumulative EMA Sum(w^2) (refit kernel)
-#define PG_ENTRY_STRIDE      80   // [79] reserved
+#define PG_MATURITY          79   // slow-decayed deposit count (refit kernel)
+#define PG_ENTRY_STRIDE      80
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 // Initialize a cell's lobes to the tetrahedral starting configuration:

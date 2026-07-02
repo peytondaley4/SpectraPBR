@@ -844,7 +844,7 @@ __forceinline__ __device__ float3 tracePath(
         // samples at every metal vertex toward the light source, where the
         // mirror BRDF is ~zero — compounding per bounce, that blackened
         // metallic scenes and traced dead near-zero-throughput paths.
-        // pSpec, the jittered cell, kappa, and the cumN confidence ramp are
+        // pSpec, the jittered cell, kappa, and the maturity confidence ramp are
         // all deterministic given the jitter, so sampler / combined PDF /
         // NEE MIS all derive the same effective alpha and lobe — the
         // estimator stays consistent.
@@ -947,8 +947,18 @@ __forceinline__ __device__ float3 tracePath(
                         // and a freshly-subdivided neighbor (a grid-boundary
                         // pop). conf only scales alpha, never the estimator, so
                         // any ramp shape stays unbiased.
-                        float cumN = cell[PG_CUM_COUNT];
-                        float conf = smoothstep01(0.0f, 32.0f, cumN);
+                        //
+                        // Confidence reads the SLOW-decayed maturity, not the
+                        // fast EMA count: the fast count measures recent
+                        // deposit RATE, and in dim regions lit by a small/hard
+                        // light deposits only occur when a path FINDS light —
+                        // rare under BSDF sampling — so rate-based confidence
+                        // deadlocks at ~0 exactly where guiding is needed most
+                        // (no guide -> no successes -> no deposits). Maturity
+                        // accumulates evidence over ~50 refits, so consistent
+                        // trickle deposits eventually switch guiding on and
+                        // break the loop.
+                        float conf = smoothstep01(0.0f, 32.0f, cell[PG_MATURITY]);
                         if (conf > 0.0f) {
                             // Eligible-lobe subset: only narrow lobes (kappa
                             // >= 2) with real mixture weight. Wide lobes are

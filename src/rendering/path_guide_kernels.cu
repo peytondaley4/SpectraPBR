@@ -29,15 +29,27 @@ constexpr uint32_t BLOCK_SIZE = 256;
 // exit immediately (the counter read broadcasts from L2).
 //------------------------------------------------------------------------------
 __global__ void refitCellsKernel(float* data,
+                                 const unsigned long long* cellKeys,
                                  const uint32_t* cellCounter, uint32_t cellCapacity,
-                                 float emaDecay, float currentFrame)
+                                 float emaDecay, float baseCellSize,
+                                 float currentFrame)
 {
+    // Maturity decays much slower than the fit window: evidence accumulates
+    // over ~1/(1-0.98) = 50 refits, so trickle-fed cells (dim regions, hard
+    // lights) eventually activate guiding instead of deadlocking at zero
+    // confidence. The distribution itself still tracks the fast 0.85 window.
+    constexpr float MATURITY_DECAY = 0.98f;
+
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t totalCells = *cellCounter;
     if (totalCells > cellCapacity) totalCells = cellCapacity;
     if (idx >= totalCells) return;
 
     float* c = data + (size_t)idx * PG_ENTRY_STRIDE;
+
+    // This cell's edge length: base size halves per level (per_level_scale=2).
+    uint32_t cellLevel = (uint32_t)(cellKeys[idx] >> 48);
+    float cellSize = baseCellSize * exp2f(-(float)cellLevel);
 
     // Fold each lobe's interval window into its EMA lifetime totals
     float lobeW[PG_NUM_LOBES];
@@ -57,7 +69,9 @@ __global__ void refitCellsKernel(float* data,
     }
 
     float cumN = emaDecay * c[PG_CUM_COUNT] + c[PG_INT_COUNT];
+    float maturity = MATURITY_DECAY * c[PG_MATURITY] + c[PG_INT_COUNT];
     c[PG_CUM_COUNT] = cumN;
+    c[PG_MATURITY] = maturity;
     c[PG_INT_COUNT] = 0.0f;
 
     // Fold the interval spatial first moments into their EMA totals on the same
@@ -94,16 +108,38 @@ __global__ void refitCellsKernel(float* data,
                     float invLen = 1.0f / len;
                     float rbar = fminf(len / lobeW[k], 0.99999f);
                     float kappa = rbar * (3.0f - rbar * rbar) / fmaxf(1.0f - rbar * rbar, 1e-4f);
-                    // Confidence-gated sharpness ceiling. The old flat 300
-                    // (~5 deg lobe) could not importance-sample compact bright
-                    // emitters (a sun disc is ~0.5 deg; neon/env hotspots
-                    // similar), capping exactly the "hard light" gains. Allow
-                    // tight lobes only once the cell has real evidence: a
-                    // too-tight, slightly miscentered lobe knocked off by the
-                    // +-0.5 cell box-filter jitter has near-zero pdf at the true
-                    // direction and raises its own variance. (Sampler + PDF
-                    // already handle large kappa numerically — vmf_device.h.)
-                    float kappaMax = (cumN >= 64.0f) ? 2000.0f : 300.0f;
+                    // Weighted mean distance to the incident radiance, for
+                    // parallax-aware reprojection at lookup AND the geometric
+                    // kappa cap below. cumS[PG_S_DIST] is the EMA sum of
+                    // weight*dist; dividing by the weight sum gives the mean —
+                    // decay-invariant like rbar.
+                    float meanDist = cumS[PG_S_DIST] / lobeW[k];
+
+                    // GEOMETRY-AWARE sharpness ceiling. A lobe is consumed up
+                    // to ~1 cell away from where it was fit (the +-0.5-cell
+                    // box-filter jitter), and the parallax reprojection can be
+                    // off by a fraction of a cell (cell-center pivot vs true
+                    // deposit centroid). Both put an angular error of order
+                    // cellSize/meanDist on the borrowed lobe — so its width
+                    // must not be narrower than that error, i.e.
+                    // kappa <= (2*meanDist/cellSize)^2 (vMF std ~ 1/sqrt(k)).
+                    // A NEAR light over fine cells caps at a few tens — a
+                    // tight lobe there would miss the source entirely when
+                    // borrowed, wasting the guide's sample share and leaving
+                    // firefly residue for the clamp to eat (the cell-shaped
+                    // dark/noisy checkerboard around a close small light). A
+                    // DISTANT source (meanDist >> cellSize, incl. env at
+                    // sceneFar) still earns up to 2000 (~2 deg), which is the
+                    // point of the raised ceiling. Evidence gate uses the
+                    // slow-decayed MATURITY, not the rate-based fast count.
+                    // Evidence gates only the 300 -> 2000 unlock; the geometric
+                    // cap is a SAFETY and applies whenever meanDist is known
+                    // (a near-field lobe is fragile at 300 too).
+                    float kappaMax = (maturity >= 64.0f) ? 2000.0f : 300.0f;
+                    if (meanDist > 1e-4f) {
+                        float ratio = 2.0f * meanDist / fmaxf(cellSize, 1e-6f);
+                        kappaMax = fminf(kappaMax, fmaxf(ratio * ratio, 8.0f));
+                    }
                     kappa = fminf(kappa, kappaMax);
                     l[PG_L_MU_X] = cumS[0] * invLen;
                     l[PG_L_MU_Y] = cumS[1] * invLen;
@@ -112,11 +148,7 @@ __global__ void refitCellsKernel(float* data,
                     // Cache the vMF normalization term: halves the expf count
                     // in the shader's PDF/sampler hot path.
                     l[PG_L_EXP_NEG2K] = expf(-2.0f * kappa);
-                    // Weighted mean distance to the incident radiance, for
-                    // parallax-aware reprojection at lookup. cumS[PG_S_DIST] is
-                    // the EMA sum of weight*dist; dividing by the weight sum
-                    // (lobeW[k]) gives the mean — decay-invariant like rbar.
-                    l[PG_L_MEAN_DIST] = cumS[PG_S_DIST] / lobeW[k];
+                    l[PG_L_MEAN_DIST] = meanDist;
                 }
             }
         }
@@ -294,6 +326,11 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                 dc[PG_S_DIST] = pc[PG_S_DIST] * 0.125f;  // scale distance sum with the rest
             }
             d[PG_CUM_COUNT] = c[PG_CUM_COUNT] * 0.125f;
+            // Maturity inherits like the count: a split parent had plenty of
+            // evidence, and children starting at zero would drop the guide
+            // confidence to 0 exactly where the grid just refined (guiding
+            // pops off, then slowly re-ramps over the maturity window).
+            d[PG_MATURITY] = c[PG_MATURITY] * 0.125f;
             // Spatial moments are measured relative to the PARENT's center and
             // half-size, so they don't carry into a child's own frame — reset
             // them. A zero centroid also blocks an immediate cascade re-split
@@ -328,15 +365,17 @@ __global__ void initCellsKernel(float* data,
 
 } // anonymous namespace
 
-void launchRefitCells(float* data,
+void launchRefitCells(float* data, const uint64_t* cellKeys,
                       const uint32_t* cellCounter, uint32_t cellCapacity,
-                      float emaDecay, uint32_t currentFrame,
+                      float emaDecay, float baseCellSize, uint32_t currentFrame,
                       cudaStream_t stream)
 {
-    if (!data || !cellCounter || cellCapacity == 0) return;
+    if (!data || !cellKeys || !cellCounter || cellCapacity == 0) return;
     uint32_t blocks = (cellCapacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
     refitCellsKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
-        data, cellCounter, cellCapacity, emaDecay, static_cast<float>(currentFrame));
+        data, reinterpret_cast<const unsigned long long*>(cellKeys),
+        cellCounter, cellCapacity, emaDecay, baseCellSize,
+        static_cast<float>(currentFrame));
 }
 
 void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,

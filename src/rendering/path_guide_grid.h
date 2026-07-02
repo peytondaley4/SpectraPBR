@@ -91,14 +91,15 @@ struct PathGuideGridConfig {
     // blind to even-symmetric variation; costs at most one surplus level on
     // hot uniform cells). Both thresholds are empirical — tune.
     //
-    // The count gate is also a MATURITY gate: a cell must be well-sampled before
-    // it splits, because (a) the centroid is only trustworthy with enough
-    // deposits and (b) each of the 8 children inherits just 1/8 of the parent's
-    // cumulative evidence — split too early and the children are born below the
-    // confidence ramp (cumN/32) and stay noisy until they re-accumulate. At
-    // 2048, children start at ~256 cumN, comfortably trained. (EMA window is
-    // ~1/(1-decay) ≈ 6.7 refits, and cells reached the old 8192 rule, so 2048 is
-    // well within reach.)
+    // The count gate is also a WELL-FED gate: a cell must be well-sampled
+    // before it splits, because (a) the centroid is only trustworthy with
+    // enough deposits and (b) each of the 8 children inherits just 1/8 of the
+    // parent's cumulative evidence (incl. the slow-decayed PG_MATURITY that
+    // drives the guide confidence ramp) — split too early and the children
+    // are born under-trained and stay noisy until they re-accumulate. At
+    // 2048, children start at ~256, comfortably trained. (Fast-EMA window is
+    // ~1/(1-decay) ≈ 6.7 refits, and cells reached the old 8192 rule, so 2048
+    // is well within reach.)
     float subdivide_count_threshold = 2048.0f;      // min-sample / maturity gate
     float subdivide_contrast_threshold = 0.12f;     // |centroid|^2 trigger, [0,3]
 

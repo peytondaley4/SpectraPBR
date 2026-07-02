@@ -190,8 +190,16 @@ void PathGuideGrid::clear(cudaStream_t stream) {
 
 void PathGuideGrid::refitLobes(uint32_t currentFrame, cudaStream_t stream) {
     if (!m_data || !m_cellCounter) return;
-    launchRefitCells(m_data, m_cellCounter, m_config.cell_capacity,
-                     m_config.refit_ema_decay, currentFrame, stream);
+    // Mean cell edge at level 0 (bounds may be anisotropic; the geometric
+    // kappa cap is a heuristic, the average is plenty). Halves per level on
+    // the device side.
+    float res0 = static_cast<float>(m_levelResolutions[0]);
+    float baseCellSize =
+        ((m_config.bounds_max[0] - m_config.bounds_min[0]) +
+         (m_config.bounds_max[1] - m_config.bounds_min[1]) +
+         (m_config.bounds_max[2] - m_config.bounds_min[2])) / (3.0f * res0);
+    launchRefitCells(m_data, m_cellKeys, m_cellCounter, m_config.cell_capacity,
+                     m_config.refit_ema_decay, baseCellSize, currentFrame, stream);
 }
 
 void PathGuideGrid::runSubdivisionPass(uint32_t currentFrame, cudaStream_t stream) {

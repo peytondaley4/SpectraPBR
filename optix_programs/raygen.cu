@@ -913,14 +913,15 @@ __forceinline__ __device__ float3 tracePath(
                 // extent/res, so 1/halfSize = 2*res/extent). Using the jittered
                 // position keeps it genuinely inside ctxCellIdx and consistent
                 // with the box-filter support. Feeds the spatial first moments
-                // whose centroid drives barrier-only subdivision.
-                {
-                    float tcx, tcy, tcz;
-                    pgCellCenter(grid, ctxCellIdx, tcx, tcy, tcz);
-                    trainRelX = clamp((jx - tcx) * 2.0f * res / (grid.bounds_max[0] - grid.bounds_min[0]), -1.0f, 1.0f);
-                    trainRelY = clamp((jy - tcy) * 2.0f * res / (grid.bounds_max[1] - grid.bounds_min[1]), -1.0f, 1.0f);
-                    trainRelZ = clamp((jz - tcz) * 2.0f * res / (grid.bounds_max[2] - grid.bounds_min[2]), -1.0f, 1.0f);
-                }
+                // whose centroid drives barrier-only subdivision. The cell
+                // center is computed once here and reused by the parallax
+                // reprojection below (same ctxCellIdx — one key read + Morton
+                // decode per vertex instead of two).
+                float ctxCx, ctxCy, ctxCz;
+                pgCellCenter(grid, ctxCellIdx, ctxCx, ctxCy, ctxCz);
+                trainRelX = clamp((jx - ctxCx) * 2.0f * res / (grid.bounds_max[0] - grid.bounds_min[0]), -1.0f, 1.0f);
+                trainRelY = clamp((jy - ctxCy) * 2.0f * res / (grid.bounds_max[1] - grid.bounds_min[1]), -1.0f, 1.0f);
+                trainRelZ = clamp((jz - ctxCz) * 2.0f * res / (grid.bounds_max[2] - grid.bounds_min[2]), -1.0f, 1.0f);
 
                 // (1-pSpec) sends near-specular surfaces to pure VNDF, but it
                 // also zeroes guiding on ROUGH metals (pSpec pins to 1 for
@@ -1024,9 +1025,9 @@ __forceinline__ __device__ float3 tracePath(
                                 // cached vMF kappa/pdf are evaluated around the
                                 // reprojected mean by sampler/PDF/NEE alike, so
                                 // the estimator stays consistent and unbiased.
-                                float ccx, ccy, ccz;
-                                pgCellCenter(grid, ctxCellIdx, ccx, ccy, ccz);
-                                pgParallaxReproject(ccx, ccy, ccz, l[PG_L_MEAN_DIST],
+                                // (ctxCx/Cy/Cz computed once above for the
+                                // spatial moments — same ctxCellIdx.)
+                                pgParallaxReproject(ctxCx, ctxCy, ctxCz, l[PG_L_MEAN_DIST],
                                     s.pos.x, s.pos.y, s.pos.z,
                                     guideLobe.mux, guideLobe.muy, guideLobe.muz);
 

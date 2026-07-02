@@ -8,9 +8,9 @@
 // or grid swap to maintain. What remains host-driven is launching:
 //   - the refit kernel (fold interval sums into EMA cumulative sums, refit
 //     each cell's vMF lobe in place), every few frames, and
-//   - the subdivision kernel (insert the 8 children of any cell whose
-//     EMA deposit count crossed the threshold; PPG-style sample-count
-//     criterion), every refine interval.
+//   - the subdivision kernel (insert the 8 children of any mature cell whose
+//     radiance is spatially off-center — count gate x noise-floored contrast
+//     test), every refine interval.
 // Both are bounded by the device-side allocation counter — the host never
 // needs to know the cell count to launch them.
 //------------------------------------------------------------------------------
@@ -32,9 +32,14 @@ void launchRefitCells(float* data,
 
 // Subdivide cells straddling a spatial barrier: for every cell with level <
 // maxLevel that has >= minCount deposits and whose radiance centroid is
-// off-center (|centroid|^2 = sum_a S_a^2 / W^2 >= contrastThreshold), insert its
-// 8 children into the table. The scale-invariant centroid test refines only the
-// boundary of a difference (caustic edge, shadow line), not uniform regions.
+// off-center (|centroid|^2 = sum_a S_a^2 / W^2 above BOTH contrastThreshold and
+// a noise floor ~4/nEff, nEff = W^2/Sum(w^2) — so heavy-tailed Li/pdf weight
+// spikes cannot fake spatial structure), insert its 8 children into the table.
+// Cells far past maturity (8x minCount) split regardless of contrast: a
+// first-moment centroid is blind to even-symmetric variation, and the hatch
+// costs at most one surplus level on genuinely uniform hot cells. The
+// scale-invariant centroid test refines only the boundary of a difference
+// (caustic edge, shadow line), not uniform regions.
 // Children warm-start with the parent's mixture and 1/8 of its cumulative
 // statistics so guiding (and the confidence ramp) survive the split.
 // Idempotent: existing children are left untouched, so re-running on an

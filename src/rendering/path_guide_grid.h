@@ -81,8 +81,15 @@ struct PathGuideGridConfig {
     // cell (bright OR dark) is never split and the grid no longer subdivides
     // uniformly under flat primary visibility. Counts are in DEPOSIT units —
     // deposits are subsampled 1/4 in raygen (PG_TRAIN_PROB). The contrast
-    // threshold is dimensionless in [0,3]; ~0.1 catches sharp edges while
-    // staying above the ~3/N centroid noise floor. Both are empirical — tune.
+    // threshold is dimensionless in [0,3]; ~0.1 catches sharp edges. The
+    // kernel ALSO requires contrast to clear a per-cell noise floor ~4/nEff,
+    // nEff = W^2/Sum(w^2) (Kish effective sample size): the centroid's noise
+    // is governed by nEff, not deposit count — one heavy Li/pdf firefly can
+    // collapse nEff to a handful while the count stays in the thousands, and
+    // would otherwise fake spatial structure in a uniform cell. Cells past 8x
+    // the count gate split regardless of contrast (first-moment centroids are
+    // blind to even-symmetric variation; costs at most one surplus level on
+    // hot uniform cells). Both thresholds are empirical — tune.
     //
     // The count gate is also a MATURITY gate: a cell must be well-sampled before
     // it splits, because (a) the centroid is only trustworthy with enough

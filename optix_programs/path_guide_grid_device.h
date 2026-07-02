@@ -246,6 +246,11 @@ __forceinline__ __device__ void pathGuideTrainCell(
     atomicAdd(&cell[PG_INT_SR_X], relX * weight);
     atomicAdd(&cell[PG_INT_SR_Y], relY * weight);
     atomicAdd(&cell[PG_INT_SR_Z], relZ * weight);
+    // Sum of squared weights: with W this gives the Kish effective sample size
+    // nEff = W^2/Sum(w^2), the denominator of the centroid's noise floor in the
+    // subdivision test. Heavy-tailed Li/pdf weights make nEff << deposit count
+    // whenever a firefly lands — exactly when the centroid cannot be trusted.
+    atomicAdd(&cell[PG_INT_SW2], weight * weight);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);

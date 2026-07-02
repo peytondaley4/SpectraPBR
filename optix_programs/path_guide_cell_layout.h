@@ -14,7 +14,7 @@
 // subdivision is reserved for actual spatial variation (sample-count
 // criterion in the subdivision kernel).
 //
-// === Cell data layout (72 floats = 288 bytes per cell) ===
+// === Cell data layout (80 floats = 320 bytes per cell) ===
 //
 //  [0..27]  PG_NUM_LOBES=4 lobes x PG_LOBE_STRIDE=7 floats:
 //             +0..2  mu (unit mean direction)     — written by refit kernel
@@ -46,6 +46,17 @@
 //           absolute brightness. A uniform cell (bright OR dark) has centroid
 //           ~0 and is never split; only the boundary of a difference (a caustic
 //           edge, a shadow line) is refined.
+//  [77]     interval Sum(w^2) — atomicAdd per deposit
+//  [78]     cumulative Sum(w^2) (EMA) — owned by refit kernel. With W this
+//           gives the Kish EFFECTIVE sample size nEff = W^2 / Sum(w^2), which
+//           is what actually bounds the centroid's estimation noise: deposit
+//           weights are heavy-tailed Li/pdf, so one firefly among thousands of
+//           ordinary deposits collapses nEff to a handful while the deposit
+//           COUNT stays large. The subdivision kernel requires the contrast to
+//           also clear a noise floor ~ 1/nEff, so weight spikes can never
+//           masquerade as spatial structure. (The count gate alone cannot see
+//           this — it counts deposits, not effective weight mass.)
+//  [79]     reserved
 //------------------------------------------------------------------------------
 
 #define PG_NUM_LOBES         4
@@ -71,7 +82,9 @@
 #define PG_CUM_SR_X          74   // cumulative EMA Sum(w*relX) (refit kernel)
 #define PG_CUM_SR_Y          75   // cumulative EMA Sum(w*relY)
 #define PG_CUM_SR_Z          76   // cumulative EMA Sum(w*relZ)
-#define PG_ENTRY_STRIDE      77
+#define PG_INT_SW2           77   // interval  Sum(w^2) (atomicAdd by shaders)
+#define PG_CUM_SW2           78   // cumulative EMA Sum(w^2) (refit kernel)
+#define PG_ENTRY_STRIDE      80   // [79] reserved
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 // Initialize a cell's lobes to the tetrahedral starting configuration:

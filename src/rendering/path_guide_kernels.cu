@@ -62,13 +62,18 @@ __global__ void refitCellsKernel(float* data,
 
     // Fold the interval spatial first moments into their EMA totals on the same
     // decay footing as the weight sums, so the centroid the subdivision kernel
-    // reads (c_a = S_a / W) stays consistent.
+    // reads (c_a = S_a / W) stays consistent. Sum(w^2) folds with decay^2: an
+    // old deposit's weight is decay^k * w, so its SQUARE is decay^(2k) * w^2 —
+    // this makes nEff = W^2/Sum(w^2) exactly the Kish effective sample size of
+    // the same exponentially-decayed population the centroid is estimated from.
     c[PG_CUM_SR_X] = emaDecay * c[PG_CUM_SR_X] + c[PG_INT_SR_X];
     c[PG_CUM_SR_Y] = emaDecay * c[PG_CUM_SR_Y] + c[PG_INT_SR_Y];
     c[PG_CUM_SR_Z] = emaDecay * c[PG_CUM_SR_Z] + c[PG_INT_SR_Z];
+    c[PG_CUM_SW2]  = emaDecay * emaDecay * c[PG_CUM_SW2] + c[PG_INT_SW2];
     c[PG_INT_SR_X] = 0.0f;
     c[PG_INT_SR_Y] = 0.0f;
     c[PG_INT_SR_Z] = 0.0f;
+    c[PG_INT_SW2]  = 0.0f;
 
     // M-step: refit every lobe with evidence; normalize mixture weights
     if (totalW >= 1.0f) {
@@ -217,17 +222,49 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     if (totalCells > table.cell_capacity) totalCells = table.cell_capacity;
     if (idx >= totalCells) return;
 
+    // Noise-floor multiplier for the contrast test. Under the null hypothesis
+    // (spatially uniform radiance, rel ~ U[-1,1] per axis) the centroid is pure
+    // estimation noise with E[|centroid|^2] = 3*Var(rel)/nEff ~= 1/nEff, where
+    // nEff = W^2/Sum(w^2) is the Kish effective sample size. Requiring
+    // contrast > LAMBDA/nEff (~4x the null mean, several sigma) means a weight
+    // spike (one firefly collapses nEff to a handful while the deposit COUNT
+    // stays large) can never masquerade as spatial structure. This is the
+    // guard the deposit-count gate cannot provide: it counts deposits, not
+    // effective weight mass, and Li/pdf weights are heavy-tailed.
+    constexpr float CONTRAST_NOISE_LAMBDA = 4.0f;
+    // Escape hatch: a first-moment centroid is blind to EVEN-SYMMETRIC spatial
+    // variation (a light pool centered in the cell, a stripe through the
+    // middle) — such cells would never split under a hard contrast gate. A
+    // cell that keeps absorbing traffic long past maturity splits anyway. The
+    // waste is bounded: an ultra-hot but genuinely uniform cell splits ONCE,
+    // its children each inherit ~1/8 of the traffic and never reach the hatch
+    // again — at most one surplus level, in exchange for never deadlocking
+    // real-but-symmetric structure at coarse resolution.
+    constexpr float COUNT_HATCH_MULT = 8.0f;
+
     float* c = table.data + (size_t)idx * table.entry_stride;
-    // Min-sample gate: the centroid is only meaningful with enough deposits.
+    // Min-sample gate: affordability + maturity — children inherit 1/8 of the
+    // parent's evidence, so a split below this leaves them under-trained; and
+    // the centroid is only meaningful with enough deposits.
     if (c[PG_CUM_COUNT] < minCount) return;
-    // Scale-invariant spatial-contrast criterion: |centroid|^2 = sum S_a^2 / W^2.
-    float sumW = 0.0f;
-    for (uint32_t lk = 0; lk < PG_NUM_LOBES; lk++)
-        sumW += c[PG_CUMS_BASE + lk * PG_SUM_STRIDE + 3];   // per-lobe weight sum W
-    if (!(sumW > 1e-8f)) return;
-    float sx = c[PG_CUM_SR_X], sy = c[PG_CUM_SR_Y], sz = c[PG_CUM_SR_Z];
-    float contrast = (sx * sx + sy * sy + sz * sz) / (sumW * sumW);   // |centroid|^2
-    if (!(contrast > contrastThreshold)) return;
+
+    // (minCount <= 0 disables the hatch rather than the contrast test: with a
+    // zero gate, `cumN < 8*0` would be false for every cell and the whole grid
+    // would split unconditionally each pass.)
+    if (minCount <= 0.0f || c[PG_CUM_COUNT] < COUNT_HATCH_MULT * minCount) {
+        // Scale-invariant spatial-contrast criterion: |centroid|^2 = sum S_a^2 / W^2,
+        // accepted only if it clears BOTH the absolute threshold and the
+        // nEff-based noise floor.
+        float sumW = 0.0f;
+        for (uint32_t lk = 0; lk < PG_NUM_LOBES; lk++)
+            sumW += c[PG_CUMS_BASE + lk * PG_SUM_STRIDE + 3];   // per-lobe weight sum W
+        if (!(sumW > 1e-8f)) return;
+        float sx = c[PG_CUM_SR_X], sy = c[PG_CUM_SR_Y], sz = c[PG_CUM_SR_Z];
+        float contrast = (sx * sx + sy * sy + sz * sz) / (sumW * sumW);   // |centroid|^2
+        float nEff = (sumW * sumW) / fmaxf(c[PG_CUM_SW2], 1e-12f);
+        float gate = fmaxf(contrastThreshold, CONTRAST_NOISE_LAMBDA / fmaxf(nEff, 1.0f));
+        if (!(contrast > gate)) return;
+    }
 
     unsigned long long key = table.cell_keys[idx];
     uint32_t level = (uint32_t)(key >> 48);
@@ -260,9 +297,14 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
             // Spatial moments are measured relative to the PARENT's center and
             // half-size, so they don't carry into a child's own frame — reset
             // them. A zero centroid also blocks an immediate cascade re-split
-            // before the child gathers its own evidence.
+            // before the child gathers its own evidence. Sum(w^2) resets with
+            // them so the noise-floor nEff is computed from the same fresh
+            // population as the centroid (inherited W makes the child's early
+            // contrast an UNDERestimate — conservative, converges as the
+            // inherited mass decays out of the EMA).
             d[PG_CUM_SR_X] = 0.0f; d[PG_CUM_SR_Y] = 0.0f; d[PG_CUM_SR_Z] = 0.0f;
             d[PG_INT_SR_X] = 0.0f; d[PG_INT_SR_Y] = 0.0f; d[PG_INT_SR_Z] = 0.0f;
+            d[PG_CUM_SW2] = 0.0f;  d[PG_INT_SW2] = 0.0f;
             d[PG_LAST_HIT_FRAME] = currentFrame;
         }
     }

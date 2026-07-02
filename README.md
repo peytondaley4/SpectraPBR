@@ -31,6 +31,29 @@ Before building, ensure you have the following installed:
 
 ## Building the Project
 
+### Quick build (recommended)
+
+One command from the project root — configures, builds Release for your GPU,
+and optionally launches:
+
+```powershell
+# Windows
+build.bat              # configure + build
+build.bat run          # ... and launch
+build.bat clean run    # full rebuild + launch
+```
+
+```bash
+# Linux
+./build.sh run
+```
+
+Both default to CUDA arch 89 (Ada / RTX 40-series) for ~3x faster device
+compiles; override with `set SPECTRA_CUDA_ARCH=86` (Windows) or
+`SPECTRA_CUDA_ARCH=86 ./build.sh` (Linux). If OptiX isn't found, set
+`OptiX_INSTALL_DIR` to your SDK path. The manual steps below do the same
+thing explicitly.
+
 ### Step 1: Configure with CMake
 
 Open PowerShell or Command Prompt in the project root directory and run:

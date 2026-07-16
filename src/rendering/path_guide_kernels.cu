@@ -74,22 +74,59 @@ __global__ void refitCellsKernel(float* data,
     c[PG_MATURITY] = maturity;
     c[PG_INT_COUNT] = 0.0f;
 
-    // Fold the interval spatial first moments into their EMA totals on the same
-    // decay footing as the weight sums, so the centroid the subdivision kernel
-    // reads (c_a = S_a / W) stays consistent. Sum(w^2) folds with decay^2: an
-    // old deposit's weight is decay^k * w, so its SQUARE is decay^(2k) * w^2 —
-    // this makes nEff = MW^2/Sum(mw^2) exactly the Kish effective sample size of
-    // the same exponentially-decayed population the centroid is estimated from.
+    // Fold the deposit-position moments (centroid + spread, jittered basis)
+    // on the same decay footing as their SMW normalizer, and the visit /
+    // half-cell radiance stats (exact basis) on the same footing as each
+    // other — every ratio the consumers form is a pair of identically
+    // decayed populations.
     c[PG_CUM_SR_X] = emaDecay * c[PG_CUM_SR_X] + c[PG_INT_SR_X];
     c[PG_CUM_SR_Y] = emaDecay * c[PG_CUM_SR_Y] + c[PG_INT_SR_Y];
     c[PG_CUM_SR_Z] = emaDecay * c[PG_CUM_SR_Z] + c[PG_INT_SR_Z];
+    c[PG_CUM_SRR]  = emaDecay * c[PG_CUM_SRR] + c[PG_INT_SRR];
     c[PG_CUM_SMW]  = emaDecay * c[PG_CUM_SMW] + c[PG_INT_SMW];
-    c[PG_CUM_SW2]  = emaDecay * emaDecay * c[PG_CUM_SW2] + c[PG_INT_SW2];
+    c[PG_CUM_VISITS] = emaDecay * c[PG_CUM_VISITS] + c[PG_INT_VISITS];
+    c[PG_CUM_SL]   = emaDecay * c[PG_CUM_SL] + c[PG_INT_SL];
+    c[PG_CUM_HC_X] = emaDecay * c[PG_CUM_HC_X] + c[PG_INT_HC_X];
+    c[PG_CUM_HC_Y] = emaDecay * c[PG_CUM_HC_Y] + c[PG_INT_HC_Y];
+    c[PG_CUM_HC_Z] = emaDecay * c[PG_CUM_HC_Z] + c[PG_INT_HC_Z];
+    c[PG_CUM_HL_X] = emaDecay * c[PG_CUM_HL_X] + c[PG_INT_HL_X];
+    c[PG_CUM_HL_Y] = emaDecay * c[PG_CUM_HL_Y] + c[PG_INT_HL_Y];
+    c[PG_CUM_HL_Z] = emaDecay * c[PG_CUM_HL_Z] + c[PG_INT_HL_Z];
     c[PG_INT_SR_X] = 0.0f;
     c[PG_INT_SR_Y] = 0.0f;
     c[PG_INT_SR_Z] = 0.0f;
+    c[PG_INT_SRR]  = 0.0f;
     c[PG_INT_SMW]  = 0.0f;
-    c[PG_INT_SW2]  = 0.0f;
+    c[PG_INT_VISITS] = 0.0f;
+    c[PG_INT_SL]   = 0.0f;
+    c[PG_INT_HC_X] = 0.0f;
+    c[PG_INT_HC_Y] = 0.0f;
+    c[PG_INT_HC_Z] = 0.0f;
+    c[PG_INT_HL_X] = 0.0f;
+    c[PG_INT_HL_Y] = 0.0f;
+    c[PG_INT_HL_Z] = 0.0f;
+
+    // Deposit spread about the mw-weighted centroid (rel units, [0..~1.7]):
+    // the lobe's true positional uncertainty for the geometric kappa cap.
+    // With the parallax pivot at the measured centroid (raygen), the
+    // borrowing error is the spread of the deposits around that pivot — NOT
+    // the whole cell size — so a compact light pool inside a coarse cell can
+    // still earn a sharp, correctly-aimed lobe (this is what decouples guide
+    // quality from refinement level; the old cellSize-denominated cap forced
+    // coarse cells near lights to floodlight lobes, which rendered every
+    // refinement-level boundary as a convergence cliff). Floored at 0.25:
+    // an ultra-tight measured spread is more likely undersampling than a
+    // point source, and the pivot itself carries estimation error.
+    float spreadRel = 0.25f;
+    float cellSmw = c[PG_CUM_SMW];   // log-tamed weight mass; resets on split
+    if (cellSmw > 1e-6f) {
+        float invSmw = 1.0f / cellSmw;
+        float cwx = c[PG_CUM_SR_X] * invSmw;
+        float cwy = c[PG_CUM_SR_Y] * invSmw;
+        float cwz = c[PG_CUM_SR_Z] * invSmw;
+        float spread2 = c[PG_CUM_SRR] * invSmw - (cwx * cwx + cwy * cwy + cwz * cwz);
+        spreadRel = fmaxf(sqrtf(fmaxf(spread2, 0.0f)), 0.25f);
+    }
 
     // M-step: refit every lobe with evidence; normalize mixture weights
     if (totalW >= 1.0f) {
@@ -117,29 +154,43 @@ __global__ void refitCellsKernel(float* data,
                     // decay-invariant like rbar.
                     float meanDist = cumS[PG_S_DIST] / lobeW[k];
 
-                    // GEOMETRY-AWARE sharpness ceiling. A lobe is consumed up
-                    // to ~1 cell away from where it was fit (the +-0.5-cell
-                    // box-filter jitter), and the parallax reprojection can be
-                    // off by a fraction of a cell (cell-center pivot vs true
-                    // deposit centroid). Both put an angular error of order
-                    // cellSize/meanDist on the borrowed lobe — so its width
-                    // must not be narrower than that error, i.e.
-                    // kappa <= (2*meanDist/cellSize)^2 (vMF std ~ 1/sqrt(k)).
-                    // A NEAR light over fine cells caps at a few tens — a
-                    // tight lobe there would miss the source entirely when
-                    // borrowed, wasting the guide's sample share and leaving
-                    // firefly residue for the clamp to eat (the cell-shaped
-                    // dark/noisy checkerboard around a close small light). A
-                    // DISTANT source (meanDist >> cellSize, incl. env at
-                    // sceneFar) still earns up to 2000 (~2 deg), which is the
-                    // point of the raised ceiling. Evidence gate uses the
-                    // slow-decayed MATURITY, not the rate-based fast count.
-                    // Evidence gates only the 300 -> 2000 unlock; the geometric
-                    // cap is a SAFETY and applies whenever meanDist is known
-                    // (a near-field lobe is fragile at 300 too).
+                    // GEOMETRY-AWARE sharpness ceiling, denominated in the
+                    // measured DEPOSIT SPREAD about the parallax pivot — not
+                    // the cell size. The lobe is consumed up to ~1 cell from
+                    // where it was fit (box-filter jitter), but the parallax
+                    // reprojection pivots at the measured centroid, so the
+                    // residual positional error is the spread of the deposits
+                    // around that pivot: sigma_pos ~ spreadRel * halfCell.
+                    // Angular error ~ sigma_pos/meanDist, and vMF std ~
+                    // 1/sqrt(kappa), so kappa <= (meanDist/sigma_pos)^2.
+                    // The old cellSize denominator assumed the worst pivot
+                    // error (half a cell); with the centroid pivot that
+                    // over-penalized every coarse cell near a light by up to
+                    // 16x, hard-capping them to floodlight lobes and turning
+                    // refinement-level boundaries into convergence cliffs.
+                    // Evidence gate unchanged: maturity unlocks 300 -> 2000.
                     float kappaMax = (maturity >= 64.0f) ? 2000.0f : 300.0f;
+                    // Fresh-evidence damp on the 2000 unlock ONLY: maturity
+                    // is inherited IN FULL on split (the mixture is
+                    // verbatim), but the cell's own fitted mass starts at
+                    // zero — 1-2 fresh aligned deposits give rbar ~= 1 and a
+                    // raw kappa in the tens of thousands, which inherited
+                    // maturity would otherwise wave straight through to
+                    // 2000. Denominate the EXTRA sharpness in the cell's
+                    // LOG-TAMED weight mass (CUM_SMW: <= ~6.9 per deposit,
+                    // resets on split): ~40 units (~6+ deposits) for the
+                    // full 2000. FLOORED AT 300 — the pre-unlock trust
+                    // ceiling — because a fresh child re-fitting its
+                    // inherited (verbatim, trusted) mixture with SMW = 0
+                    // must not have its kappa crushed to zero: that
+                    // de-eligibles every lobe and switches guiding OFF in
+                    // exactly the cells the grid just refined, stamping a
+                    // noisy rectangle into the accumulation for every late
+                    // split (the visible "notches").
+                    kappaMax = fminf(kappaMax, fmaxf(50.0f * cellSmw, 300.0f));
                     if (meanDist > 1e-4f) {
-                        float ratio = 2.0f * meanDist / fmaxf(cellSize, 1e-6f);
+                        float sigmaPos = fmaxf(spreadRel * 0.5f * cellSize, 1e-6f);
+                        float ratio = meanDist / sigmaPos;
                         kappaMax = fminf(kappaMax, fmaxf(ratio * ratio, 8.0f));
                     }
                     kappa = fminf(kappa, kappaMax);
@@ -222,30 +273,33 @@ __global__ void refitCellsKernel(float* data,
 }
 
 //------------------------------------------------------------------------------
-// Subdivision: insert the 8 children of any cell that contains a spatial
-// BARRIER. A pure sample-count criterion refines wherever the most samples
-// land — but under uniform primary visibility every floor cell gets equal
-// traffic, so the grid subdivides uniformly and gives almost no benefit over
-// no guiding, while a high-VARIANCE feature like a caustic (same count, very
-// different radiance) is ignored. Instead split only where the radiance varies
-// SPATIALLY across the cell: with the weighted centroid c_a = S_a / W of the
-// deposit positions (S_a = EMA Sum(w*rel_a), W = EMA weight sum, rel in
-// [-1,1]), |centroid|^2 = sum_a S_a^2 / W^2 measures how off-center the
-// radiance is. It is scale-INVARIANT (W cancels), so a uniform cell — bright or
-// dark — has centroid ~0 and is never split, while the boundary of a difference
-// (a caustic edge, a shadow line) has a large centroid and is refined. Count is
-// kept only as a min-sample gate so the centroid estimate is meaningful.
+// Subdivision: insert the 8 children of a cell when BOTH hold:
+//  1. VISIT sufficiency (level-normalized): enough guided-vertex traffic —
+//     counted with NO radiance gate — that the statistics below are
+//     trustworthy. Traffic, not brightness, buys eligibility: the previous
+//     radiance-gated deposit count handed every split decision to bright
+//     cells before any criterion ran, which was the persistent root cause
+//     of brightness-correlated refinement across four criterion iterations.
+//  2. RADIANCE STRUCTURE (per-axis half-cell log-radiance ratio): the
+//     conditional mean log1p(radiance) differs between the two halves of
+//     the cell along some axis. Density-invariant, geometry-invariant,
+//     importance-sampling-invariant, measured at exact (unjittered)
+//     positions — see the criterion comment in the kernel body and the
+//     layout header for why every weighted-centroid contrast variant
+//     failed structurally.
 //
-// Once children exist, the top-down lookup targets them, the parent stops
-// receiving deposits, and its EMA evidence decays within a few refits — so
-// re-examining subdivided parents costs only hash probes (pgTableInsert is
-// idempotent).
+// Once children exist, the top-down lookup targets them and the parent's
+// EXACT-cell visit stats stop accumulating (its EMA evidence decays within
+// a few refits); the box-filter jitter may still deposit lobe training into
+// it, which is intentional cross-face splatting. Re-examining subdivided
+// parents costs only hash probes (pgTableInsert is idempotent).
 //------------------------------------------------------------------------------
 __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                                      const uint32_t* countSnapshot,
-                                     uint32_t maxLevel, float minCount,
-                                     float contrastThreshold,
-                                     float currentFrame)
+                                     uint32_t maxLevel, uint32_t startLevel,
+                                     float minVisits, float hlrThreshold,
+                                     float baseCellSize,
+                                     float currentFrame, uint32_t* stats)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     // Bound by the pre-launch snapshot, NOT the live counter: children
@@ -256,66 +310,142 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     if (totalCells > table.cell_capacity) totalCells = table.cell_capacity;
     if (idx >= totalCells) return;
 
-    // Noise-floor multiplier for the contrast test. Under the null hypothesis
-    // (spatially uniform radiance, rel ~ U[-1,1] per axis) the centroid is pure
-    // estimation noise with E[|centroid|^2] = 3*Var(rel)/nEff ~= 1/nEff, where
-    // nEff = W^2/Sum(w^2) is the Kish effective sample size. Requiring
-    // contrast > LAMBDA/nEff (~4x the null mean, several sigma) means a weight
-    // spike (one firefly collapses nEff to a handful while the deposit COUNT
-    // stays large) can never masquerade as spatial structure. This is the
-    // guard the deposit-count gate cannot provide: it counts deposits, not
-    // effective weight mass, and Li/pdf weights are heavy-tailed.
-    constexpr float CONTRAST_NOISE_LAMBDA = 4.0f;
-    // Escape hatch: a first-moment centroid is blind to EVEN-SYMMETRIC spatial
-    // variation (a light pool centered in the cell, a stripe through the
-    // middle) — such cells would never split under a hard contrast gate. A
-    // cell that keeps absorbing traffic long past maturity splits anyway. The
-    // waste is bounded: an ultra-hot but genuinely uniform cell splits ONCE,
-    // its children each inherit ~1/8 of the traffic and never reach the hatch
-    // again — at most one surplus level, in exchange for never deadlocking
-    // real-but-symmetric structure at coarse resolution.
-    //
-    // CALIBRATION: the hatch reads MATURITY, whose steady state is
-    // rate/(1-0.98) = 50*rate, vs the min gate's fast count at
-    // rate/(1-0.85) = 6.67*rate. To mean "~8x hotter than the gate" the
-    // multiplier must carry the window ratio (50/6.67 = 7.5): 8 * 7.5 = 60.
-    // A naive 8 here would fire at only ~7% above the gate rate — every
-    // sustained-traffic cell would eventually split once, re-creating the
-    // uniform subdivision the contrast criterion exists to prevent.
-    constexpr float COUNT_HATCH_MULT = 60.0f;
-
-    float* c = table.data + (size_t)idx * table.entry_stride;
-    // Min-sample gate: affordability + maturity — children inherit 1/8 of the
-    // parent's evidence, so a split below this leaves them under-trained; and
-    // the centroid is only meaningful with enough deposits.
-    if (c[PG_CUM_COUNT] < minCount) return;
-
-    // Escape hatch reads MATURITY (slow-decayed evidence), not the fast EMA
-    // count: the fast count is a deposit RATE, and 8x the gate in rate units
-    // is only reachable by ultra-hot cells — evidence is what the hatch is
-    // actually about. (minCount <= 0 disables the hatch rather than the
-    // contrast test: with a zero gate the whole grid would split
-    // unconditionally each pass.)
-    if (minCount <= 0.0f || c[PG_MATURITY] < COUNT_HATCH_MULT * minCount) {
-        // Scale-invariant spatial-contrast criterion using the LOG-TAMED
-        // weight statistics (mw = log1p(w)): contrast = |centroid|^2 =
-        // sum_a S_a^2 / MW^2, accepted only if it clears BOTH the absolute
-        // threshold and the nEff noise floor. The normalizer MUST be the
-        // Sum(mw) that matches the moments — the per-lobe radiance weight
-        // sums use raw w and would mis-scale the centroid.
-        float sumMW = c[PG_CUM_SMW];
-        if (!(sumMW > 1e-8f)) return;
-        float sx = c[PG_CUM_SR_X], sy = c[PG_CUM_SR_Y], sz = c[PG_CUM_SR_Z];
-        float contrast = (sx * sx + sy * sy + sz * sz) / (sumMW * sumMW);   // |centroid|^2
-        float nEff = (sumMW * sumMW) / fmaxf(c[PG_CUM_SW2], 1e-12f);
-        float gate = fmaxf(contrastThreshold, CONTRAST_NOISE_LAMBDA / fmaxf(nEff, 1.0f));
-        if (!(contrast > gate)) return;
-    }
-
     unsigned long long key = table.cell_keys[idx];
     uint32_t level = (uint32_t)(key >> 48);
+    if (stats) {
+        uint32_t l = level < 15u ? level : 15u;
+        atomicAdd(&stats[4 + l], 1u);  // live-cell level histogram
+    }
     if (level >= maxLevel) return;
+
+    float* c = table.data + (size_t)idx * table.entry_stride;
+
+    // ── Gate 1: statistical sufficiency, in VISITS (traffic), level-
+    // normalized. Visits are counted for every guided vertex with NO
+    // radiance gate, so eligibility follows where the camera's paths
+    // actually are — a dim-but-visible cell is exactly as eligible as a
+    // bright one (the old radiance-gated deposit count handed every split
+    // decision to bright cells before any criterion even ran; that was the
+    // saga-long driver of brightness-correlated refinement). The threshold
+    // halves per axis per level (visits per cell fall ~4x per level for
+    // 2D surface traffic). NOTE the semantics: CUM_VISITS is a fast EMA
+    // (steady state = 6.67x the per-refit-interval rate), so these are
+    // sustained-RATE thresholds, not cumulative counts — a cell below the
+    // rate never qualifies no matter how long the camera stares. The floor
+    // is min(256, minVisits) so a small configured threshold cannot make
+    // deep levels HARDER to reach than the start level; minVisits <= 0
+    // disables subdivision entirely.
+    float gateVisits = minVisits;
+    if (level > startLevel) {
+        gateVisits = fmaxf(minVisits * exp2f(-2.0f * (float)(level - startLevel)),
+                           fminf(256.0f, minVisits));
+    }
+    float visits = c[PG_CUM_VISITS];
+    if (minVisits <= 0.0f || visits < gateVisits) return;
+    if (stats) atomicAdd(&stats[1], 1u);   // gate-passed
+
+    // ── Gate 2: radiance structure — per-axis half-cell statistics on the
+    // conditional MEAN log1p(radiance) of the two half-cells (negative half
+    // derived by subtraction from the totals). Why this statistic survives
+    // where every weighted-centroid variant failed (established
+    // numerically, 2026-07):
+    //  - conditional MEANS are invariant to deposit DENSITY, so the
+    //    radiance-correlated visit density that poisoned the centroid
+    //    criteria (bright halves get more samples) cancels by construction;
+    //  - both halves are measured directly — a surface cutting the cell
+    //    off-center shifts both means identically (geometry-invariant);
+    //  - the statistic is built on RAW radiance, not Li/pdf, so the guide's
+    //    own convergence does not flatten it away;
+    //  - measured at EXACT vertex positions (raygen packs the half-cell
+    //    signs before jittering), so the box filter cannot smear the edge.
+    // TWO forms are tested, because log1p changes character with exposure:
+    //  - RATIO |log((posMean+eps)/(negMean+eps))|: for radiance <~ 1,
+    //    log1p(L) ~= L, so this is the scale-invariant log radiance ratio —
+    //    the calibrated regime (edges 1.7+, smooth 4x falloff ~0.26). The
+    //    eps floor bounds the dark-half ratio; it also means scenes whose
+    //    mean incident luminance sits below ~0.02 cannot split on this form.
+    //  - DIFFERENCE |posMean - negMean| vs 1.7x the threshold: for radiance
+    //    >> 1, log1p(L) ~= log(L), so the DIFFERENCE of means is the log of
+    //    the geometric-mean ratio — exactly scale-invariant where the ratio
+    //    form's double-log compression would go blind (a 20:1 edge measures
+    //    ~3.0 at ANY bright exposure; a smooth 4x gradient <= ~0.7 < 1.19).
+    // Split when either form fires on any axis.
+    {
+        const float EPS = 0.02f;       // mean floor: bounds the dark-half ratio
+        const float HALF_FLOOR = 32.0f; // min visits per half for a valid mean
+        float sl = c[PG_CUM_SL];
+        bool structure = false;
+        #pragma unroll
+        for (int a = 0; a < 3; a++) {
+            float posC = c[PG_CUM_HC_X + a];
+            float negC = visits - posC;
+            if (posC < HALF_FLOOR || negC < HALF_FLOOR) continue;
+            float posL = c[PG_CUM_HL_X + a];
+            float negL = fmaxf(sl - posL, 0.0f);
+            float posMean = posL / posC;
+            float negMean = negL / negC;
+            float ratio = fabsf(logf((posMean + EPS) / (negMean + EPS)));
+            float diff  = fabsf(posMean - negMean);
+            if (ratio > hlrThreshold || diff > 1.7f * hlrThreshold) {
+                structure = true;
+                break;
+            }
+        }
+        // ── Gate 2b: RESOLUTION-LIMITED test (Ruppert-style adaptivity).
+        // The half-cell test above only sees scalar radiance EDGES; a
+        // smooth-but-NEAR illumination field (the falloff band around a
+        // light pool) never trips it, yet its directional distribution
+        // varies too fast for a coarse cell: the spread-denominated kappa
+        // cap pins the lobes to floodlights (observed: kappa ~9 in a base
+        // cell beside a pool whose fine neighbors earn 2000), and the
+        // visible result is "convergence tracks grid density". Split when a
+        // trained lobe's FITTED concentration demand (Banerjee/Sra from the
+        // cum sums, same formula as the refit) exceeds the cell's
+        // achievable cap severalfold — the guide is provably limited by
+        // spatial resolution, not by evidence. Brightness-neutral (rbar is
+        // a normalized direction statistic) and self-limiting: each split
+        // quadruples the cap, so refinement stops as soon as the cap clears
+        // the demand (bounded by the physical source size, max_level, and
+        // the visit gate above).
+        if (!structure) {
+            float smw = c[PG_CUM_SMW];
+            if (smw > 1e-6f) {
+                float invSmw = 1.0f / smw;
+                float cwx = c[PG_CUM_SR_X] * invSmw;
+                float cwy = c[PG_CUM_SR_Y] * invSmw;
+                float cwz = c[PG_CUM_SR_Z] * invSmw;
+                float spread2 = c[PG_CUM_SRR] * invSmw - (cwx * cwx + cwy * cwy + cwz * cwz);
+                float spreadRel = fmaxf(sqrtf(fmaxf(spread2, 0.0f)), 0.25f);
+                float cellSize = baseCellSize * exp2f(-(float)level);
+                float sigmaPos = fmaxf(spreadRel * 0.5f * cellSize, 1e-6f);
+                for (int k = 0; k < PG_NUM_LOBES; k++) {
+                    const float* cumS = c + PG_CUMS_BASE + k * PG_SUM_STRIDE;
+                    float w = cumS[3];
+                    if (w < 32.0f) continue;   // lobe must be well-evidenced
+                    float len = sqrtf(cumS[0] * cumS[0] + cumS[1] * cumS[1] + cumS[2] * cumS[2]);
+                    float rbar = fminf(len / w, 0.99999f);
+                    float implied = rbar * (3.0f - rbar * rbar) / fmaxf(1.0f - rbar * rbar, 1e-4f);
+                    float meanDist = cumS[PG_S_DIST] / w;
+                    if (meanDist < 1e-4f) continue;
+                    float ratio = meanDist / sigmaPos;
+                    float cap = ratio * ratio;
+                    // cap >= 500: already sharp enough that refinement buys
+                    // little; demand > 4x cap: real headroom, with hysteresis.
+                    if (cap < 500.0f && implied > 4.0f * cap) {
+                        structure = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!structure) {
+            if (stats) atomicAdd(&stats[2], 1u);   // structure test failed
+            return;
+        }
+    }
+
     unsigned long long morton = key & ((1ull << 48) - 1);
+    if (stats) atomicAdd(&stats[0], 1u);   // split
 
     for (uint32_t k = 0; k < 8; k++) {
         bool inserted = false;
@@ -340,24 +470,31 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                 dc[PG_S_DIST] = pc[PG_S_DIST] * 0.125f;  // scale distance sum with the rest
             }
             d[PG_CUM_COUNT] = c[PG_CUM_COUNT] * 0.125f;
-            // Maturity inherits like the count: a split parent had plenty of
-            // evidence, and children starting at zero would drop the guide
-            // confidence to 0 exactly where the grid just refined (guiding
-            // pops off, then slowly re-ramps over the maturity window).
-            d[PG_MATURITY] = c[PG_MATURITY] * 0.125f;
-            // Spatial moments are measured relative to the PARENT's center and
-            // half-size, so they don't carry into a child's own frame — reset
-            // them. A zero centroid also blocks an immediate cascade re-split
-            // before the child gathers its own evidence. Sum(w^2) resets with
-            // them so the noise-floor nEff is computed from the same fresh
-            // population as the centroid (inherited W makes the child's early
-            // contrast an UNDERestimate — conservative, converges as the
-            // inherited mass decays out of the EMA).
+            // Maturity inherits IN FULL, not 1/8: the child's mixture is the
+            // parent's verbatim (copied above), so the guide's *confidence*
+            // in it did not drop — only the deposit-rate semantics did. The
+            // old 1/8 inheritance cut the confidence ramp (and the kappa
+            // evidence unlock) 8x at exactly the cells the grid just deemed
+            // important, drawing cell-shaped confidence rings around every
+            // split.
+            d[PG_MATURITY] = c[PG_MATURITY];
+            // Spatial moments and the visit/half-cell radiance stats are
+            // measured relative to the PARENT's frame — they don't carry
+            // into a child's own frame. Reset; children earn their own
+            // (fresh-population ratios stay consistent because every
+            // numerator/denominator pair resets together).
             d[PG_CUM_SR_X] = 0.0f; d[PG_CUM_SR_Y] = 0.0f; d[PG_CUM_SR_Z] = 0.0f;
             d[PG_INT_SR_X] = 0.0f; d[PG_INT_SR_Y] = 0.0f; d[PG_INT_SR_Z] = 0.0f;
-            d[PG_CUM_SW2] = 0.0f;  d[PG_INT_SW2] = 0.0f;
+            d[PG_CUM_SRR] = 0.0f;  d[PG_INT_SRR] = 0.0f;
             d[PG_CUM_SMW] = 0.0f;  d[PG_INT_SMW] = 0.0f;
+            d[PG_CUM_VISITS] = 0.0f; d[PG_INT_VISITS] = 0.0f;
+            d[PG_CUM_SL] = 0.0f;   d[PG_INT_SL] = 0.0f;
+            d[PG_CUM_HC_X] = 0.0f; d[PG_CUM_HC_Y] = 0.0f; d[PG_CUM_HC_Z] = 0.0f;
+            d[PG_INT_HC_X] = 0.0f; d[PG_INT_HC_Y] = 0.0f; d[PG_INT_HC_Z] = 0.0f;
+            d[PG_CUM_HL_X] = 0.0f; d[PG_CUM_HL_Y] = 0.0f; d[PG_CUM_HL_Z] = 0.0f;
+            d[PG_INT_HL_X] = 0.0f; d[PG_INT_HL_Y] = 0.0f; d[PG_INT_HL_Z] = 0.0f;
             d[PG_LAST_HIT_FRAME] = currentFrame;
+            if (stats) atomicAdd(&stats[3], 1u);
         }
     }
 }
@@ -398,8 +535,10 @@ void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
                           uint64_t* cellKeys, uint32_t* cellCounter, uint32_t cellCapacity,
                           const uint32_t* countSnapshot,
                           float* data, uint32_t entryStride,
-                          uint32_t maxLevel, float minCount, float contrastThreshold,
-                          uint32_t currentFrame,
+                          uint32_t maxLevel, uint32_t startLevel,
+                          float minVisits, float hlrThreshold,
+                          float baseCellSize,
+                          uint32_t currentFrame, uint32_t* stats,
                           cudaStream_t stream)
 {
     if (!data || !cellCounter || !countSnapshot || !hashKeys || cellCapacity == 0) return;
@@ -416,8 +555,8 @@ void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
 
     uint32_t blocks = (cellCapacity + BLOCK_SIZE - 1) / BLOCK_SIZE;
     subdivideCellsKernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
-        table, countSnapshot, maxLevel, minCount, contrastThreshold,
-        static_cast<float>(currentFrame));
+        table, countSnapshot, maxLevel, startLevel, minVisits, hlrThreshold,
+        baseCellSize, static_cast<float>(currentFrame), stats);
 }
 
 void launchInitCells(float* data,

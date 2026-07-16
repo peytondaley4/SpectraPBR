@@ -131,8 +131,16 @@ __forceinline__ __device__ HitInfo traceRadianceRay(
     return hit;
 }
 
+// deltaLight: the shadow ray targets a point/directional light — the ONLY
+// case where transmissive surfaces pass the ray (see __anyhit__shadow_alpha:
+// no path-sampled alternative exists for delta lights, so occluding would
+// render glass interiors black). Area/mesh/env shadow rays are occluded by
+// glass: the transmitted energy arrives via refracted path transport (the
+// caustic), and letting NEE through would both erase the glass shadow and
+// double-count on top of the caustic.
 __forceinline__ __device__ bool traceShadowRay(
-    const float3& origin, const float3& geomNormal, const float3& direction, float tmax)
+    const float3& origin, const float3& geomNormal, const float3& direction, float tmax,
+    bool deltaLight = false)
 {
     float NdotD = dot(geomNormal, direction);
     float3 offsetNormal = (NdotD > 0.0f) ? geomNormal : -geomNormal;
@@ -148,6 +156,7 @@ __forceinline__ __device__ bool traceShadowRay(
     // program invocation; alpha-masked and transmissive materials carry
     // __anyhit__shadow_alpha (cut-out shadows / transparent glass shadows).
     unsigned int occluded = 1;
+    unsigned int isDelta = deltaLight ? 1u : 0u;
     float safeTmax = fmaxf(tmax - RAY_EPS, RAY_EPS * 2.0f);
 
     optixTrace(
@@ -160,7 +169,7 @@ __forceinline__ __device__ bool traceShadowRay(
         RAY_TYPE_SHADOW,
         RAY_TYPE_COUNT,
         RAY_TYPE_SHADOW,
-        occluded);
+        occluded, isDelta);
 
     return occluded == 0;
 }
@@ -245,7 +254,15 @@ __forceinline__ __device__ Surface loadSurface(
     float3 worldNormal = normalize(transformVector(nxf, objectNormal));
 
     float4 tangent = bw * v0.tangent + bu * v1.tangent + bv * v2.tangent;
-    float3 worldTangent = normalize(transformVector(xf, make_float3(tangent.x, tangent.y, tangent.z)));
+    // Meshes without authored tangents interpolate to ~zero; normalize(0) is
+    // NaN (rsqrtf(0)), which would ride through applyNormalMap into the
+    // shading normal and get every affected sample discarded by the NaN
+    // guard. Detect it and disable normal mapping for the hit instead.
+    float3 tangentVec = transformVector(xf, make_float3(tangent.x, tangent.y, tangent.z));
+    float tangentLen2 = dot(tangentVec, tangentVec);
+    bool hasTangent = tangentLen2 > 1e-12f;
+    float3 worldTangent = hasTangent ? tangentVec * rsqrtf(tangentLen2)
+                                     : make_float3(1.0f, 0.0f, 0.0f);
 
     float2 texCoord = make_float2(
         bw * v0.u + bu * v1.u + bv * v2.u,
@@ -279,7 +296,7 @@ __forceinline__ __device__ Surface loadSurface(
     }
 
     float3 shadingNormal = worldNormal;
-    if (material.normalTex != 0) {
+    if (material.normalTex != 0 && hasTangent) {
         float4 normalSample = tex2DLod<float4>(material.normalTex, texCoord.x, texCoord.y, texLOD);
         shadingNormal = applyNormalMap(unpackNormal(normalSample), worldNormal, worldTangent, tangent.w);
     }
@@ -343,11 +360,8 @@ __forceinline__ __device__ Surface loadSurface(
 // keep host and device formulas in lockstep or the estimator biases.
 //------------------------------------------------------------------------------
 
-#define LIGHT_KIND_NONE  0
-#define LIGHT_KIND_POINT 1
-#define LIGHT_KIND_DIR   2
-#define LIGHT_KIND_AREA  3
-#define LIGHT_KIND_ENV   4
+// LIGHT_KIND_* constants come from gpu_types.h (shared with the host-built
+// alias table).
 
 __forceinline__ __device__ float areaLightSelectionWeight(const GpuAreaLight& l) {
     return luminance3(l.emission) * l.area;
@@ -359,38 +373,39 @@ __forceinline__ __device__ float areaLightSelectionProb(const GpuAreaLight& l, f
     return (grandTotal > 0.0f) ? areaLightSelectionWeight(l) / grandTotal : 0.0f;
 }
 
-// Pick one light by luminance-weighted CDF walk. Returns kind + index.
-// Floating-point rounding can leave the target unmatched; the fallback keeps
-// the walk exhaustive (last candidate) so no probability mass is dropped.
+// Pick one light: env-vs-scene split, then O(1) Walker/Vose alias-table pick
+// among the scene lights (host-built by LightManager::syncToGpu from the same
+// selection weights). Replaces the linear luminance-CDF walk — that walk was
+// O(N-lights) of divergent global loads per path vertex, dominating the
+// shadow ray itself in many-light scenes. Selection probabilities are
+// IDENTICAL (P(light) = weight / grandTotal), so every selProb/MIS formula
+// downstream is unchanged. Draws its own randoms from the path seed.
 __forceinline__ __device__ unsigned int selectLight(
-    float xi, float grandTotal, unsigned int& outIndex)
+    unsigned int& seed, float grandTotal, unsigned int& outIndex)
 {
-    float target = xi * grandTotal;
-    float cumulative = 0.0f;
-    unsigned int lastKind = LIGHT_KIND_NONE;
-    unsigned int lastIndex = 0;
-
-    for (unsigned int i = 0; i < params.point_light_count; ++i) {
-        cumulative += luminance3(params.point_lights[i].intensity);
-        lastKind = LIGHT_KIND_POINT; lastIndex = i;
-        if (target <= cumulative) { outIndex = i; return LIGHT_KIND_POINT; }
-    }
-    for (unsigned int i = 0; i < params.directional_light_count; ++i) {
-        cumulative += luminance3(params.directional_lights[i].irradiance) * 10.0f;
-        lastKind = LIGHT_KIND_DIR; lastIndex = i;
-        if (target <= cumulative) { outIndex = i; return LIGHT_KIND_DIR; }
-    }
-    for (unsigned int i = 0; i < params.area_light_count; ++i) {
-        cumulative += areaLightSelectionWeight(params.area_lights[i]);
-        lastKind = LIGHT_KIND_AREA; lastIndex = i;
-        if (target <= cumulative) { outIndex = i; return LIGHT_KIND_AREA; }
-    }
+    // Environment leg: P(env) = env_selection_weight / grandTotal, exactly as
+    // the CDF walk realized it (env took the tail past the scene lights).
     if (params.env_selection_weight > 0.0f) {
-        outIndex = 0;
-        return LIGHT_KIND_ENV;
+        if (randomFloat(seed) * grandTotal >= params.total_light_luminance) {
+            outIndex = 0;
+            return LIGHT_KIND_ENV;
+        }
     }
-    outIndex = lastIndex;
-    return lastKind;
+
+    unsigned int n = params.light_alias_count;
+    if (n == 0 || params.light_alias_prob == nullptr) {
+        outIndex = 0;
+        return LIGHT_KIND_NONE;
+    }
+    unsigned int bucket = (unsigned int)(randomFloat(seed) * (float)n);
+    if (bucket >= n) bucket = n - 1;
+    // Fresh random for the accept test — the bucket residual is too
+    // quantized to reuse (same reasoning as the env alias sampler).
+    unsigned int slot = (randomFloat(seed) < params.light_alias_prob[bucket])
+                      ? bucket : params.light_alias_idx[bucket];
+    unsigned int packed = params.light_alias_entries[slot];
+    outIndex = packed & 0x00FFFFFFu;
+    return packed >> 24;
 }
 
 // Sample a point uniformly (by area) on a mesh light's triangles.
@@ -454,14 +469,14 @@ __forceinline__ __device__ float guideLobePdf(const GuideLobe& lobe, const float
 // MIS-weighting it down here would lose direct light.
 __forceinline__ __device__ float3 sampleDirectLight(
     const Surface& s, const float3& V,
-    float pSpec, float guideAlpha, const GuideLobe& guideLobe,
+    float pSpec, float pSheen, float guideAlpha, const GuideLobe& guideLobe,
     unsigned int& seed, bool finalVertex)
 {
     float grandTotal = params.total_light_luminance + params.env_selection_weight;
     if (grandTotal <= 0.0f) return make_float3(0.0f, 0.0f, 0.0f);
 
     unsigned int lightIdx = 0;
-    unsigned int kind = selectLight(randomFloat(seed), grandTotal, lightIdx);
+    unsigned int kind = selectLight(seed, grandTotal, lightIdx);
     if (kind == LIGHT_KIND_NONE) return make_float3(0.0f, 0.0f, 0.0f);
 
     const float3& N = s.shadingNormal;
@@ -475,10 +490,10 @@ __forceinline__ __device__ float3 sampleDirectLight(
         float3 L = lightVec / distance;
         float NdotL = dot(N, L);
         if (NdotL > 0.0f && selProb > 0.0f) {
-            if (traceShadowRay(s.pos, s.geomNormal, L, distance)) {
+            if (traceShadowRay(s.pos, s.geomNormal, L, distance, /*deltaLight=*/true)) {
                 float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                     s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                    params.quality_mode, pSpec, nullptr);
+                    params.quality_mode, pSpec, pSheen, nullptr);
                 // Delta light: no MIS (path sampler cannot hit it)
                 contrib = f * light.intensity * (NdotL / (distance * distance * selProb));
             }
@@ -489,10 +504,10 @@ __forceinline__ __device__ float3 sampleDirectLight(
         float3 L = -normalize(light.direction);
         float NdotL = dot(N, L);
         if (NdotL > 0.0f && selProb > 0.0f) {
-            if (traceShadowRay(s.pos, s.geomNormal, L, sceneFarDistance())) {
+            if (traceShadowRay(s.pos, s.geomNormal, L, sceneFarDistance(), /*deltaLight=*/true)) {
                 float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                     s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                    params.quality_mode, pSpec, nullptr);
+                    params.quality_mode, pSpec, pSheen, nullptr);
                 contrib = f * light.irradiance * (NdotL / selProb);
             }
         }
@@ -538,7 +553,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
                         float misW = 1.0f;
                         if (isMeshLight && !finalVertex) {
                             // BSDF/guide sampling can also hit this geometry — MIS.
-                            float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec);
+                            float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec, pSheen);
                             if (guideAlpha > 0.0f) {
                                 float pGuide = guideLobePdf(guideLobe, L);
                                 pPath = guideAlpha * pGuide + (1.0f - guideAlpha) * pPath;
@@ -548,7 +563,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
 
                         float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                             s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                            params.quality_mode, pSpec, nullptr);
+                            params.quality_mode, pSpec, pSheen, nullptr);
                         contrib = f * light.emission * (NdotL * misW / pLight);
                     }
                 }
@@ -560,7 +575,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
             params.env_alias_prob != nullptr && params.env_pmf != nullptr) {
             float envPdf;
             float3 L = sampleEnvironmentDirection(
-                randomFloat(seed), randomFloat(seed), randomFloat(seed),
+                randomFloat(seed), randomFloat(seed), randomFloat(seed), randomFloat(seed),
                 params.env_alias_prob, params.env_alias_idx, params.env_pmf,
                 params.env_width, params.env_height, envPdf);
             float NdotL = dot(N, L);
@@ -571,7 +586,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
                     // Path sampler reaches the env on miss — MIS.
                     float misW = 1.0f;
                     if (!finalVertex) {
-                        float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec);
+                        float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec, pSheen);
                         if (guideAlpha > 0.0f) {
                             float pGuide = guideLobePdf(guideLobe, L);
                             pPath = guideAlpha * pGuide + (1.0f - guideAlpha) * pPath;
@@ -583,7 +598,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
                         params.environment_intensity);
                     float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                         s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                        params.quality_mode, pSpec, nullptr);
+                        params.quality_mode, pSpec, pSheen, nullptr);
                     contrib = f * envRadiance * (NdotL * misW / pLight);
                 }
             }
@@ -598,6 +613,10 @@ __forceinline__ __device__ float3 sampleDirectLight(
 //------------------------------------------------------------------------------
 struct TrainRecord {
     unsigned int cellIdx;   // deposit target (0xFFFFFFFF = chain-only entry)
+    // Exact-cell visit record for the split statistics: exact cell index in
+    // bits [0..27], per-axis half-cell signs of the EXACT vertex position in
+    // bits [29..31]. 0xFFFFFFFF = no guided lookup at this vertex.
+    unsigned int exactPacked;
     float dirX, dirY, dirZ; // sampled continuation direction
     float pdf;              // combined sampling pdf of that direction
     // RGB (not luminance) so the backward recurrence reconstructs the true
@@ -611,8 +630,9 @@ struct TrainRecord {
     float dist;             // distance to the next vertex along dir (parallax fit);
                             // patched from the next segment's hit.t after the trace
     float relX, relY, relZ; // deposit position within the training cell, [-1,1]
-                            // from cell center; feeds the spatial (barrier)
-                            // subdivision criterion
+                            // from cell center; feeds the deposit centroid and
+                            // spread (parallax pivot + kappa cap) — NOT
+                            // subdivision, which uses exactPacked
 };
 
 //------------------------------------------------------------------------------
@@ -689,6 +709,13 @@ __forceinline__ __device__ float3 tracePath(
     }
     TrainRecord train[MAX_TRAIN_VERTICES];
     int trainCount = 0;
+    // Set when the path continues past a vertex that could not be recorded
+    // (train[] saturated): the recurrence below train[last] is then missing
+    // that vertex's local/beta, so splicing terminalEnv onto train[last]
+    // would attribute radiance to it un-attenuated (orders of magnitude too
+    // large after several unrecorded bounces). A broken chain seeds lo = 0
+    // instead — the recorded vertices still train on their own local terms.
+    bool trainChainBroken = false;
     float3 terminalEnv = make_float3(0.0f, 0.0f, 0.0f);  // (unweighted) RGB radiance entering the last segment
     // Index of the continuation deposit awaiting its parallax distance — the
     // distance to where its radiance came from is the NEXT segment's hit.t,
@@ -749,11 +776,19 @@ __forceinline__ __device__ float3 tracePath(
                     *outSelectionRim = rim * rim * 0.5f;
                 }
             }
-            // Denoiser AOVs: first-hit albedo and world-space normal
+            // Denoiser AOVs: first-hit albedo and CAMERA-space normal — the
+            // OptiX denoiser's normal guide layer is specified in camera
+            // space; a world-space normal makes the guide inconsistent under
+            // camera rotation. Right-handed view basis, looking down -Z.
             if (outFirstAlbedo)
                 *outFirstAlbedo = s.baseColor;
-            if (outFirstNormal)
-                *outFirstNormal = s.shadingNormal;
+            if (outFirstNormal) {
+                const float3& n = s.shadingNormal;
+                *outFirstNormal = make_float3(
+                    dot(n, params.camera.right),
+                    dot(n, params.camera.up),
+                    -dot(n, params.camera.forward));
+            }
         }
 
         float3 V = -rayDir;
@@ -833,10 +868,13 @@ __forceinline__ __device__ float3 tracePath(
             if (trainCount < MAX_TRAIN_VERTICES) {
                 TrainRecord& tr = train[trainCount++];
                 tr.cellIdx = 0xFFFFFFFFu;          // delta vertex: chain only
+                tr.exactPacked = 0xFFFFFFFFu;      // no guided lookup here
                 tr.dirX = newDir.x; tr.dirY = newDir.y; tr.dirZ = newDir.z;
                 tr.pdf = 0.0f;
                 tr.local = emissionContrib;
                 tr.beta = tint;
+            } else {
+                trainChainBroken = true;  // path continues unrecorded
             }
 
             rayOrigin = s.pos + (reflected ? gN : -gN) * RAY_EPS;
@@ -851,6 +889,7 @@ __forceinline__ __device__ float3 tracePath(
         //── Lobe weights for this vertex (shared by sampler, PDF, NEE MIS) ──
         float NdotV = fmaxf(dot(s.shadingNormal, V), BRDF_EPSILON);
         float pSpec = specularSelectProb(NdotV, s.baseColor, s.metallic, params.quality_mode);
+        float pSheen = sheenSelectProb(s.sheenColor, s.baseColor, s.metallic, params.quality_mode);
 
         //── Path-guide lookup (sampling + training context) ─────────────────
         // The guide learns INCIDENT RADIANCE, which is only a good sampling
@@ -866,6 +905,13 @@ __forceinline__ __device__ float3 tracePath(
         // estimator stays consistent.
         float guideAlpha = 0.0f;
         unsigned int trainCellIdx = PG_INVALID_CELL;
+        // Exact-cell visit record for the SPLIT statistics: cell index (28
+        // bits) plus the per-axis half-cell signs of the EXACT (unjittered)
+        // vertex position, packed for the TrainRecord. Split statistics must
+        // use exact positions — the box-filter jitter would smear the very
+        // edge being detected — while lobe training stays on the jittered
+        // cell (the guide distribution the sampler conditions on).
+        unsigned int exactPacked = 0xFFFFFFFFu;
         float trainRelX = 0.0f, trainRelY = 0.0f, trainRelZ = 0.0f;
         GuideLobe guideLobe = {};
         if (guidingActive && !atCap) {
@@ -889,6 +935,19 @@ __forceinline__ __device__ float3 tracePath(
             if (exactCellIdx != PG_INVALID_CELL) {
                 incrementGuideStat(GUIDE_STAT_CELL_FOUND);
 
+                // Pack the exact-cell visit record: index + per-axis half-cell
+                // signs of the exact position. Consumed by the backward pass
+                // for the (unconditional) visit / half-cell radiance stats
+                // that drive subdivision.
+                {
+                    float exCx, exCy, exCz;
+                    pgCellCenter(grid, exactCellIdx, exCx, exCy, exCz);
+                    exactPacked = (exactCellIdx & 0x0FFFFFFFu)
+                                | ((s.pos.x > exCx) ? (1u << 29) : 0u)
+                                | ((s.pos.y > exCy) ? (1u << 30) : 0u)
+                                | ((s.pos.z > exCz) ? (1u << 31) : 0u);
+                }
+
                 // Stochastic box filter (Müller 2017): jitter the query by
                 // ±0.5 cell at the found level and use THE cell at the
                 // jittered position for training, sampling, and every PDF.
@@ -900,44 +959,54 @@ __forceinline__ __device__ float3 tracePath(
                 float jy = s.pos.y + (randomFloat(seed) - 0.5f) * (grid.bounds_max[1] - grid.bounds_min[1]) * invRes;
                 float jz = s.pos.z + (randomFloat(seed) - 0.5f) * (grid.bounds_max[2] - grid.bounds_min[2]) * invRes;
                 // Resolve the jittered sample at the home cell's OWN level (one
-                // hash probe, no descent). The previous full top-down re-lookup
-                // could descend into a FINER child on one side of a subdivision
-                // face while the jitter width was sized for foundLevel — a
-                // support/cell level mismatch that made the box-filtered guide
-                // distribution discontinuous across the face (the dominant
-                // visible grid-boundary seam). Co-leveling removes that and also
-                // cuts the per-vertex guide lookup from two full descents to
-                // one descent (the exact lookup) plus one single-level probe.
+                // hash probe, no descent — co-leveled so the box-filter support
+                // matches the jitter width). If the neighbor is COARSER (no
+                // cell at foundLevel there — the fine side of a refinement
+                // face), fall through to the parent level so the filter
+                // crosses refinement boundaries instead of collapsing onto the
+                // home cell: the old home-cell fallback pinned those deposits
+                // at rel = ±1 on the boundary face and severed the Müller
+                // splatting continuity exactly where the visible level seams
+                // are. The home-cell fallback remains for jitters that leave
+                // the grid, land in an unallocated base cell, or cross a
+                // level gap >= 2 (no 2:1 balance is enforced) — those
+                // deposits still clamp rel to the face.
+                unsigned int ctxLevel = foundLevel;
                 unsigned int ctxCellIdx = pathGuideCellAtLevel(grid, jx, jy, jz, foundLevel);
-                if (ctxCellIdx == PG_INVALID_CELL) ctxCellIdx = exactCellIdx;  // jitter left coverage
-                // Train the JITTERED cell — the same co-leveled box-filter cell
-                // used for sampling/PDF — so training and sampling share one
-                // stochastic support (Müller 2017). Marginalized over the ±0.5
-                // cell jitter this spreads each deposit across the box
-                // neighborhood, which (a) smooths the spatial deposit
-                // distribution so adjacent cells converge at similar rates
-                // instead of forming hard clean/noisy seams, and (b) spreads the
-                // subdivision deposit-count so the grid stops over-concentrating
-                // on the exact bright cells. The earlier exact-cell training was
-                // a workaround for jitter landing in a wrong-LEVEL neighbor; the
-                // co-leveled single-probe box filter above already fixes that at
-                // the root, so the workaround is no longer needed.
+                // Walk UP through coarser levels until a cell exists (down
+                // to start_level — nothing is allocated coarser). A single
+                // parent probe only healed gap-1 faces; the grid enforces no
+                // 2:1 balance, so a max-level region can directly border a
+                // base-level one (observed: L6 against L2) and the filter
+                // must cross that face too or the refined region keeps a
+                // hard convergence seam at its border. Bounded: at most
+                // (max_level - start_level) probes, each one hash lookup.
+                while (ctxCellIdx == PG_INVALID_CELL &&
+                       ctxLevel > params.path_guide_start_level) {
+                    ctxLevel--;
+                    ctxCellIdx = pathGuideCellAtLevel(grid, jx, jy, jz, ctxLevel);
+                }
+                if (ctxCellIdx == PG_INVALID_CELL) {
+                    ctxCellIdx = exactCellIdx;   // jitter left coverage
+                    ctxLevel = foundLevel;
+                }
+                // Train the JITTERED cell — the same box-filter cell used for
+                // sampling/PDF — so training and sampling share one stochastic
+                // support (Müller 2017).
                 trainCellIdx = ctxCellIdx;
 
                 // Position of the (jittered) deposit within its training cell,
-                // normalized to [-1,1] from the cell center (cell size =
-                // extent/res, so 1/halfSize = 2*res/extent). Using the jittered
-                // position keeps it genuinely inside ctxCellIdx and consistent
-                // with the box-filter support. Feeds the spatial first moments
-                // whose centroid drives barrier-only subdivision. The cell
-                // center is computed once here and reused by the parallax
-                // reprojection below (same ctxCellIdx — one key read + Morton
-                // decode per vertex instead of two).
+                // normalized to [-1,1] from the cell center AT THE CTX CELL'S
+                // OWN LEVEL (it may be the coarser parent across a refinement
+                // face). Feeds the deposit centroid (parallax pivot) and
+                // spread (kappa cap) — not subdivision, which uses the exact
+                // stats above.
+                float ctxRes = sparseResolutionAtLevel(grid, ctxLevel);
                 float ctxCx, ctxCy, ctxCz;
                 pgCellCenter(grid, ctxCellIdx, ctxCx, ctxCy, ctxCz);
-                trainRelX = clamp((jx - ctxCx) * 2.0f * res / (grid.bounds_max[0] - grid.bounds_min[0]), -1.0f, 1.0f);
-                trainRelY = clamp((jy - ctxCy) * 2.0f * res / (grid.bounds_max[1] - grid.bounds_min[1]), -1.0f, 1.0f);
-                trainRelZ = clamp((jz - ctxCz) * 2.0f * res / (grid.bounds_max[2] - grid.bounds_min[2]), -1.0f, 1.0f);
+                trainRelX = clamp((jx - ctxCx) * 2.0f * ctxRes / (grid.bounds_max[0] - grid.bounds_min[0]), -1.0f, 1.0f);
+                trainRelY = clamp((jy - ctxCy) * 2.0f * ctxRes / (grid.bounds_max[1] - grid.bounds_min[1]), -1.0f, 1.0f);
+                trainRelZ = clamp((jz - ctxCz) * 2.0f * ctxRes / (grid.bounds_max[2] - grid.bounds_min[2]), -1.0f, 1.0f);
 
                 // (1-pSpec) sends near-specular surfaces to pure VNDF, but it
                 // also zeroes guiding on ROUGH metals (pSpec pins to 1 for
@@ -1044,16 +1113,32 @@ __forceinline__ __device__ float3 tracePath(
                                 guideLobe.expNeg2K = l[PG_L_EXP_NEG2K];
                                 // Parallax-aware reprojection: swing the lobe
                                 // mean toward where its radiance actually comes
-                                // from (cellCenter + mu*meanDist), reducing
+                                // from (pivot + mu*meanDist), reducing
                                 // within-cell directional error and giving
                                 // neighbouring cells a consistent aim near
-                                // shared faces. Reprojects mu in place; the
-                                // cached vMF kappa/pdf are evaluated around the
+                                // shared faces. The PIVOT is the cell's
+                                // measured deposit centroid (CUM_SR/CUM_SMW,
+                                // mapped from rel back to world), not the cell
+                                // center: the lobe was fit where the deposits
+                                // are, and pivoting there shrinks the residual
+                                // positional error from half-a-cell to the
+                                // deposit spread — the same quantity that now
+                                // bounds kappa, so coarse cells aim as well as
+                                // their evidence allows (Ruppert 2020 spirit).
+                                // Reprojects mu in place; the cached vMF
+                                // kappa/pdf are evaluated around the
                                 // reprojected mean by sampler/PDF/NEE alike, so
                                 // the estimator stays consistent and unbiased.
-                                // (ctxCx/Cy/Cz computed once above for the
-                                // spatial moments — same ctxCellIdx.)
-                                pgParallaxReproject(ctxCx, ctxCy, ctxCz, l[PG_L_MEAN_DIST],
+                                float pvX = ctxCx, pvY = ctxCy, pvZ = ctxCz;
+                                float smw = cell[PG_CUM_SMW];
+                                if (smw > 1e-4f) {
+                                    float invSmw = 1.0f / smw;
+                                    float halfInv = 0.5f / ctxRes;   // halfCell = extent/(2*res)
+                                    pvX += cell[PG_CUM_SR_X] * invSmw * (grid.bounds_max[0] - grid.bounds_min[0]) * halfInv;
+                                    pvY += cell[PG_CUM_SR_Y] * invSmw * (grid.bounds_max[1] - grid.bounds_min[1]) * halfInv;
+                                    pvZ += cell[PG_CUM_SR_Z] * invSmw * (grid.bounds_max[2] - grid.bounds_min[2]) * halfInv;
+                                }
+                                pgParallaxReproject(pvX, pvY, pvZ, l[PG_L_MEAN_DIST],
                                     s.pos.x, s.pos.y, s.pos.z,
                                     guideLobe.mux, guideLobe.muy, guideLobe.muz);
 
@@ -1102,8 +1187,15 @@ __forceinline__ __device__ float3 tracePath(
         }
 
         //── Next event estimation (one light sample, one shadow ray) ────────
-        float3 neeContrib = sampleDirectLight(s, V, pSpec, guideAlpha,
+        float3 neeContrib = sampleDirectLight(s, V, pSpec, pSheen, guideAlpha,
             guideLobe, seed, atCap);
+        // Off-cap, the stochastic transmission event above evaluates the
+        // (1-t)*opaque + t*transmission blend by branching, so surviving to
+        // NEE already carries the (1-t) factor. At the cap that draw never
+        // happens, so the factor must be applied explicitly — otherwise a
+        // deep glass chain renders its cap vertex as fully opaque (energy
+        // ADDED, not just truncation bias).
+        if (atCap) neeContrib = neeContrib * (1.0f - s.transmission);
         radiance = radiance + clampContribution(throughput * neeContrib);
 
         // RGB local emission for this vertex = surface emission + the NEE
@@ -1125,6 +1217,9 @@ __forceinline__ __device__ float3 tracePath(
             if (trainCount < MAX_TRAIN_VERTICES) {
                 TrainRecord& tr = train[trainCount++];
                 tr.cellIdx = 0xFFFFFFFFu;
+                // Always the sentinel here: the guide block is gated !atCap,
+                // so no lookup happened and cap vertices carry no visit.
+                tr.exactPacked = exactPacked;
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
                 tr.local = localRGB;
@@ -1148,6 +1243,12 @@ __forceinline__ __device__ float3 tracePath(
                 if (trainCount < MAX_TRAIN_VERTICES) {
                     TrainRecord& tr = train[trainCount++];
                     tr.cellIdx = 0xFFFFFFFFu;
+                    // The visit still counts — RR deaths correlate with
+                    // darkness, and dropping them would reintroduce the
+                    // brightness-correlated eligibility the visit stats
+                    // exist to kill. (Every record site MUST set this
+                    // field: train[] is uninitialized local memory.)
+                    tr.exactPacked = exactPacked;
                     tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                     tr.pdf = 0.0f;
                     tr.local = localRGB;
@@ -1171,7 +1272,7 @@ __forceinline__ __device__ float3 tracePath(
             haveDir = true;
         } else {
             incrementGuideStat(GUIDE_STAT_BSDF_SAMPLED);
-            haveDir = sampleBSDFMixture(V, s.shadingNormal, s.roughness, pSpec,
+            haveDir = sampleBSDFMixture(V, s.shadingNormal, s.roughness, pSpec, pSheen,
                 randomFloat(seed), randomFloat(seed), randomFloat(seed), L);
         }
 
@@ -1183,6 +1284,7 @@ __forceinline__ __device__ float3 tracePath(
             if (trainCount < MAX_TRAIN_VERTICES) {
                 TrainRecord& tr = train[trainCount++];
                 tr.cellIdx = 0xFFFFFFFFu;
+                tr.exactPacked = exactPacked;   // the visit still counts
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
                 tr.local = localRGB;
@@ -1193,7 +1295,7 @@ __forceinline__ __device__ float3 tracePath(
 
         // Combined PDF: the one-sample MIS estimator divides by the mixture
         // density — no separate weight needed.
-        float pdfBsdf = pdfBSDFMixture(V, L, s.shadingNormal, s.roughness, pSpec);
+        float pdfBsdf = pdfBSDFMixture(V, L, s.shadingNormal, s.roughness, pSpec, pSheen);
         float combinedPdf;
         if (guideAlpha > 0.0f) {
             float pdfGuide = guideLobePdf(guideLobe, L);
@@ -1205,6 +1307,7 @@ __forceinline__ __device__ float3 tracePath(
             if (trainCount < MAX_TRAIN_VERTICES) {
                 TrainRecord& tr = train[trainCount++];
                 tr.cellIdx = 0xFFFFFFFFu;
+                tr.exactPacked = exactPacked;   // the visit still counts
                 tr.dirX = 0.0f; tr.dirY = 0.0f; tr.dirZ = 1.0f;
                 tr.pdf = 0.0f;
                 tr.local = localRGB;
@@ -1215,7 +1318,7 @@ __forceinline__ __device__ float3 tracePath(
 
         float3 f = evalPbrBSDF(V, L, s.shadingNormal, s.baseColor, s.metallic, s.roughness,
             s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-            params.quality_mode, pSpec, nullptr);
+            params.quality_mode, pSpec, pSheen, nullptr);
 
         float3 beta = f * (NdotL / combinedPdf) * rrInv;
         throughput = throughput * beta;
@@ -1224,6 +1327,7 @@ __forceinline__ __device__ float3 tracePath(
         if (trainCount < MAX_TRAIN_VERTICES) {
             TrainRecord& tr = train[trainCount++];
             tr.cellIdx = trainCellIdx;
+            tr.exactPacked = exactPacked;
             tr.dirX = L.x; tr.dirY = L.y; tr.dirZ = L.z;
             tr.pdf = combinedPdf;
             tr.local = localRGB;
@@ -1231,6 +1335,8 @@ __forceinline__ __device__ float3 tracePath(
             tr.dist = sceneFarDistance();   // patched to the next segment's hit.t
             tr.relX = trainRelX; tr.relY = trainRelY; tr.relZ = trainRelZ;
             if (trainCellIdx != PG_INVALID_CELL) pendingDistRecord = trainCount - 1;
+        } else {
+            trainChainBroken = true;  // path continues unrecorded
         }
 
         // Continue the path
@@ -1251,15 +1357,26 @@ __forceinline__ __device__ float3 tracePath(
     // the vertex's training cell. Training only shapes the guide — image
     // unbiasedness never depends on it. Subsampled per path (PG_TRAIN_PROB)
     // with compensating weight to cut contended atomic traffic.
-    if (guidingActive && trainCount > 0 && randomFloat(seed) < PG_TRAIN_PROB) {
+    // Gated on path_guide_training: while the host state machine is paused no
+    // refit folds the interval sums, so depositing would let them grow without
+    // bound (float precision loss + a maturity spike that mass-subdivides on
+    // resume).
+    if (guidingActive && params.path_guide_training != 0 &&
+        trainCount > 0 && randomFloat(seed) < PG_TRAIN_PROB) {
         // RGB recurrence: lo(k) = local(k) + beta(k) ⊙ lo(k+1). The deposit is
         // the LUMINANCE of this true RGB incident radiance — element-wise RGB
         // accumulation avoids the chromatic over/under-estimation a scalar
         // luminance recurrence produces across colored bounces.
-        float3 lo = terminalEnv;
+        float3 lo = trainChainBroken ? make_float3(0.0f, 0.0f, 0.0f) : terminalEnv;
         for (int k = trainCount - 1; k >= 0; --k) {
             const TrainRecord& tr = train[k];
             float loLum = luminance3(lo);
+            // Visit + half-cell radiance stats into the EXACT cell,
+            // unconditionally (no radiance gate — see pathGuideVisitCell).
+            // These drive subdivision; the lobe deposit below stays gated.
+            if (tr.exactPacked != 0xFFFFFFFFu) {
+                pathGuideVisitCell(grid, tr.exactPacked, loLum);
+            }
             if (tr.cellIdx != 0xFFFFFFFFu && loLum > 1e-6f && tr.pdf > 1e-8f) {
                 float* cell = sparseCellDataPtr(grid, tr.cellIdx);
                 if (cell != nullptr) {

@@ -14,7 +14,7 @@
 // subdivision is reserved for actual spatial variation (sample-count
 // criterion in the subdivision kernel).
 //
-// === Cell data layout (84 floats = 336 bytes per cell) ===
+// === Cell data layout (98 floats = 392 bytes per cell) ===
 //
 //  [0..27]  PG_NUM_LOBES=4 lobes x PG_LOBE_STRIDE=7 floats:
 //             +0..2  mu (unit mean direction)     — written by refit kernel
@@ -34,30 +34,32 @@
 //  [69]     interval deposit count — atomicAdd 1 per deposit
 //  [70]     cumulative deposit count (EMA) — owned by refit kernel; drives
 //           the guide confidence ramp and the min-count gate of subdivision
-//  === Spatial-contrast statistics ([71..78], [80..81]) ===
-//  All weighted by mw = log1p(w), NOT the raw deposit weight w: raw Li/pdf
-//  weights are heavy-tailed BY NATURE in exactly the regions subdivision
-//  matters most (caustics, near-field pools — the tail IS the signal there,
-//  not firefly noise), which collapses the effective sample size and lets the
-//  noise floor block refinement forever. log1p tames the tails ~1000x -> ~7x
-//  while preserving the bright-vs-dark asymmetry the centroid detects, so
-//  caustic edges split and single fireflies still cannot fake structure.
+//  === Deposit-position statistics ([71..78], [80..81]) — jittered cell ===
+//  mw-weighted (mw = log1p(w)) first and second spatial moments of the
+//  deposits, rel in [-1,1] from the cell center. These do NOT drive
+//  subdivision (see below for why every weighted-centroid criterion failed);
+//  they serve the GUIDE itself:
+//  [71..73] interval Sum(mw*rel_a) — atomicAdd per deposit
+//  [74..76] cumulative EMA — with MW ([80..81]) gives the deposit centroid
+//           c_w = S_a/MW, used as the PARALLAX PIVOT: lobes reproject around
+//           where the radiance was actually deposited, not the cell center,
+//           so coarse cells aim correctly (Ruppert 2020 spirit).
+//  [77..78] Sum(mw*|rel|^2) interval/EMA — with the centroid gives the
+//           deposit SPREAD, which bounds the lobe's positional uncertainty
+//           and therefore the kappa cap (a compact pool in a big cell may be
+//           sharp; a wall-to-wall glow may not).
 //
-//  [71..73] interval spatial first moments {Sum(mw*relX), Sum(mw*relY),
-//           Sum(mw*relZ)} — atomicAdd per deposit, rel in [-1,1] = deposit
-//           position within the cell from its center. Folded to the EMA below.
-//  [74..76] cumulative spatial first moments (EMA) — owned by refit kernel.
-//           With the log-weight sum MW ([80..81]) these give the weighted
-//           radiance CENTROID c_a = S_a / MW. The subdivision kernel splits a
-//           cell when |centroid|^2 = sum_a S_a^2/MW^2 exceeds a threshold:
-//           i.e. only where the radiance is spatially OFF-CENTER (a barrier /
-//           edge inside the cell), independent of absolute brightness. A
-//           uniform cell (bright OR dark) has centroid ~0 and is never split.
-//  [77]     interval Sum(mw^2) — atomicAdd per deposit
-//  [78]     cumulative Sum(mw^2) (EMA) — refit kernel. With MW this gives the
-//           Kish EFFECTIVE sample size nEff = MW^2 / Sum(mw^2), bounding the
-//           centroid's estimation noise; the subdivision kernel requires the
-//           contrast to also clear a noise floor ~ 1/nEff.
+//  === Why subdivision does NOT use weighted-centroid contrast ===
+//  Three structural reasons, established numerically (2026-07): (1) deposits
+//  lie on 2D surfaces inside 3D cells, so the raw weighted centroid carries
+//  a pure-geometry offset up to ~0.5 with uniform radiance (false positive in
+//  ~1/3 of cells at every level); (2) subtracting the unweighted centroid
+//  cancels geometry but also the signal — deposit DENSITY is radiance-
+//  correlated, so edges live in the density channel the subtraction removes;
+//  (3) any statistic on w = Li/pdf is self-erasing: the guide's convergence
+//  flattens Li/pdf by design. No threshold separated real edges from noise
+//  for any centroid variant (inverted 5-10x). Subdivision instead uses the
+//  half-cell log-RADIANCE statistics below ([82..97]).
 //  [79]     maturity — SLOW-decayed deposit count (decay 0.98/refit vs 0.85
 //           for cumCount), owned by the refit kernel. Drives the guide
 //           confidence ramp and the kappa evidence gate INSTEAD of the fast
@@ -95,14 +97,58 @@
 #define PG_CUM_SR_X          74   // cumulative EMA Sum(mw*relX) (refit kernel)
 #define PG_CUM_SR_Y          75   // cumulative EMA Sum(mw*relY)
 #define PG_CUM_SR_Z          76   // cumulative EMA Sum(mw*relZ)
-#define PG_INT_SW2           77   // interval  Sum(mw^2), mw=log1p(w) (atomicAdd)
-#define PG_CUM_SW2           78   // cumulative EMA Sum(mw^2) (refit kernel)
+#define PG_INT_SRR           77   // interval  Sum(mw*|rel|^2) (atomicAdd) —
+#define PG_CUM_SRR           78   // cumulative EMA (refit kernel). With the
+                                  // centroid this gives the deposit SPREAD
+                                  // about it: spread^2 = SRR/SMW - |SR/SMW|^2.
+                                  // Drives the geometry-aware kappa cap — the
+                                  // lobe's positional uncertainty is the
+                                  // spread about its parallax pivot, NOT the
+                                  // whole cell size, so a compact light pool
+                                  // in a coarse cell still earns a sharp lobe.
 #define PG_MATURITY          79   // slow-decayed deposit count (refit kernel)
 #define PG_INT_SMW           80   // interval  Sum(mw) (atomicAdd by shaders)
 #define PG_CUM_SMW           81   // cumulative EMA Sum(mw) (refit kernel) —
-                                  // the centroid/nEff normalizer; MUST use the
-                                  // same weighting as the moments and SW2
-#define PG_ENTRY_STRIDE      84   // [82..83] reserved
+                                  // the centroid/spread normalizer; MUST use
+                                  // the same weighting as SR and SRR
+#define PG_INT_VISITS        82   // interval  guided-vertex VISIT count —
+#define PG_CUM_VISITS        83   // cumulative EMA. Incremented for every
+                                  // guided vertex of a TRAINING-SUBSAMPLED
+                                  // path (PG_TRAIN_PROB = 1/2, uncompensated;
+                                  // gated on path_guide_training; first
+                                  // MAX_TRAIN_VERTICES vertices only), with
+                                  // NO radiance gate: the refinement budget
+                                  // must follow traffic (Mueller-style), not
+                                  // brightness. Absolute visit thresholds
+                                  // are denominated in these subsampled
+                                  // fast-EMA units (sustained rates, not
+                                  // cumulative counts). Written to the EXACT
+                                  // (unjittered) cell.
+// Half-cell split statistics (written to the EXACT cell at the EXACT vertex
+// position — the box-filter jitter would smear the very edge being detected):
+// per axis a, the positive half-cell's visit count and its Sum(log1p(Llum)),
+// where Llum is the vertex's reconstructed incident radiance luminance (the
+// RAW radiance, NOT Li/pdf — importance sampling flattens Li/pdf by design,
+// so any pdf-divided statistic self-erases as the guide converges). Negative
+// halves derive by subtraction from the totals. The split criterion is the
+// per-axis log-ratio of conditional mean log-radiance between the halves:
+// density-invariant (conditional means), geometry-invariant (both halves are
+// measured, not a centroid), and IS-invariant (no pdf anywhere).
+#define PG_INT_HC_X          84   // interval  visits with relX > 0
+#define PG_INT_HC_Y          85
+#define PG_INT_HC_Z          86
+#define PG_CUM_HC_X          87   // cumulative EMA (refit kernel)
+#define PG_CUM_HC_Y          88
+#define PG_CUM_HC_Z          89
+#define PG_INT_HL_X          90   // interval  Sum(log1p(Llum)) over relX > 0
+#define PG_INT_HL_Y          91
+#define PG_INT_HL_Z          92
+#define PG_CUM_HL_X          93   // cumulative EMA (refit kernel)
+#define PG_CUM_HL_Y          94
+#define PG_CUM_HL_Z          95
+#define PG_INT_SL            96   // interval  Sum(log1p(Llum)) over ALL visits
+#define PG_CUM_SL            97   // cumulative EMA (refit kernel)
+#define PG_ENTRY_STRIDE      98
 
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 // Initialize a cell's lobes to the tetrahedral starting configuration:

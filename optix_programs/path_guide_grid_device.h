@@ -100,7 +100,9 @@ __forceinline__ __device__ void pgCellCenter(
     const SparsePathGuideDescriptorDevice& grid, unsigned int cellIdx,
     float& cx, float& cy, float& cz)
 {
-    unsigned long long key = grid.table.cell_keys[cellIdx];
+    // __ldcg: pairs with the insert winner's __threadfence + atomicExch
+    // publish — see the concurrency notes in path_guide_hash_device.h.
+    unsigned long long key = __ldcg(&grid.table.cell_keys[cellIdx]);
     unsigned int level = (unsigned int)(key >> 48);
     unsigned long long morton = key & ((1ull << 48) - 1);
     unsigned int ix, iy, iz;
@@ -251,16 +253,62 @@ __forceinline__ __device__ void pathGuideTrainCell(
     // the centroid detects. mw, the moments, Sum(mw^2), and the Sum(mw)
     // normalizer must all use the SAME weighting or the contrast is
     // mis-scaled.
+    // Deposit-position moments (jittered rel): first moments give the
+    // centroid used as the PARALLAX PIVOT; the second radial moment gives
+    // the deposit SPREAD about it, which bounds the kappa cap. These do NOT
+    // drive subdivision (see the layout header for why weighted-centroid
+    // contrast criteria are structurally blind here).
     float mw = log1pf(weight);
     atomicAdd(&cell[PG_INT_SR_X], relX * mw);
     atomicAdd(&cell[PG_INT_SR_Y], relY * mw);
     atomicAdd(&cell[PG_INT_SR_Z], relZ * mw);
-    atomicAdd(&cell[PG_INT_SW2], mw * mw);
+    atomicAdd(&cell[PG_INT_SRR], mw * (relX * relX + relY * relY + relZ * relZ));
     atomicAdd(&cell[PG_INT_SMW], mw);
 
     // atomicMax on lastHitFrame: positive floats have same ordering as ints
     int frameAsInt = __float_as_int((float)frameIndex);
     atomicMax((int*)&cell[PG_LAST_HIT_FRAME], frameAsInt);
+}
+
+// Record a guided-vertex VISIT and its half-cell radiance statistics into
+// the EXACT (unjittered) cell. These drive subdivision. Two deliberate
+// contrasts with pathGuideTrainCell above:
+//  - NO radiance gate: the refinement budget must follow traffic
+//    (Mueller-style), not brightness. A visit that found no light still
+//    counts, and its zero log-radiance is exactly what makes a dark
+//    half-cell readable against a lit one.
+//  - RAW radiance (log1p of the reconstructed incident luminance), never
+//    Li/pdf: importance sampling flattens Li/pdf by design, so any
+//    pdf-divided statistic self-erases as the guide converges.
+// packed = (signZ<<31 | signY<<30 | signX<<29 | exactCellIdx), from raygen.
+__forceinline__ __device__ void pathGuideVisitCell(
+    const SparsePathGuideDescriptorDevice& grid,
+    unsigned int packed, float loLum)
+{
+    // Hard capacity bound: sparseCellDataPtr only rejects the INVALID
+    // sentinel, which a 28-bit-masked value can never equal — without this
+    // check a corrupt packed index becomes an out-of-bounds atomicAdd up to
+    // ~100 GB past the allocation instead of a dropped stat.
+    unsigned int idx = packed & 0x0FFFFFFFu;
+    if (idx >= grid.table.cell_capacity) return;
+    float* cell = sparseCellDataPtr(grid, idx);
+    if (cell == nullptr) return;
+    float mwL = log1pf(fmaxf(loLum, 0.0f));
+    if (!isfinite(mwL)) mwL = 0.0f;
+    atomicAdd(&cell[PG_INT_VISITS], 1.0f);
+    atomicAdd(&cell[PG_INT_SL], mwL);
+    if (packed & (1u << 29)) {
+        atomicAdd(&cell[PG_INT_HC_X], 1.0f);
+        atomicAdd(&cell[PG_INT_HL_X], mwL);
+    }
+    if (packed & (1u << 30)) {
+        atomicAdd(&cell[PG_INT_HC_Y], 1.0f);
+        atomicAdd(&cell[PG_INT_HL_Y], mwL);
+    }
+    if (packed & (1u << 31)) {
+        atomicAdd(&cell[PG_INT_HC_Z], 1.0f);
+        atomicAdd(&cell[PG_INT_HL_Z], mwL);
+    }
 }
 
 // Parallax-aware reprojection of a lobe mean toward the actual query vertex.

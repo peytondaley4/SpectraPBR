@@ -29,6 +29,14 @@ constexpr unsigned int ALPHA_MODE_OPAQUE = 0;
 constexpr unsigned int ALPHA_MODE_MASK   = 1;
 constexpr unsigned int ALPHA_MODE_BLEND  = 2;
 
+// NEE light-selection kinds — must match src/core/shared_types.h; packed
+// into the high byte of light-alias-table entries.
+constexpr unsigned int LIGHT_KIND_NONE  = 0;
+constexpr unsigned int LIGHT_KIND_POINT = 1;
+constexpr unsigned int LIGHT_KIND_DIR   = 2;
+constexpr unsigned int LIGHT_KIND_AREA  = 3;
+constexpr unsigned int LIGHT_KIND_ENV   = 4;
+
 // Quality modes
 constexpr unsigned int QUALITY_FAST     = 0;
 constexpr unsigned int QUALITY_BALANCED = 1;
@@ -257,6 +265,16 @@ struct GpuLaunchParams {
     float env_total_luminance;              // (host-side selection weight; unused on device)
     float _pad_env_cdf;
 
+    // Scene-light alias table (Walker/Vose) for O(1) NEE light selection —
+    // replaces the per-vertex linear luminance-CDF walk over all lights.
+    // Host-built by LightManager::syncToGpu from the SAME selection weights
+    // that sum to total_light_luminance; each entry packs (kind << 24 | index)
+    // with the LIGHT_KIND_* constants.
+    const float* light_alias_prob;           // [light_alias_count] accept prob
+    const unsigned int* light_alias_idx;     // [light_alias_count] fallback bucket
+    const unsigned int* light_alias_entries; // [light_alias_count] packed kind/index
+    unsigned int light_alias_count;
+
     // Quality and rendering settings
     unsigned int quality_mode;
     unsigned int samples_per_pixel;     // SPP per frame (higher = less noise, slower)
@@ -306,7 +324,7 @@ struct GpuLaunchParams {
     float tan_half_fov_y;               // tanf(camera.fovY * 0.5f)
     float tan_half_fov_x;               // tan_half_fov_y * camera.aspectRatio
     float pixel_world_size;             // (2 * tan_half_fov_y) / height
-    float _pad_tail;
+    unsigned int path_guide_training;   // 1 = deposit training samples (host refits are running)
 
     // Denoiser AOV guide buffers (progressive average, same frame counter)
     float4* aov_albedo_buffer;          // First-hit baseColor

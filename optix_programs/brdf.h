@@ -349,17 +349,53 @@ __forceinline__ __device__ float specularSelectProb(
     return clamp(specW / total, 0.1f, 0.9f);
 }
 
+// Fraction of the NON-specular selection budget spent on the sheen leg — a
+// uniform-hemisphere proposal for the Charlie sheen lobe. Charlie's energy
+// sits at grazing angles where neither the cosine nor the VNDF proposal has
+// mass, so strong-sheen materials (velvet/cloth) otherwise get their sheen
+// only through badly-matched proposals — variance the firefly clamp then
+// turns into visible energy loss. Uniform-hemisphere is the standard
+// proposal for Charlie (Estevez & Kulla 2017): it keeps grazing directions
+// reachable at O(1/2pi) density. Deterministic in the material, so
+// sampler / mixture PDF / NEE MIS recompute it identically (same contract
+// as specularSelectProb). Capped at 0.5 so the cosine leg is never starved.
+__forceinline__ __device__ float sheenSelectProb(
+    const float3& sheenColor, const float3& baseColor, float metallic,
+    unsigned int quality)
+{
+    if (quality == QUALITY_FAST) return 0.0f;  // FAST evaluates pure Lambert
+    float lumSheen = luminance3(sheenColor);
+    if (lumSheen <= 0.0f) return 0.0f;
+    float lumDiff = (1.0f - metallic) * luminance3(baseColor);
+    return fminf(lumSheen / (lumSheen + lumDiff + 1e-4f), 0.5f);
+}
+
+// Uniform hemisphere sampling (the sheen leg's proposal)
+__forceinline__ __device__ float3 sampleUniformHemisphere(float u1, float u2) {
+    float z = u1;
+    float r = sqrtf(fmaxf(1.0f - z * z, 0.0f));
+    float phi = 2.0f * M_PI * u2;
+    float sinPhi, cosPhi;
+    sincosf(phi, &sinPhi, &cosPhi);
+    return make_float3(r * cosPhi, r * sinPhi, z);
+}
+
+#define PDF_UNIFORM_HEMISPHERE (1.0f / (2.0f * M_PI))
+
 // Mixture PDF for direction L given view V and shading normal N.
-// pSpec must come from specularSelectProb with the same inputs the sampler used.
+// pSpec / pSheen must come from specularSelectProb / sheenSelectProb with the
+// same inputs the sampler used.
 __forceinline__ __device__ float pdfBSDFMixture(
     const float3& V, const float3& L, const float3& N,
-    float roughness, float pSpec)
+    float roughness, float pSpec, float pSheen)
 {
     float NdotL = dot(N, L);
     if (NdotL <= 0.0f) return 0.0f;
 
+    // Non-specular leg: cosine diffuse blended with the uniform sheen proposal
     float pdfDiffuse = NdotL / M_PI;
-    if (pSpec <= 0.0f) return pdfDiffuse;
+    float pdfDiffLeg = (1.0f - pSheen) * pdfDiffuse + pSheen * PDF_UNIFORM_HEMISPHERE;
+    if (pSpec <= 0.0f) return pdfDiffLeg;
 
     float3 H = normalize(V + L);
     float NdotH = fmaxf(dot(N, H), 0.0f);
@@ -367,14 +403,14 @@ __forceinline__ __device__ float pdfBSDFMixture(
     float alpha = fmaxf(roughness * roughness, 0.001f);
     float pdfSpec = pdfGGXVNDF(D_GGX(NdotH, alpha), G1_GGX(NdotV, alpha), NdotV);
 
-    return pSpec * pdfSpec + (1.0f - pSpec) * pdfDiffuse;
+    return pSpec * pdfSpec + (1.0f - pSpec) * pdfDiffLeg;
 }
 
 // Sample a direction from the diffuse/specular mixture.
 // Returns false if the sampled direction is below the shading hemisphere.
 __forceinline__ __device__ bool sampleBSDFMixture(
     const float3& V, const float3& N,
-    float roughness, float pSpec,
+    float roughness, float pSpec, float pSheen,
     float uSelect, float u1, float u2,
     float3& outL)
 {
@@ -390,8 +426,11 @@ __forceinline__ __device__ bool sampleBSDFMixture(
         float3 H = T * Hl.x + B * Hl.y + N * Hl.z;
         L = 2.0f * dot(V, H) * H - V;
     } else {
-        // Diffuse: cosine-weighted hemisphere
-        float3 Ll = sampleCosineHemisphere(u1, u2);
+        // Non-specular: remap the leftover select variable (uniform given
+        // uSelect >= pSpec) to choose sheen-uniform vs cosine diffuse.
+        float rSel = (uSelect - pSpec) / fmaxf(1.0f - pSpec, 1e-6f);
+        float3 Ll = (rSel < pSheen) ? sampleUniformHemisphere(u1, u2)
+                                    : sampleCosineHemisphere(u1, u2);
         L = T * Ll.x + B * Ll.y + N * Ll.z;
     }
 
@@ -416,6 +455,7 @@ __forceinline__ __device__ float3 evalPbrBSDF(
     const float3& sheenColor, float sheenRoughness,
     unsigned int quality,
     float pSpec,        // from specularSelectProb (same inputs as the sampler)
+    float pSheen,       // from sheenSelectProb (same inputs as the sampler)
     float* outPdf)      // optional: mixture PDF of L (nullptr to skip)
 {
     float NdotL = dot(N, L);
@@ -446,7 +486,8 @@ __forceinline__ __device__ float3 evalPbrBSDF(
     if (outPdf) {
         float pdfSpec = pdfGGXVNDF(D, G1V, NdotV);
         float pdfDiff = NdotL / M_PI;
-        *outPdf = pSpec * pdfSpec + (1.0f - pSpec) * pdfDiff;
+        float pdfDiffLeg = (1.0f - pSheen) * pdfDiff + pSheen * PDF_UNIFORM_HEMISPHERE;
+        *outPdf = pSpec * pdfSpec + (1.0f - pSpec) * pdfDiffLeg;
     }
 
     // Exact Fresnel (dielectric / conductor dispatch)
@@ -555,17 +596,20 @@ __forceinline__ __device__ float3 equirectangularToDirection(float u, float v) {
 // alias tables (prob[], alias[]) and the per-texel pmf once at load.
 //
 // Unbiasedness: environmentPdf() (the MIS density) reads the SAME pmf the
-// sampler uses, so the two stay in exact lockstep. Reusing the fractional part
-// of xi1*N as the accept test is valid — for xi1 uniform, frac(xi1*N) is
-// uniform on [0,1) and independent of the chosen bucket.
+// sampler uses, so the two stay in exact lockstep. The accept test takes its
+// OWN random number (xiAccept): reusing frac(xi1*N) only works in exact
+// arithmetic — a float xi1 has 24 mantissa bits, and for a 2K map (N = 2^21)
+// the recovered fraction is quantized to ~3 bits in the upper buckets,
+// skewing per-texel selection away from the pmf the MIS density divides by
+// (a bias accumulation converges TO, growing with env resolution).
 //------------------------------------------------------------------------------
 
 // Sample a direction from the environment proportional to sin(theta)-weighted
 // luminance via the alias table. Returns the direction and its solid-angle PDF.
-// xi1 picks the bucket (its fractional part is the accept/alias test); xi2, xi3
+// xi1 picks the bucket, xiAccept drives the accept/alias test; xi2, xi3
 // jitter the sample uniformly inside the chosen texel.
 __forceinline__ __device__ float3 sampleEnvironmentDirection(
-    float xi1, float xi2, float xi3,
+    float xi1, float xiAccept, float xi2, float xi3,
     const float* aliasProb,             // [W*H] bucket accept-probabilities
     const unsigned int* aliasIdx,       // [W*H] bucket fallback texels
     const float* pmf,                   // [W*H] per-texel selection probability
@@ -574,11 +618,9 @@ __forceinline__ __device__ float3 sampleEnvironmentDirection(
     float& outPdf)
 {
     unsigned int n = envWidth * envHeight;
-    float scaled = xi1 * (float)n;
-    unsigned int bucket = (unsigned int)scaled;
+    unsigned int bucket = (unsigned int)(xi1 * (float)n);
     if (bucket >= n) bucket = n - 1;
-    float frac = scaled - (float)bucket;        // uniform[0,1), independent of bucket
-    unsigned int texel = (frac < aliasProb[bucket]) ? bucket : aliasIdx[bucket];
+    unsigned int texel = (xiAccept < aliasProb[bucket]) ? bucket : aliasIdx[bucket];
 
     unsigned int col = texel % envWidth;
     unsigned int row = texel / envWidth;

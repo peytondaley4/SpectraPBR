@@ -74,6 +74,20 @@ bool PathGuideGrid::init(const PathGuideGridConfig& config) {
                   << config.per_level_scale << ")\n";
         return false;
     }
+    // Packed keys reserve 48 bits for the Morton code (16 bits per axis);
+    // the level field lives above it. The finest level's per-axis resolution
+    // must therefore fit in 16 bits, or Morton bits would silently corrupt
+    // the level field and alias keys across levels.
+    {
+        const uint64_t finestRes = (uint64_t)config.base_resolution << config.max_level;
+        if (config.max_level >= MAX_LEVELS || finestRes > (1ull << 16)) {
+            std::cerr << "[PathGuideGrid] base_resolution " << config.base_resolution
+                      << " * 2^max_level " << config.max_level
+                      << " exceeds the 48-bit Morton key budget (finest per-axis"
+                         " resolution must be <= 65536)\n";
+            return false;
+        }
+    }
     // Hash sizing below doubles to 2x capacity in a uint32 — keep headroom.
     if (config.cell_capacity == 0 || config.cell_capacity > (1u << 28)) {
         std::cerr << "[PathGuideGrid] cell_capacity " << config.cell_capacity
@@ -136,6 +150,21 @@ bool PathGuideGrid::init(const PathGuideGridConfig& config) {
         return false;
     }
 
+    // Subdivision-pass statistics (console diagnostics)
+    err = cudaMalloc(&m_subdivStats, PG_SUBDIV_STATS_SIZE * sizeof(uint32_t));
+    if (err != cudaSuccess) return fail("subdiv stats", err);
+    cudaMemset(m_subdivStats, 0, PG_SUBDIV_STATS_SIZE * sizeof(uint32_t));
+    err = cudaMallocHost(&m_pinnedSubdivStats, PG_SUBDIV_STATS_SIZE * sizeof(uint32_t));
+    if (err != cudaSuccess) return fail("pinned subdiv stats", err);
+    err = cudaEventCreateWithFlags(&m_subdivStatsEvent, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        std::cerr << "[PathGuideGrid] subdiv stats event create failed: "
+                  << cudaGetErrorString(err) << "\n";
+        shutdown();
+        return false;
+    }
+    m_subdivStatsInFlight = false;
+
     m_countInFlight = false;
     m_lastCellCount = 0;
     m_hostKeys.clear();
@@ -156,6 +185,14 @@ void PathGuideGrid::shutdown() {
         m_countEvent = nullptr;
     }
     if (m_pinnedCount) { cudaFreeHost(m_pinnedCount); m_pinnedCount = nullptr; }
+    if (m_subdivStatsEvent) {
+        cudaEventSynchronize(m_subdivStatsEvent);
+        cudaEventDestroy(m_subdivStatsEvent);
+        m_subdivStatsEvent = nullptr;
+    }
+    if (m_pinnedSubdivStats) { cudaFreeHost(m_pinnedSubdivStats); m_pinnedSubdivStats = nullptr; }
+    if (m_subdivStats) { cudaFree(m_subdivStats); m_subdivStats = nullptr; }
+    m_subdivStatsInFlight = false;
     if (m_hashKeys) { cudaFree(m_hashKeys); m_hashKeys = nullptr; }
     if (m_hashValues) { cudaFree(m_hashValues); m_hashValues = nullptr; }
     if (m_cellKeys) { cudaFree(m_cellKeys); m_cellKeys = nullptr; }
@@ -202,20 +239,56 @@ void PathGuideGrid::refitLobes(uint32_t currentFrame, cudaStream_t stream) {
                      m_config.refit_ema_decay, baseCellSize, currentFrame, stream);
 }
 
-void PathGuideGrid::runSubdivisionPass(uint32_t currentFrame, cudaStream_t stream) {
+void PathGuideGrid::runSubdivisionPass(uint32_t currentFrame, uint32_t passId,
+                                       cudaStream_t stream) {
     if (!m_data || !m_cellCounter || !m_counterSnapshot) return;
     // Snapshot the allocation counter (stream-ordered) so the kernel only
     // processes cells that existed before the pass — children it inserts
     // must not cascade-subdivide within the same pass.
     cudaMemcpyAsync(m_counterSnapshot, m_cellCounter, sizeof(uint32_t),
                     cudaMemcpyDeviceToDevice, stream);
+    // Stats: only if the previous readback has been harvested (a stale
+    // in-flight copy must not race the new pass writing the same buffer).
+    uint32_t* stats = nullptr;
+    if (m_subdivStats && m_pinnedSubdivStats && !m_subdivStatsInFlight) {
+        stats = m_subdivStats;
+        cudaMemsetAsync(stats, 0, PG_SUBDIV_STATS_SIZE * sizeof(uint32_t), stream);
+    }
+    // Mean level-0 cell edge for the resolution-limited test (same
+    // derivation as refitLobes' kappa cap — the two must agree).
+    float res0 = static_cast<float>(m_levelResolutions[0]);
+    float baseCellSize =
+        ((m_config.bounds_max[0] - m_config.bounds_min[0]) +
+         (m_config.bounds_max[1] - m_config.bounds_min[1]) +
+         (m_config.bounds_max[2] - m_config.bounds_min[2])) / (3.0f * res0);
     launchSubdivideCells(m_hashKeys, m_hashValues, m_hashTableSize, m_hashShift,
                          m_cellKeys, m_cellCounter, m_config.cell_capacity,
                          m_counterSnapshot,
                          m_data, m_entryStride,
-                         m_config.max_level, m_config.subdivide_count_threshold,
+                         m_config.max_level, m_config.start_level,
+                         m_config.subdivide_count_threshold,
                          m_config.subdivide_contrast_threshold,
-                         currentFrame, stream);
+                         baseCellSize,
+                         currentFrame, stats, stream);
+    if (stats) {
+        cudaMemcpyAsync(m_pinnedSubdivStats, stats,
+                        PG_SUBDIV_STATS_SIZE * sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaEventRecord(m_subdivStatsEvent, stream);
+        m_subdivStatsInFlight = true;
+        m_subdivStatsPassId = passId;
+    }
+}
+
+bool PathGuideGrid::pollSubdivStats(uint32_t out[], uint32_t* outPassId) {
+    if (!m_subdivStatsInFlight || !m_subdivStatsEvent) return false;
+    cudaError_t err = cudaEventQuery(m_subdivStatsEvent);
+    if (err == cudaErrorNotReady) return false;
+    m_subdivStatsInFlight = false;
+    if (err != cudaSuccess) return false;
+    for (uint32_t i = 0; i < PG_SUBDIV_STATS_SIZE; i++) out[i] = m_pinnedSubdivStats[i];
+    if (outPassId) *outPassId = m_subdivStatsPassId;
+    return true;
 }
 
 //------------------------------------------------------------------------------
@@ -377,7 +450,7 @@ PathGuideGrid::CellInspectionResult PathGuideGrid::inspectCellAtPosition(
         result.iy = iy;
         result.iz = iz;
 
-        // Read back just this cell (synchronous, 64 bytes — UI click only)
+        // Read back just this cell (synchronous, entry_stride floats — UI click only)
         cudaMemcpy(result.data, m_data + (size_t)it->second * m_entryStride,
                    m_entryStride * sizeof(float), cudaMemcpyDeviceToHost);
 

@@ -18,10 +18,17 @@
 //    transitions PENDING -> index (or FULL) exactly once, published with
 //    atomicExch after a __threadfence so the winner's payload initialization
 //    (lobe init + cell_keys) is visible before the index is.
-//  - Lookups use plain loads. A reader can transiently see a stale EMPTY or
-//    PENDING for a cell that another SM just inserted; both read as "miss",
+//  - Key probes use plain loads: a reader can transiently see a stale EMPTY
+//    or PENDING for a cell another SM just inserted; both read as "miss",
 //    which is benign — the vertex falls back to BSDF sampling for one frame.
 //    Readers never spin.
+//  - The PUBLISH words are read with __ldcg (L2, which atomics update): a
+//    plain L1 load could return a fresh index while cell_keys[idx] is stale
+//    in the same reader's L1, decoding a wrong cell center. The writer-side
+//    __threadfence orders the stores at L2, so reading both words through L2
+//    closes that window. The lobe payload needs no such treatment: kappa is
+//    initialized to 0 (never sampled before its first refit), and no reader
+//    can have cached a cell's payload before learning its index.
 //------------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
@@ -120,7 +127,7 @@ __forceinline__ __device__ unsigned int pgTableLookup(
     for (unsigned int i = 0; i < PG_MAX_PROBES; i++) {
         unsigned long long k = t.hash_keys[slot];
         if (k == key) {
-            unsigned int v = t.hash_values[slot];
+            unsigned int v = __ldcg(&t.hash_values[slot]);
             return (v >= PG_VALUE_MIN_SENTINEL) ? PG_INVALID_CELL : v;
         }
         if (k == PG_KEY_EMPTY) return PG_INVALID_CELL;
@@ -171,7 +178,7 @@ __forceinline__ __device__ unsigned int pgTableInsert(
             return idx;
         }
         if (prev == key) {
-            unsigned int v = t.hash_values[slot];
+            unsigned int v = __ldcg(&t.hash_values[slot]);
             return (v >= PG_VALUE_MIN_SENTINEL) ? PG_INVALID_CELL : v;
         }
         slot = (slot + 1) & mask;

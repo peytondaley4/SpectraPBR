@@ -8,9 +8,9 @@
 // or grid swap to maintain. What remains host-driven is launching:
 //   - the refit kernel (fold interval sums into EMA cumulative sums, refit
 //     each cell's vMF lobe in place), every few frames, and
-//   - the subdivision kernel (insert the 8 children of any mature cell whose
-//     radiance is spatially off-center — count gate x noise-floored contrast
-//     test), every refine interval.
+//   - the subdivision kernel (insert the 8 children of any cell passing the
+//     level-normalized visit gate AND the half-cell radiance structure
+//     test — see launchSubdivideCells), every refine interval.
 // Both are bounded by the device-side allocation counter — the host never
 // needs to know the cell count to launch them.
 //------------------------------------------------------------------------------
@@ -20,36 +20,54 @@
 
 namespace spectra {
 
+// Subdivision statistics buffer layout (uint32 counters, zeroed per pass):
+//   [0] parents split (passed both the visit gate and the structure test)
+//   [1] parents that passed the level-normalized visit gate
+//   [2] gate-passed parents whose half-cell radiance structure test failed
+//   [3] children actually inserted (new cells)
+//   [4..19] live cells per level 0..15 (histogram over the snapshot)
+constexpr uint32_t PG_SUBDIV_STAT_SPLIT      = 0;
+constexpr uint32_t PG_SUBDIV_STAT_ELIGIBLE   = 1;
+constexpr uint32_t PG_SUBDIV_STAT_NOSTRUCT   = 2;
+constexpr uint32_t PG_SUBDIV_STAT_CHILDREN   = 3;
+constexpr uint32_t PG_SUBDIV_STAT_LEVEL0     = 4;
+constexpr uint32_t PG_SUBDIV_STATS_SIZE      = 20;
+
 // Fold per-lobe interval sums into EMA cumulative sums and refit the cell's
 // vMF mixture (hard-assignment stepwise EM M-step; Banerjee/Sra kappa
-// approximation; dead-lobe re-seeding). kappa is capped geometry-aware:
-// a lobe fit over a cell of edge `cellSize` (derived from cellKeys level +
-// baseCellSize, halving per level) and consumed up to ~1 cell away by the
-// box-filter jitter must not be narrower than the borrowing error
-// cellSize/meanDist — so kappa <= (2*meanDist/cellSize)^2, with the flat
-// 2000 ceiling unlocked only past the slow-decayed maturity count. Must run
-// on the render stream so it is ordered against optixLaunch (shaders and the
-// refit never touch the cell data concurrently).
+// approximation; dead-lobe re-seeding). kappa is capped geometry-aware,
+// denominated in the measured DEPOSIT SPREAD about the parallax pivot (the
+// deposit centroid), not the cell size: sigmaPos = spreadRel * halfCell,
+// kappa <= (meanDist/sigmaPos)^2, floored at 8 — a compact light pool in a
+// coarse cell still earns a sharp, correctly-aimed lobe. The flat 2000
+// ceiling additionally requires slow-decayed maturity evidence AND the
+// cell's own (post-split) log-tamed weight mass. Must run on the render
+// stream so it is ordered against optixLaunch (shaders and the refit never
+// touch the cell data concurrently).
 void launchRefitCells(float* data, const uint64_t* cellKeys,
                       const uint32_t* cellCounter, uint32_t cellCapacity,
                       float emaDecay, float baseCellSize, uint32_t currentFrame,
                       cudaStream_t stream);
 
-// Subdivide cells straddling a spatial barrier: for every cell with level <
-// maxLevel that has >= minCount deposits and whose radiance centroid is
-// off-center (|centroid|^2 = sum_a S_a^2 / MW^2 above BOTH contrastThreshold
-// and a noise floor ~4/nEff, nEff = MW^2/Sum(mw^2)), insert its 8 children.
-// All spatial statistics use the log-tamed weight mw = log1p(w): raw Li/pdf
-// weights are heavy-tailed by nature exactly where refinement matters
-// (caustics), which would collapse nEff and block splitting forever, while a
-// single firefly could otherwise fake structure. Cells whose slow-decayed
-// MATURITY passes 8x minCount split regardless of contrast: a first-moment
-// centroid is blind to even-symmetric variation, and the hatch costs at most
-// one surplus level on genuinely uniform hot cells. The scale-invariant
-// centroid test refines only the boundary of a difference (caustic edge,
-// shadow line), not uniform regions.
-// Children warm-start with the parent's mixture and 1/8 of its cumulative
-// statistics so guiding (and the confidence ramp) survive the split.
+// Subdivide cells with (1) enough guided-vertex VISITS — traffic counted
+// with no radiance gate, threshold minVisits at startLevel and halved per
+// axis per level below it (floored at min(256, minVisits)) — and (2) either
+// genuine radiance STRUCTURE (per-axis half-cell conditional mean
+// log1p(radiance) ratio/difference at exact positions exceeding
+// hlrThreshold, per-half minimum visit floor) or a RESOLUTION-LIMITED guide
+// (a well-evidenced lobe's fitted kappa demand exceeds the spread-based cap
+// severalfold while the cap is still low — smooth near-field illumination
+// needs finer cells even without a radiance edge). The visit
+// gate makes ELIGIBILITY brightness-neutral (the old radiance-gated deposit
+// count only ever admitted bright cells — the root cause of brightness-
+// correlated refinement); the structure test makes the TRIGGER density-,
+// geometry-, and importance-sampling-invariant (every weighted-centroid
+// contrast variant failed on at least one of those — see the layout
+// header). There is no escape hatch and no lineage lock: the structure test
+// needs neither.
+// Children warm-start with the parent's full mixture, 1/8 of its per-lobe
+// evidence, and its FULL maturity (the mixture is verbatim, so confidence
+// must not drop); parent-frame spatial/visit statistics reset to zero.
 // Idempotent: existing children are left untouched, so re-running on an
 // already-subdivided parent only costs hash probes. Runs on the render
 // stream for the same ordering reason as the refit.
@@ -59,13 +77,17 @@ void launchRefitCells(float* data, const uint64_t* cellKeys,
 // blocks process children inserted earlier in the same pass — a warm-started
 // child inherits parent/8 evidence and could cascade-subdivide within one
 // pass, and its payload may still be mid-write.
+// stats (optional, may be null): PG_SUBDIV_STATS_SIZE uint32 counters,
+// zeroed by the caller before the pass (layout above).
 void launchSubdivideCells(uint64_t* hashKeys, uint32_t* hashValues,
                           uint32_t hashTableSize, uint32_t hashShift,
                           uint64_t* cellKeys, uint32_t* cellCounter, uint32_t cellCapacity,
                           const uint32_t* countSnapshot,
                           float* data, uint32_t entryStride,
-                          uint32_t maxLevel, float minCount, float contrastThreshold,
-                          uint32_t currentFrame,
+                          uint32_t maxLevel, uint32_t startLevel,
+                          float minVisits, float hlrThreshold,
+                          float baseCellSize,
+                          uint32_t currentFrame, uint32_t* stats,
                           cudaStream_t stream);
 
 // Reinitialize every allocated cell's lobes to the tetrahedral starting

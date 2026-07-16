@@ -18,9 +18,11 @@
 // Fitting: ON DEVICE — the refit kernel periodically folds interval sums into
 //   EMA cumulative sums and refits each lobe in place (path_guide_kernels.cu).
 // Refinement: ON DEVICE — the subdivision kernel inserts the 8 children of
-//   any cell whose EMA deposit count crossed a threshold (PPG-style
-//   sample-count criterion). Children warm-start from the parent. There is no
-//   coarsening: indices are stable and memory is bounded by cell_capacity.
+//   any cell with sufficient guided-vertex VISITS (traffic, level-normalized
+//   — Mueller-style eligibility, brightness-neutral) AND genuine radiance
+//   structure (per-axis half-cell log-radiance ratio). Children warm-start
+//   from the parent. There is no coarsening: indices are stable and memory
+//   is bounded by cell_capacity.
 // Lookup: top-down — probe the start level, descend while a finer cell
 //   containing the position exists (per_level_scale is fixed at 2, so finer
 //   cells are always proper octree children).
@@ -45,6 +47,7 @@
 #include <unordered_map>
 #include <vector>
 #include "path_guide_cell_layout.h"
+#include "path_guide_kernels.h"   // PG_SUBDIV_STAT_* layout for pollSubdivStats
 
 namespace spectra {
 
@@ -71,40 +74,30 @@ struct PathGuideGridConfig {
     uint32_t max_level = 6;                // Finest allowed level (subdivision cap)
     uint32_t refine_interval_frames = 30;  // Subdivision kernel cadence
 
-    // Subdivision is spatial-contrast driven, not raw sample count: a cell
-    // splits only when the radiance is spatially OFF-CENTER inside it, i.e. it
-    // straddles a barrier (caustic edge, shadow line). The trigger is the
-    // scale-invariant |centroid|^2 = sum_a S_a^2 / MW^2 (S_a = EMA
-    // Sum(mw*rel_a), MW = EMA Sum(mw), mw = log1p(w) — log-tamed so caustic-
-    // grade heavy tails neither block nor fake structure, rel in [-1,1])
-    // exceeding subdivide_contrast_threshold,
-    // gated by at least subdivide_count_threshold deposits so the centroid is
-    // meaningful. Because |centroid|^2 is independent of brightness, a uniform
-    // cell (bright OR dark) is never split and the grid no longer subdivides
-    // uniformly under flat primary visibility. Counts are in DEPOSIT units —
-    // deposits are subsampled by PG_TRAIN_PROB in raygen (currently 1/2). The contrast
-    // threshold is dimensionless in [0,3]; ~0.1 catches sharp edges. The
-    // kernel ALSO requires contrast to clear a per-cell noise floor ~4/nEff,
-    // nEff = MW^2/Sum(mw^2) (Kish effective sample size on the log-tamed
-    // weights): the centroid's noise is governed by nEff, not deposit count —
-    // an untamed firefly would otherwise fake spatial structure in a uniform
-    // cell, while caustic-grade heavy tails would collapse nEff and block
-    // real structure; log1p resolves both. Cells whose slow MATURITY passes
-    // 8x the count gate split regardless of contrast (first-moment centroids
-    // are blind to even-symmetric variation; costs at most one surplus level
-    // on hot uniform cells). Both thresholds are empirical — tune.
+    // Subdivision = VISIT sufficiency x RADIANCE STRUCTURE (both required):
     //
-    // The count gate is also a WELL-FED gate: a cell must be well-sampled
-    // before it splits, because (a) the centroid is only trustworthy with
-    // enough deposits and (b) each of the 8 children inherits just 1/8 of the
-    // parent's cumulative evidence (incl. the slow-decayed PG_MATURITY that
-    // drives the guide confidence ramp) — split too early and the children
-    // are born under-trained and stay noisy until they re-accumulate. At
-    // 2048, children start at ~256, comfortably trained. (Fast-EMA window is
-    // ~1/(1-decay) ≈ 6.7 refits, and cells reached the old 8192 rule, so 2048
-    // is well within reach.)
-    float subdivide_count_threshold = 2048.0f;      // min-sample / maturity gate
-    float subdivide_contrast_threshold = 0.12f;     // |centroid|^2 trigger, [0,3]
+    //  - subdivide_count_threshold is the VISIT gate at start_level, in
+    //    guided-vertex visits (fast-EMA units; visits are subsampled by
+    //    PG_TRAIN_PROB in raygen, currently 1/2). Visits are counted with NO
+    //    radiance gate, so eligibility follows camera/path traffic, not
+    //    brightness — the old radiance-gated deposit count only ever
+    //    admitted bright cells, which was the persistent root cause of
+    //    brightness-correlated refinement no trigger criterion could fix.
+    //    The kernel halves the gate per axis per level below start_level
+    //    (visits/cell fall ~4x per level for 2D surface traffic), floored
+    //    at 256 so the half-cell statistics stay trustworthy.
+    //
+    //  - subdivide_contrast_threshold is the STRUCTURE trigger: the largest
+    //    per-axis |log ratio| of conditional mean log1p(radiance) between
+    //    the cell's two halves (exact positions, eps-floored means, minimum
+    //    32 visits per half). ~0.7 separates real edges (hard lit/unlit
+    //    boundaries measure 1.7+) from smooth inverse-square falloff
+    //    (~0.26 at 4x across a cell) with a wide margin. Density-,
+    //    geometry-, and importance-sampling-invariant — the reasons every
+    //    weighted-centroid contrast variant failed are documented in
+    //    path_guide_cell_layout.h.
+    float subdivide_count_threshold = 2048.0f;      // visit gate at start_level
+    float subdivide_contrast_threshold = 0.7f;      // half-cell log-radiance ratio
 
     // Device refit: EMA decay applied to cumulative sums per refit. The
     // effective averaging window is refit_interval / (1 - decay) frames.
@@ -155,9 +148,21 @@ public:
     // place, on the render stream. Cheap — call every few frames.
     void refitLobes(uint32_t currentFrame, cudaStream_t stream);
 
-    // Insert children of well-fed cells (EMA count >= threshold). Render
-    // stream for ordering against optixLaunch. Cheap and idempotent.
-    void runSubdivisionPass(uint32_t currentFrame, cudaStream_t stream);
+    // Insert children of eligible cells (visit gate x structure test).
+    // Render stream for ordering against optixLaunch. Cheap and idempotent.
+    // Each pass also fills the subdivision stats buffer (split counts +
+    // level histogram) and kicks an async readback tagged with passId —
+    // unless a previous readback is still in flight, in which case the pass
+    // runs without stats (at most one readback outstanding).
+    void runSubdivisionPass(uint32_t currentFrame, uint32_t passId,
+                            cudaStream_t stream);
+
+    // Harvest the stats of the most recently COMPLETED subdivision pass.
+    // Non-blocking; returns true at most once per pass (layout:
+    // PG_SUBDIV_STAT_* in path_guide_kernels.h). outPassId receives the
+    // passId given to the pass the stats belong to.
+    bool pollSubdivStats(uint32_t out[/*PG_SUBDIV_STATS_SIZE*/],
+                         uint32_t* outPassId = nullptr);
 
     // Non-blocking cell-count poll for the UI: each call first harvests a
     // previously completed copy, then kicks off a fresh 4-byte async copy.
@@ -225,6 +230,13 @@ private:
     cudaEvent_t m_countEvent = nullptr;
     bool m_countInFlight = false;
     uint32_t m_lastCellCount = 0;
+
+    // ── Subdivision-pass statistics (async readback, console diagnostics) ──
+    uint32_t* m_subdivStats = nullptr;        // device, PG_SUBDIV_STATS_SIZE
+    uint32_t* m_pinnedSubdivStats = nullptr;  // pinned host copy
+    cudaEvent_t m_subdivStatsEvent = nullptr;
+    bool m_subdivStatsInFlight = false;
+    uint32_t m_subdivStatsPassId = 0;         // passId of the in-flight readback
 
     // ── Host debug mirror (refreshHostMirror) ──
     std::vector<uint64_t> m_hostKeys;                    // [count] packed keys

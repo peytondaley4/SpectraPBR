@@ -264,15 +264,11 @@ bool SceneManager::buildIAS() {
 
     OptixDeviceContext context = m_optixEngine->getContext();
 
-    // Free old IAS
-    if (m_iasBuffer) {
-        cudaFree(reinterpret_cast<void*>(m_iasBuffer));
-        m_iasBuffer = 0;
-    }
-    if (m_instanceBuffer) {
-        cudaFree(reinterpret_cast<void*>(m_instanceBuffer));
-        m_instanceBuffer = 0;
-    }
+    // Note: the old IAS/instance buffers are NOT freed up front. They are
+    // persistent and reused in place (transform drags rebuild every event —
+    // free/malloc pairs both device-sync and fragment), and on growth the
+    // new buffer is allocated before the old is freed so any failure below
+    // leaves the previous IAS and m_iasHandle fully intact.
 
     // Build OptixInstance array
     std::vector<OptixInstance> optixInstances(m_instances.size());
@@ -296,12 +292,19 @@ bool SceneManager::buildIAS() {
         oi.traversableHandle = gas.handle;
     }
 
-    // Upload instances to GPU
+    // Upload instances to GPU (persistent buffer, grows only)
     size_t instancesSize = sizeof(OptixInstance) * optixInstances.size();
-    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&m_instanceBuffer), instancesSize);
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate instance buffer: " << cudaGetErrorString(err) << "\n";
-        return false;
+    cudaError_t err;
+    if (optixInstances.size() > m_instanceBufferCapacity) {
+        CUdeviceptr newBuffer = 0;
+        err = cudaMalloc(reinterpret_cast<void**>(&newBuffer), instancesSize);
+        if (err != cudaSuccess) {
+            std::cerr << "[SceneManager] Failed to allocate instance buffer: " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+        if (m_instanceBuffer) cudaFree(reinterpret_cast<void*>(m_instanceBuffer));
+        m_instanceBuffer = newBuffer;
+        m_instanceBufferCapacity = optixInstances.size();
     }
     err = cudaMemcpy(reinterpret_cast<void*>(m_instanceBuffer), optixInstances.data(),
                      instancesSize, cudaMemcpyHostToDevice);
@@ -348,13 +351,19 @@ bool SceneManager::buildIAS() {
         m_tempBufferSize = bufferSizes.tempSizeInBytes;
     }
 
-    // Allocate IAS buffer
-    err = cudaMalloc(reinterpret_cast<void**>(&m_iasBuffer), bufferSizes.outputSizeInBytes);
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate IAS buffer: " << cudaGetErrorString(err) << "\n";
-        return false;
+    // IAS output buffer: reuse the existing allocation when it still fits
+    // (steady-state transform edits), grow with alloc-before-free otherwise.
+    if (bufferSizes.outputSizeInBytes > m_iasBufferSize) {
+        CUdeviceptr newBuffer = 0;
+        err = cudaMalloc(reinterpret_cast<void**>(&newBuffer), bufferSizes.outputSizeInBytes);
+        if (err != cudaSuccess) {
+            std::cerr << "[SceneManager] Failed to allocate IAS buffer: " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+        if (m_iasBuffer) cudaFree(reinterpret_cast<void*>(m_iasBuffer));
+        m_iasBuffer = newBuffer;
+        m_iasBufferSize = bufferSizes.outputSizeInBytes;
     }
-    m_iasBufferSize = bufferSizes.outputSizeInBytes;
 
     // Build IAS
     res = optixAccelBuild(
@@ -366,7 +375,7 @@ bool SceneManager::buildIAS() {
         m_tempBuffer,
         bufferSizes.tempSizeInBytes,
         m_iasBuffer,
-        bufferSizes.outputSizeInBytes,
+        m_iasBufferSize,
         &m_iasHandle,
         nullptr,
         0
@@ -377,26 +386,8 @@ bool SceneManager::buildIAS() {
         return false;
     }
 
-    // Build buffer pointer arrays for shader access
-    if (m_d_vertexBuffers) {
-        cudaFree(m_d_vertexBuffers);
-    }
-    if (m_d_indexBuffers) {
-        cudaFree(m_d_indexBuffers);
-    }
-    if (m_d_instanceTransforms) {
-        cudaFree(m_d_instanceTransforms);
-        m_d_instanceTransforms = nullptr;
-    }
-    if (m_d_instanceNormalTransforms) {
-        cudaFree(m_d_instanceNormalTransforms);
-        m_d_instanceNormalTransforms = nullptr;
-    }
-    if (m_d_instanceMaterialIndices) {
-        cudaFree(m_d_instanceMaterialIndices);
-        m_d_instanceMaterialIndices = nullptr;
-    }
-
+    // Build buffer pointer arrays for shader access (persistent, grow-only —
+    // allocated further below once the host-side staging is filled)
     std::vector<CUdeviceptr> vertexPtrs(m_instances.size());
     std::vector<CUdeviceptr> indexPtrs(m_instances.size());
     std::vector<float> transforms(m_instances.size() * 12);
@@ -435,41 +426,48 @@ bool SceneManager::buildIAS() {
         n[8] = c20 * invDet; n[9] = c21 * invDet; n[10] = c22 * invDet; n[11] = 0.0f;
     }
 
+    // Grow the five aux arrays together: allocate ALL new buffers first, so
+    // any failure leaves the previous (still-valid) arrays untouched.
+    if (m_instances.size() > m_bufferArrayCapacity) {
+        const size_t n = m_instances.size();
+        CUdeviceptr* newVertex = nullptr;
+        CUdeviceptr* newIndex = nullptr;
+        float* newTransforms = nullptr;
+        float* newNormalTransforms = nullptr;
+        uint32_t* newMaterialIndices = nullptr;
+        bool ok =
+            cudaMalloc(reinterpret_cast<void**>(&newVertex), sizeof(CUdeviceptr) * n) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&newIndex), sizeof(CUdeviceptr) * n) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&newTransforms), sizeof(float) * n * 12) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&newNormalTransforms), sizeof(float) * n * 12) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&newMaterialIndices), sizeof(uint32_t) * n) == cudaSuccess;
+        if (!ok) {
+            std::cerr << "[SceneManager] Failed to allocate instance data arrays\n";
+            if (newVertex) cudaFree(newVertex);
+            if (newIndex) cudaFree(newIndex);
+            if (newTransforms) cudaFree(newTransforms);
+            if (newNormalTransforms) cudaFree(newNormalTransforms);
+            if (newMaterialIndices) cudaFree(newMaterialIndices);
+            return false;
+        }
+        if (m_d_vertexBuffers) cudaFree(m_d_vertexBuffers);
+        if (m_d_indexBuffers) cudaFree(m_d_indexBuffers);
+        if (m_d_instanceTransforms) cudaFree(m_d_instanceTransforms);
+        if (m_d_instanceNormalTransforms) cudaFree(m_d_instanceNormalTransforms);
+        if (m_d_instanceMaterialIndices) cudaFree(m_d_instanceMaterialIndices);
+        m_d_vertexBuffers = newVertex;
+        m_d_indexBuffers = newIndex;
+        m_d_instanceTransforms = newTransforms;
+        m_d_instanceNormalTransforms = newNormalTransforms;
+        m_d_instanceMaterialIndices = newMaterialIndices;
+        m_bufferArrayCapacity = n;
+    }
     m_bufferArraySize = m_instances.size();
 
-    err = cudaMalloc(reinterpret_cast<void**>(&m_d_vertexBuffers), sizeof(CUdeviceptr) * m_bufferArraySize);
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate vertex buffer array: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
     cudaMemcpy(m_d_vertexBuffers, vertexPtrs.data(), sizeof(CUdeviceptr) * m_bufferArraySize, cudaMemcpyHostToDevice);
-
-    err = cudaMalloc(reinterpret_cast<void**>(&m_d_indexBuffers), sizeof(CUdeviceptr) * m_bufferArraySize);
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate index buffer array: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
     cudaMemcpy(m_d_indexBuffers, indexPtrs.data(), sizeof(CUdeviceptr) * m_bufferArraySize, cudaMemcpyHostToDevice);
-
-    err = cudaMalloc(reinterpret_cast<void**>(&m_d_instanceTransforms), sizeof(float) * transforms.size());
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate instance transforms: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
     cudaMemcpy(m_d_instanceTransforms, transforms.data(), sizeof(float) * transforms.size(), cudaMemcpyHostToDevice);
-
-    err = cudaMalloc(reinterpret_cast<void**>(&m_d_instanceNormalTransforms), sizeof(float) * normalTransforms.size());
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate instance normal transforms: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
     cudaMemcpy(m_d_instanceNormalTransforms, normalTransforms.data(), sizeof(float) * normalTransforms.size(), cudaMemcpyHostToDevice);
-
-    err = cudaMalloc(reinterpret_cast<void**>(&m_d_instanceMaterialIndices), sizeof(uint32_t) * materialIndices.size());
-    if (err != cudaSuccess) {
-        std::cerr << "[SceneManager] Failed to allocate instance material indices: " << cudaGetErrorString(err) << "\n";
-        return false;
-    }
     cudaMemcpy(m_d_instanceMaterialIndices, materialIndices.data(), sizeof(uint32_t) * materialIndices.size(), cudaMemcpyHostToDevice);
 
     std::cout << "[SceneManager] Built IAS with " << m_instances.size()
@@ -540,6 +538,10 @@ void SceneManager::clear() {
         m_instanceBuffer = 0;
     }
     m_iasHandle = 0;
+    m_iasBufferSize = 0;
+    m_instanceBufferCapacity = 0;
+    m_bufferArraySize = 0;
+    m_bufferArrayCapacity = 0;
 
     // Free buffer arrays
     if (m_d_vertexBuffers) {

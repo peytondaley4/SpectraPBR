@@ -125,6 +125,10 @@ public:
     void setDirectionalLights(GpuDirectionalLight* lights, uint32_t count);
     void setAreaLights(GpuAreaLight* lights, uint32_t count);
     void setTotalLightLuminance(float luminance);
+    // Scene-light alias table for O(1) NEE selection (device pointers owned
+    // by LightManager); pass nullptrs/0 to disable.
+    void setLightAliasTable(const float* prob, const uint32_t* aliasIdx,
+                            const uint32_t* entries, uint32_t count);
 
     // Set environment map
     void setEnvironmentMap(cudaTextureObject_t envMap, float intensity);
@@ -163,6 +167,7 @@ public:
     // Path guide grid (device-resident cell table)
     void setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sparse);
     void setPathGuideEnabled(bool enabled);
+    void setPathGuideTraining(bool training);
     void setPathGuideMISWeight(float weight);
     void setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel);
 
@@ -221,11 +226,17 @@ private:
     LaunchParams m_launchParams = {};
     CUdeviceptr m_launchParamsBuffer = 0;
 
-    // Double-buffered pinned launch params for truly async H2D upload.
+    // Pinned launch-params staging ring for truly async H2D upload.
     // cudaMemcpyAsync from pageable memory implicitly synchronizes the stream,
     // blocking the CPU for the entire previous frame's GPU time (~50ms at 20 FPS).
-    // Pinned memory eliminates this per-frame CPU stall.
-    LaunchParams* m_pinnedLaunchParams[2] = { nullptr, nullptr };
+    // Pinned memory eliminates this per-frame CPU stall. The ring is deeper
+    // than the render pipeline (triple-buffered PBOs let the CPU run ~3
+    // frames ahead), and each slot has an event recorded after its H2D copy:
+    // a slot is never rewritten while its copy is still in flight, which
+    // with 2 slots could hand the GPU a torn LaunchParams.
+    static constexpr int kLaunchParamSlots = 4;
+    LaunchParams* m_pinnedLaunchParams[kLaunchParamSlots] = {};
+    cudaEvent_t m_pinnedLaunchEvents[kLaunchParamSlots] = {};
     int m_pinnedLaunchIdx = 0;
 
     // State

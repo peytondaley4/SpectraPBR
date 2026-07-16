@@ -55,11 +55,16 @@ bool OptixEngine::init(CUcontext cudaContext) {
         return false;
     }
 
-    // Allocate double-buffered pinned launch params for async H2D upload
-    for (int i = 0; i < 2; i++) {
+    // Allocate the pinned launch-params staging ring for async H2D upload
+    for (int i = 0; i < kLaunchParamSlots; i++) {
         err = cudaMallocHost(&m_pinnedLaunchParams[i], sizeof(LaunchParams));
         if (err != cudaSuccess) {
             std::cerr << "[OptiX] Failed to allocate pinned launch params[" << i << "]: " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+        err = cudaEventCreateWithFlags(&m_pinnedLaunchEvents[i], cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            std::cerr << "[OptiX] Failed to create launch params event[" << i << "]: " << cudaGetErrorString(err) << "\n";
             return false;
         }
     }
@@ -144,7 +149,14 @@ bool OptixEngine::init(CUcontext cudaContext) {
     m_launchParams.path_guide_cell_counter = nullptr;
     m_launchParams.path_guide_cell_capacity = 0;
     m_launchParams.path_guide_enabled = 0;     // Disabled by default
+    m_launchParams.path_guide_training = 0;    // No deposits until the app enables refits
     m_launchParams.path_guide_mis_weight = 0.5f;  // Conservative: guide needs time to converge
+
+    // Scene-light alias table (set by LightManager::syncToGpu)
+    m_launchParams.light_alias_prob = nullptr;
+    m_launchParams.light_alias_idx = nullptr;
+    m_launchParams.light_alias_entries = nullptr;
+    m_launchParams.light_alias_count = 0;
     // Adaptive level parameters (defaults, updated when grid is set)
     m_launchParams.path_guide_start_level = 2;
     m_launchParams.path_guide_min_level = 1;
@@ -638,7 +650,12 @@ void OptixEngine::shutdown() {
         cudaFree(reinterpret_cast<void*>(m_launchParamsBuffer));
         m_launchParamsBuffer = 0;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < kLaunchParamSlots; i++) {
+        if (m_pinnedLaunchEvents[i]) {
+            cudaEventSynchronize(m_pinnedLaunchEvents[i]);
+            cudaEventDestroy(m_pinnedLaunchEvents[i]);
+            m_pinnedLaunchEvents[i] = nullptr;
+        }
         if (m_pinnedLaunchParams[i]) {
             cudaFreeHost(m_pinnedLaunchParams[i]);
             m_pinnedLaunchParams[i] = nullptr;
@@ -777,7 +794,11 @@ void OptixEngine::render(float4* outputBuffer, cudaStream_t stream) {
     // blocking the CPU for the entire previous frame's GPU time. Pinned memory
     // eliminates this stall, letting the CPU stay ahead of the GPU.
     int idx = m_pinnedLaunchIdx;
-    m_pinnedLaunchIdx = 1 - m_pinnedLaunchIdx;
+    m_pinnedLaunchIdx = (m_pinnedLaunchIdx + 1) % kLaunchParamSlots;
+    // Never rewrite a slot whose H2D copy is still in flight (the CPU can run
+    // several frames ahead of the GPU). Normally a no-op: the ring is deeper
+    // than the pipeline, so this only blocks in pathological backlogs.
+    cudaEventSynchronize(m_pinnedLaunchEvents[idx]);
     std::memcpy(m_pinnedLaunchParams[idx], &m_launchParams, sizeof(LaunchParams));
     cudaMemcpyAsync(
         reinterpret_cast<void*>(m_launchParamsBuffer),
@@ -786,6 +807,7 @@ void OptixEngine::render(float4* outputBuffer, cudaStream_t stream) {
         cudaMemcpyHostToDevice,
         stream
     );
+    cudaEventRecord(m_pinnedLaunchEvents[idx], stream);
 
     // Launch OptiX
     OptixResult result = optixLaunch(
@@ -824,6 +846,14 @@ void OptixEngine::setAreaLights(GpuAreaLight* lights, uint32_t count) {
 
 void OptixEngine::setTotalLightLuminance(float luminance) {
     m_launchParams.total_light_luminance = luminance;
+}
+
+void OptixEngine::setLightAliasTable(const float* prob, const uint32_t* aliasIdx,
+                                     const uint32_t* entries, uint32_t count) {
+    m_launchParams.light_alias_prob = prob;
+    m_launchParams.light_alias_idx = aliasIdx;
+    m_launchParams.light_alias_entries = entries;
+    m_launchParams.light_alias_count = count;
 }
 
 void OptixEngine::setEnvironmentMap(cudaTextureObject_t envMap, float intensity) {
@@ -959,6 +989,10 @@ void OptixEngine::setPathGuideGridDescriptor(const SparsePathGuideDescriptor* sp
 
 void OptixEngine::setPathGuideEnabled(bool enabled) {
     m_launchParams.path_guide_enabled = enabled ? 1u : 0u;
+}
+
+void OptixEngine::setPathGuideTraining(bool training) {
+    m_launchParams.path_guide_training = training ? 1u : 0u;
 }
 
 void OptixEngine::setPathGuideLevelConfig(uint32_t startLevel, uint32_t minLevel, uint32_t maxLevel) {

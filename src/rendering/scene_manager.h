@@ -117,16 +117,22 @@ private:
     // Loaded model paths for serialization
     std::vector<std::string> m_loadedModelPaths;
 
-    // IAS (top-level acceleration structure)
+    // IAS (top-level acceleration structure). Buffers are persistent and
+    // grow-only: transform edits rebuild the IAS every drag event, so the
+    // steady-state rebuild must not malloc/free (cudaFree device-syncs), and
+    // growth allocates the new buffer BEFORE freeing the old so a failed
+    // allocation never leaves m_iasHandle pointing at freed memory.
     OptixTraversableHandle m_iasHandle = 0;
     CUdeviceptr m_iasBuffer = 0;
-    size_t m_iasBufferSize = 0;
+    size_t m_iasBufferSize = 0;             // current allocation (capacity) in bytes
     CUdeviceptr m_instanceBuffer = 0;
+    size_t m_instanceBufferCapacity = 0;    // in instances
 
-    // Buffer pointer arrays for shader access
+    // Buffer pointer arrays for shader access (persistent, grow-only)
     CUdeviceptr* m_d_vertexBuffers = nullptr;
     CUdeviceptr* m_d_indexBuffers = nullptr;
     size_t m_bufferArraySize = 0;
+    size_t m_bufferArrayCapacity = 0;       // in instances (all five aux arrays)
 
     // Per-instance data for raygen-side shading: 3x4 object->world transform,
     // 3x4 inverse-transpose (normal) transform, and material slot index

@@ -68,6 +68,12 @@ bool OptixDenoiserWrapper::resize(uint32_t width, uint32_t height) {
         return false;
     }
 
+    // Invalidate the current dims BEFORE freeing: if any allocation below
+    // fails, a later resize back to the old size must not early-return
+    // "already sized" and invoke the denoiser on freed state.
+    m_width = 0;
+    m_height = 0;
+
     // Free old buffers
     if (m_stateBuffer) { cudaFree(reinterpret_cast<void*>(m_stateBuffer)); m_stateBuffer = 0; }
     if (m_scratchBuffer) { cudaFree(reinterpret_cast<void*>(m_scratchBuffer)); m_scratchBuffer = 0; }

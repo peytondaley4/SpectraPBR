@@ -92,6 +92,31 @@ bool Application::parseArgs(int argc, char* argv[]) {
         if (arg == "--remote" || arg == "-r") {
             m_config.remoteMode = true;
             m_remoteMode = true;
+        } else if (arg == "--guide" || arg == "-g") {
+            m_config.enableGuiding = true;
+        } else if (arg == "--test-move-light" && i + 1 < argc) {
+            // frame,dx,dy,dz — self-test: translate the first mesh-light
+            // instance at the given frame via the UI edit path
+            float v[4];
+            if (sscanf(argv[++i], "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4) {
+                m_config.testMoveFrame = static_cast<int>(v[0]);
+                m_config.testMoveDelta[0] = v[1];
+                m_config.testMoveDelta[1] = v[2];
+                m_config.testMoveDelta[2] = v[3];
+            }
+        } else if (arg == "--cam" && i + 1 < argc) {
+            // --cam px,py,pz[,tx,ty,tz]
+            float v[6];
+            int n = sscanf(argv[++i], "%f,%f,%f,%f,%f,%f",
+                           &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+            if (n >= 3) {
+                m_config.hasCamera = true;
+                m_config.camPos[0] = v[0]; m_config.camPos[1] = v[1]; m_config.camPos[2] = v[2];
+                if (n >= 6) {
+                    m_config.hasTarget = true;
+                    m_config.camTarget[0] = v[3]; m_config.camTarget[1] = v[4]; m_config.camTarget[2] = v[5];
+                }
+            }
         } else if (m_config.modelPath.empty()) {
             m_config.modelPath = arg;
         } else if (m_config.hdrPath.empty()) {
@@ -177,6 +202,16 @@ bool Application::init() {
     if (!m_pathGuideGrid->init(gridConfig)) {
         std::cerr << "[App] Path guide grid init failed (non-fatal)\n";
         m_pathGuideGrid.reset();
+    }
+
+    // --guide: enable guiding from frame 0 (same effect as the UI toggle) —
+    // lets unattended/scripted runs exercise the guided path.
+    if (m_config.enableGuiding && m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
+        m_pathGuideMode = PathGuideMode::Running;
+        m_pathGuideTrainingFrameCount = 0;
+        m_optixEngine->setPathGuideEnabled(true);
+        m_optixEngine->setPathGuideDebugEnabled(true);
+        std::cout << "[App] Path guiding enabled from startup (--guide)\n";
     }
 
     // Initialize wireframe renderer for grid debug visualization
@@ -501,6 +536,11 @@ bool Application::loadScene() {
                                 glm::vec3 centroid(0.0f);
                                 glm::vec3 weightedNormal(0.0f);
                                 float totalArea = 0.0f;
+                                // Object-space copies of the pushed triangles,
+                                // kept so transform edits can re-bake the
+                                // world-space NEE geometry (see
+                                // refreshMeshLightGeometry).
+                                std::vector<float3> objVerts;
 
                                 for (size_t ti = 0; ti + 2 < idxs.size(); ti += 3) {
                                     glm::vec3 lp[3];
@@ -524,6 +564,9 @@ bool Application::loadScene() {
                                     lightTris.push_back(make_float4(lp[0].x, lp[0].y, lp[0].z, 0.0f)); // w = CDF (fixed up below)
                                     lightTris.push_back(make_float4(lp[1].x, lp[1].y, lp[1].z, triArea));
                                     lightTris.push_back(make_float4(lp[2].x, lp[2].y, lp[2].z, 0.0f));
+                                    for (int vi = 0; vi < 3; vi++) {
+                                        objVerts.push_back(verts[idxs[ti + vi]].position);
+                                    }
                                 }
 
                                 uint32_t triCount = static_cast<uint32_t>((lightTris.size() - firstTri) / 3);
@@ -557,6 +600,8 @@ bool Application::loadScene() {
                                     uint32_t lightIdx = static_cast<uint32_t>(m_lightManager->getAreaLightCount());
                                     m_lightManager->addAreaLight(light);
                                     instanceLightPairs.push_back({ thisInstanceId, lightIdx });
+                                    m_meshLightSources[thisInstanceId] =
+                                        MeshLightSource{ lightIdx, triOffset, std::move(objVerts) };
                                     std::string lightName = "Emissive " + std::to_string(lightIdx);
                                     m_sceneHierarchy->addAreaLight(lightIdx, lightName);
 
@@ -645,8 +690,24 @@ bool Application::loadScene() {
                     yaw = -90.0f;
                 }
 
-                m_camera->setPosition(camPos);
-                m_camera->setYawPitch(yaw, 0.0f);
+                if (m_config.hasCamera) {
+                    // --cam override: fixed start pose for scripted runs
+                    camPos = glm::vec3(m_config.camPos[0], m_config.camPos[1], m_config.camPos[2]);
+                    if (m_config.hasTarget) {
+                        glm::vec3 dir = glm::normalize(glm::vec3(
+                            m_config.camTarget[0], m_config.camTarget[1], m_config.camTarget[2]) - camPos);
+                        yaw = glm::degrees(std::atan2(dir.z, dir.x));
+                        float pitch = glm::degrees(std::asin(glm::clamp(dir.y, -1.0f, 1.0f)));
+                        m_camera->setPosition(camPos);
+                        m_camera->setYawPitch(yaw, pitch);
+                    } else {
+                        m_camera->setPosition(camPos);
+                        m_camera->setYawPitch(yaw, 0.0f);
+                    }
+                } else {
+                    m_camera->setPosition(camPos);
+                    m_camera->setYawPitch(yaw, 0.0f);
+                }
 
                 // Scale move speed and clip planes to scene size
                 m_camera->setMoveSpeed(maxExtent * 0.5f);
@@ -680,27 +741,44 @@ bool Application::loadScene() {
 }
 
 void Application::setupDefaultScene() {
-    // Create default lights
-    m_lightManager->createDefaultLights();
-
-    // Add lights to hierarchy
-    m_sceneHierarchy->addDirectionalLight(0, "Sun");
-    m_sceneHierarchy->addAreaLight(0, "Key Light");
-    m_sceneHierarchy->addAreaLight(1, "Fill Light");
+    // The default Sun/Key/Fill rig exists ONLY for the empty no-model
+    // startup (so the app isn't a black window). Any LOADED model renders
+    // under its own lighting: its emissive materials (mesh lights,
+    // registered in loadScene) and/or the environment map — never the
+    // default rig, which would wash out the transport (caustics, hard
+    // shadows) real scenes exist to exercise.
+    if (m_sceneManager->getInstanceCount() == 0) {
+        m_lightManager->createDefaultLights();
+        m_sceneHierarchy->addDirectionalLight(0, "Sun");
+        m_sceneHierarchy->addAreaLight(0, "Key Light");
+        m_sceneHierarchy->addAreaLight(1, "Fill Light");
+    } else {
+        std::cout << "[App] Model loaded - skipping default Sun/Key/Fill ("
+                  << m_lightManager->getAreaLightCount()
+                  << " emissive mesh light(s) from the scene)\n";
+    }
 
     m_lightManager->syncToGpu(m_optixEngine.get(), m_cudaInterop->getStream());
 
-    // Load environment map
+    // Load environment map. The DEFAULT fallback HDRI is skipped when the
+    // scene brought its own emissive lighting — an ambient env wash would
+    // drown exactly the transport (caustics, hard shadows) such scenes
+    // exercise. An explicitly passed hdrPath always loads.
     std::filesystem::path hdrPath = m_config.hdrPath;
     if (hdrPath.empty()) {
-        std::vector<std::filesystem::path> searchPaths = {
-            m_exePath / "assets" / "hdri" / "default.hdr",
-            std::filesystem::current_path() / "assets" / "hdri" / "default.hdr",
-        };
-        for (const auto& path : searchPaths) {
-            if (std::filesystem::exists(path)) {
-                hdrPath = path;
-                break;
+        if (m_lightManager->getAreaLightCount() > 0 &&
+            m_lightManager->getDirectionalLightCount() == 0) {
+            std::cout << "[App] Scene has its own lights - skipping default HDRI\n";
+        } else {
+            std::vector<std::filesystem::path> searchPaths = {
+                m_exePath / "assets" / "hdri" / "default.hdr",
+                std::filesystem::current_path() / "assets" / "hdri" / "default.hdr",
+            };
+            for (const auto& path : searchPaths) {
+                if (std::filesystem::exists(path)) {
+                    hdrPath = path;
+                    break;
+                }
             }
         }
     }
@@ -748,9 +826,53 @@ void Application::wireUICallbacks() {
             case SceneNodeType::DirectionalLight:
                 m_lightManager->updateDirectionalLight(index, info);
                 break;
-            case SceneNodeType::AreaLight:
+            case SceneNodeType::AreaLight: {
+                // Mesh lights: the panel's position sliders must move the
+                // OWNING INSTANCE — NEE samples the light's world-space
+                // triangles, and the GpuAreaLight.position field is only the
+                // (derived) centroid, which mesh-light NEE never reads.
+                // Writing it did nothing, which is why dragging a mesh
+                // light's position looked dead. Translate the instance
+                // through the canonical transform path instead (which
+                // re-bakes the triangles and the centroid).
+                {
+                    const GpuAreaLight* ml = m_lightManager->getAreaLight(index);
+                    if (ml && ml->triCount > 0 && ml->instanceId != UINT32_MAX) {
+                        float3 delta = make_float3(info.position.x - ml->position.x,
+                                                   info.position.y - ml->position.y,
+                                                   info.position.z - ml->position.z);
+                        if (std::fabs(delta.x) + std::fabs(delta.y) + std::fabs(delta.z) > 1e-6f) {
+                            const auto& instances = m_sceneManager->getInstances();
+                            if (ml->instanceId < instances.size()) {
+                                float t[12];
+                                std::memcpy(t, instances[ml->instanceId].transform, sizeof(t));
+                                t[3] += delta.x; t[7] += delta.y; t[11] += delta.z;
+                                applyInstanceTransform(ml->instanceId, t);
+                            }
+                        }
+                    }
+                }
                 m_lightManager->updateAreaLight(index, info);
+                // Mesh lights: mirror the new emission into the owning
+                // instance's MATERIAL so path-hit emission agrees with NEE
+                // (the two MIS estimators must see the same emitter).
+                const GpuAreaLight* l = m_lightManager->getAreaLight(index);
+                if (l && l->instanceId != UINT32_MAX) {
+                    MaterialHandle mh = m_sceneManager->getMaterialHandle(l->instanceId);
+                    const GpuMaterial* mat = (mh != INVALID_MATERIAL_HANDLE)
+                        ? m_materialManager->get(mh) : nullptr;
+                    if (mat) {
+                        GpuMaterial updated = *mat;
+                        updated.emissive = l->emission;
+                        m_materialManager->updateMaterial(mh, updated);
+                        if (!m_sceneManager->updateMaterialRecords(mh, m_cudaInterop->getStream())) {
+                            m_cudaInterop->synchronize();
+                            m_sceneManager->updateSBT();
+                        }
+                    }
+                }
                 break;
+            }
             case SceneNodeType::PointLight:
                 m_lightManager->updatePointLight(index, info);
                 break;
@@ -777,6 +899,17 @@ void Application::wireUICallbacks() {
             // and reallocates GPU memory, unsafe while optixLaunch is in flight.
             m_cudaInterop->synchronize();
             m_sceneManager->updateSBT();
+        }
+
+        // Mirror the emissive into the instance's mesh light: the SBT
+        // material drives what paths see when they HIT the lamp, but the
+        // GpuAreaLight drives NEE — every directly-lit surface. Without the
+        // mirror, editing a lamp's material brightened the lamp but not the
+        // scene (and left the two MIS estimators disagreeing on emission).
+        uint32_t lightIdx = m_lightManager->findAreaLightByInstance(instanceId);
+        if (lightIdx != UINT32_MAX) {
+            m_lightManager->setAreaLightEmission(lightIdx, material.emissive);
+            m_lightManager->syncToGpu(m_optixEngine.get(), m_cudaInterop->getStream());
         }
 
         // Reset accumulation so the new material is immediately visible
@@ -851,26 +984,15 @@ void Application::wireUICallbacks() {
         return info;
     });
 
-    // Transform edit: recompose matrix, update instance, rebuild IAS
+    // Transform edit: recompose matrix, apply through the canonical path
+    // (IAS rebuild + mesh-light re-bake + launch-param refresh + resets).
+    // No updateSBT — a transform edit changes no material/geometry SBT
+    // record, and the full SBT rebuild was a large part of the per-drag-event
+    // cost. buildIAS itself reuses persistent buffers in the steady state.
     m_uiManager->setOnTransformEdit([this](uint32_t instanceId, float3 scale, float3 translation, float3 rotation) {
         float transform[12];
         composeTransform(scale, translation, rotation, transform);
-        m_sceneManager->updateInstanceTransform(instanceId, transform);
-
-        m_cudaInterop->synchronize();
-        m_sceneManager->buildIAS();
-        m_sceneManager->updateSBT();
-
-        m_optixEngine->setSceneHandle(m_sceneManager->getSceneHandle());
-        m_optixEngine->setGeometryBuffers(m_sceneManager->getVertexBuffers(),
-                                           m_sceneManager->getIndexBuffers());
-        m_optixEngine->setInstanceData(
-            m_sceneManager->getInstanceTransforms(),
-            m_sceneManager->getInstanceNormalTransforms(),
-            m_sceneManager->getInstanceMaterialIndices());
-
-        m_optixEngine->resetAccumulation();
-        resetPathGuideTraining();
+        applyInstanceTransform(instanceId, transform);
     });
 }
 
@@ -950,13 +1072,34 @@ void Application::run() {
         if (cameraChanged(currentParams, m_prevCameraParams)) {
             m_optixEngine->resetAccumulation();
             m_prevCameraParams = currentParams;
-
-            // Reset training frame count on camera move (fresh samples for new view)
-            if (m_pathGuideMode == PathGuideMode::Running && m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
-                m_pathGuideTrainingFrameCount = 0;
-            }
+            // Note: the path-guide training counter deliberately keeps running
+            // across camera moves. The grid is world-space, and resetting the
+            // counter pinned the refit gate (0 % N == 0) true every frame,
+            // EMA-decaying the whole grid's training away during navigation.
         }
         m_optixEngine->setCamera(currentParams);
+
+        // Self-test hook (--test-move-light): translate the first mesh-light
+        // instance at the configured frame, through the exact UI edit path.
+        if (m_config.testMoveFrame > 0 &&
+            m_optixEngine->getFrameIndex() >= static_cast<uint32_t>(m_config.testMoveFrame) &&
+            !m_meshLightSources.empty()) {
+            uint32_t instanceId = m_meshLightSources.begin()->first;
+            const auto& instances = m_sceneManager->getInstances();
+            if (instanceId < instances.size()) {
+                float t[12];
+                std::memcpy(t, instances[instanceId].transform, sizeof(t));
+                t[3] += m_config.testMoveDelta[0];
+                t[7] += m_config.testMoveDelta[1];
+                t[11] += m_config.testMoveDelta[2];
+                std::cout << "[App] TEST: moving mesh-light instance " << instanceId
+                          << " by (" << m_config.testMoveDelta[0] << ", "
+                          << m_config.testMoveDelta[1] << ", "
+                          << m_config.testMoveDelta[2] << ")\n";
+                applyInstanceTransform(instanceId, t);
+            }
+            m_config.testMoveFrame = 0;   // fire once
+        }
 
         renderFrame();
 
@@ -969,6 +1112,94 @@ void Application::run() {
             m_lastTimingPrint = m_timer.frameCount;
         }
     }
+}
+
+void Application::applyInstanceTransform(uint32_t instanceId, const float transform12[12]) {
+    m_sceneManager->updateInstanceTransform(instanceId, transform12);
+
+    // Render stream must be idle before the IAS rebuild touches device
+    // buffers optixLaunch may still be reading.
+    m_cudaInterop->synchronize();
+    m_sceneManager->buildIAS();
+
+    // Mesh lights bake world-space NEE geometry — re-extract it for the
+    // moved instance (no-op for instances without a light).
+    refreshMeshLightGeometry(instanceId);
+
+    m_optixEngine->setSceneHandle(m_sceneManager->getSceneHandle());
+    m_optixEngine->setGeometryBuffers(m_sceneManager->getVertexBuffers(),
+                                       m_sceneManager->getIndexBuffers());
+    m_optixEngine->setInstanceData(
+        m_sceneManager->getInstanceTransforms(),
+        m_sceneManager->getInstanceNormalTransforms(),
+        m_sceneManager->getInstanceMaterialIndices());
+
+    m_optixEngine->resetAccumulation();
+    resetPathGuideTraining();
+}
+
+void Application::refreshMeshLightGeometry(uint32_t instanceId) {
+    auto it = m_meshLightSources.find(instanceId);
+    if (it == m_meshLightSources.end() || !m_areaLightTris) return;
+    const MeshLightSource& src = it->second;
+    const auto& instances = m_sceneManager->getInstances();
+    if (instanceId >= instances.size()) return;
+    const float* t = instances[instanceId].transform;
+
+    // Re-bake world-space triangles + per-light area CDF from the saved
+    // object-space source, mirroring the extraction in loadScene.
+    const size_t triCount = src.objVerts.size() / 3;
+    std::vector<float4> tris;
+    tris.reserve(triCount * 3);
+    glm::vec3 centroid(0.0f);
+    glm::vec3 weightedNormal(0.0f);
+    float totalArea = 0.0f;
+    for (size_t ti = 0; ti < triCount; ti++) {
+        glm::vec3 lp[3];
+        for (int vi = 0; vi < 3; vi++) {
+            const float3& p = src.objVerts[ti * 3 + vi];
+            lp[vi] = glm::vec3(
+                t[0]*p.x + t[1]*p.y + t[2]*p.z  + t[3],
+                t[4]*p.x + t[5]*p.y + t[6]*p.z  + t[7],
+                t[8]*p.x + t[9]*p.y + t[10]*p.z + t[11]);
+        }
+        glm::vec3 cr = glm::cross(lp[1] - lp[0], lp[2] - lp[0]);
+        float triArea = glm::length(cr) * 0.5f;
+        totalArea += triArea;
+        weightedNormal += cr;
+        centroid += (lp[0] + lp[1] + lp[2]) * triArea;
+        tris.push_back(make_float4(lp[0].x, lp[0].y, lp[0].z, 0.0f));
+        tris.push_back(make_float4(lp[1].x, lp[1].y, lp[1].z, triArea));
+        tris.push_back(make_float4(lp[2].x, lp[2].y, lp[2].z, 0.0f));
+    }
+    if (totalArea <= 1e-12f || tris.empty()) return;  // degenerate transform
+
+    float cumulative = 0.0f;
+    for (size_t ti = 0; ti < triCount; ti++) {
+        cumulative += tris[ti * 3 + 1].w / totalArea;
+        tris[ti * 3].w = cumulative;
+    }
+    tris[(triCount - 1) * 3].w = 1.0f;
+
+    // In-place update of this light's slice of the device triangle buffer.
+    // The transform-edit path synchronized the render stream before the IAS
+    // rebuild, so no launch is reading the buffer here.
+    cudaMemcpy(m_areaLightTris + (size_t)src.triOffset * 3, tris.data(),
+               tris.size() * sizeof(float4), cudaMemcpyHostToDevice);
+
+    centroid /= (totalArea * 3.0f);
+    glm::vec3 avgNormal = glm::normalize(weightedNormal);
+    float sideLen = std::sqrt(totalArea);
+    m_lightManager->setAreaLightGeometry(src.lightIdx,
+        make_float3(centroid.x, centroid.y, centroid.z),
+        make_float3(avgNormal.x, avgNormal.y, avgNormal.z),
+        totalArea, make_float2(sideLen, sideLen));
+    // Area feeds the selection weights + MIS pdfs — resync (also rebuilds
+    // the light alias table).
+    m_lightManager->syncToGpu(m_optixEngine.get(), m_cudaInterop->getStream());
+    std::cout << "[App] Mesh light " << src.lightIdx << " re-baked: centroid ("
+              << centroid.x << ", " << centroid.y << ", " << centroid.z
+              << "), area " << totalArea << "\n";
 }
 
 void Application::resetPathGuideTraining() {
@@ -1173,8 +1404,34 @@ void Application::renderFrame() {
         if (training && (stepOnce ||
             (m_pathGuideTrainingFrameCount > 0 &&
              (m_pathGuideTrainingFrameCount % m_pathGuideGrid->getConfig().refine_interval_frames) == 0))) {
-            m_pathGuideGrid->runSubdivisionPass(currentFrame, stream);
             m_pathGuideSubdivPasses++;
+            m_pathGuideGrid->runSubdivisionPass(currentFrame, m_pathGuideSubdivPasses, stream);
+        }
+
+        // Harvest completed subdivision-pass stats (async, at most one
+        // readback in flight — a pass launched while one is pending runs
+        // without stats and is not reported; with the 30-frame cadence that
+        // requires a badly stalled stream). Every reported pass prints,
+        // tagged with ITS OWN pass id — a silent console means "no pass
+        // ran", never "pass ran and found nothing" (that ambiguity cost a
+        // debugging round). The level histogram is the ground truth for
+        // "where is the grid refining".
+        {
+            uint32_t s[PG_SUBDIV_STATS_SIZE];
+            uint32_t passId = 0;
+            if (m_pathGuideGrid->pollSubdivStats(s, &passId)) {
+                std::cout << "[PathGuide] subdiv pass " << passId
+                          << ": split=" << s[PG_SUBDIV_STAT_SPLIT]
+                          << " eligible=" << s[PG_SUBDIV_STAT_ELIGIBLE]
+                          << " no-structure=" << s[PG_SUBDIV_STAT_NOSTRUCT]
+                          << " children=" << s[PG_SUBDIV_STAT_CHILDREN]
+                          << " | levels:";
+                for (uint32_t l = 0; l < 16; l++) {
+                    if (s[PG_SUBDIV_STAT_LEVEL0 + l])
+                        std::cout << " L" << l << "=" << s[PG_SUBDIV_STAT_LEVEL0 + l];
+                }
+                std::cout << "\n";
+            }
         }
 
         // StepOnce: one refit + subdivision step, then freeze
@@ -1187,12 +1444,17 @@ void Application::renderFrame() {
         const auto& config = m_pathGuideGrid->getConfig();
         m_optixEngine->setPathGuideLevelConfig(config.start_level, config.min_level, config.max_level);
 
+        // Deposits only while refits are running (Paused keeps sampling the
+        // guide but must not grow the un-folded interval sums)
+        m_optixEngine->setPathGuideTraining(training);
+
         // Increment training frame counter when actively training
         if (training) {
             m_pathGuideTrainingFrameCount++;
         }
     } else {
         m_optixEngine->setPathGuideGridDescriptor(nullptr);
+        m_optixEngine->setPathGuideTraining(false);
     }
 
     // [DIAG] pgSetup
@@ -1524,8 +1786,12 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
     }
 
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS && !app->m_mouseCaptured) {
+        // Pick on the render stream: the legacy default stream would act as a
+        // barrier against ALL streams and its final sync would drain the whole
+        // multi-frame pipeline — a visible hitch on every viewport click.
         PickResultBuffer pickResult = app->m_optixEngine->pickInstanceAndPosition(
-            static_cast<uint32_t>(xpos), static_cast<uint32_t>(ypos));
+            static_cast<uint32_t>(xpos), static_cast<uint32_t>(ypos),
+            app->m_cudaInterop ? app->m_cudaInterop->getStream() : 0);
 
         // Viewport double-click: open the picked surface's material panel.
         // Works in EVERY mode — during path guiding this is the only way to
@@ -1635,42 +1901,79 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                 info.variance = 1.0f - meanLen;
                 info.lastFrame = cellResult.data[PG_LAST_HIT_FRAME];
 
-                // Determine subdivision/coarsening status (display heuristic)
+                // Determine subdivision/coarsening status (display heuristic).
+                // Mirrors subdivideCellsKernel: (1) level-normalized VISIT
+                // gate (traffic, no radiance gate), (2) per-axis half-cell
+                // conditional mean log1p(radiance) ratio above the threshold
+                // with a per-half visit floor. Coarsening is retired (cell
+                // indices are stable).
                 const auto& config = app->m_pathGuideGrid->getConfig();
-                // Subdivision is spatial-contrast driven (mirrors
-                // subdivideCellsKernel): |centroid|^2 = sum_a S_a^2 / W^2 must
-                // clear BOTH the absolute threshold and the nEff noise floor
-                // (nEff = W^2/Sum(w^2), Kish effective sample size — heavy-
-                // tailed Li/pdf weights make deposit count an overestimate of
-                // the centroid's real evidence), unless the cell is far past
-                // maturity (count hatch, escapes the first-moment blind spot
-                // for even-symmetric variation). Constants mirror the kernel.
-                // Coarsening is retired (cell indices are stable).
-                constexpr float kContrastNoiseLambda = 4.0f;
-                constexpr float kCountHatchMult = 60.0f;  // 8x gate rate, in maturity units (x7.5 window ratio)
-                // Spatial stats are log1p(w)-weighted; the matching Sum(mw)
-                // normalizer lives at PG_CUM_SMW (the per-lobe radiance sums
-                // use raw w and would mis-scale the centroid). Hatch reads
-                // the slow maturity, mirroring subdivideCellsKernel.
-                float srx = cellResult.data[PG_CUM_SR_X];
-                float sry = cellResult.data[PG_CUM_SR_Y];
-                float srz = cellResult.data[PG_CUM_SR_Z];
-                float sumMW = cellResult.data[PG_CUM_SMW];
-                float contrast = (sumMW > 1e-8f)
-                    ? (srx * srx + sry * sry + srz * srz) / (sumMW * sumMW)
-                    : 0.0f;
-                float nEff = (sumMW > 1e-8f)
-                    ? (sumMW * sumMW) / std::max(cellResult.data[PG_CUM_SW2], 1e-12f)
-                    : 0.0f;
-                float gate = std::max(config.subdivide_contrast_threshold,
-                                      kContrastNoiseLambda / std::max(nEff, 1.0f));
-                float cumN = cellResult.data[PG_CUM_COUNT];
-                float maturityN = cellResult.data[PG_MATURITY];
+                float gateVisits = config.subdivide_count_threshold;
+                if (cellResult.level > config.start_level) {
+                    gateVisits = std::max(
+                        gateVisits * std::exp2(-2.0f * static_cast<float>(
+                            cellResult.level - config.start_level)),
+                        std::min(256.0f, config.subdivide_count_threshold));
+                }
+                float visits = cellResult.data[PG_CUM_VISITS];
+                float sl = cellResult.data[PG_CUM_SL];
+                bool structure = false;
+                for (int a = 0; a < 3; a++) {
+                    float posC = cellResult.data[PG_CUM_HC_X + a];
+                    float negC = visits - posC;
+                    if (posC < 32.0f || negC < 32.0f) continue;
+                    float posMean = cellResult.data[PG_CUM_HL_X + a] / posC;
+                    float negMean = std::max(sl - cellResult.data[PG_CUM_HL_X + a], 0.0f) / negC;
+                    float ratio = std::fabs(std::log((posMean + 0.02f) / (negMean + 0.02f)));
+                    float diff = std::fabs(posMean - negMean);
+                    if (ratio > config.subdivide_contrast_threshold ||
+                        diff > 1.7f * config.subdivide_contrast_threshold) {
+                        structure = true;
+                        break;
+                    }
+                }
+                // Resolution-limited test (mirrors subdivideCellsKernel
+                // gate 2b): a well-evidenced lobe whose fitted kappa demand
+                // exceeds the spread-based cap severalfold splits even
+                // without a radiance edge.
+                if (!structure) {
+                    float smw = cellResult.data[PG_CUM_SMW];
+                    if (smw > 1e-6f) {
+                        float invSmw = 1.0f / smw;
+                        float cwx = cellResult.data[PG_CUM_SR_X] * invSmw;
+                        float cwy = cellResult.data[PG_CUM_SR_Y] * invSmw;
+                        float cwz = cellResult.data[PG_CUM_SR_Z] * invSmw;
+                        float spread2 = cellResult.data[PG_CUM_SRR] * invSmw -
+                                        (cwx * cwx + cwy * cwy + cwz * cwz);
+                        float spreadRel = std::max(std::sqrt(std::max(spread2, 0.0f)), 0.25f);
+                        float baseCellSize =
+                            ((config.bounds_max[0] - config.bounds_min[0]) +
+                             (config.bounds_max[1] - config.bounds_min[1]) +
+                             (config.bounds_max[2] - config.bounds_min[2])) /
+                            (3.0f * static_cast<float>(config.base_resolution));
+                        float cellSize = baseCellSize * std::exp2(-static_cast<float>(cellResult.level));
+                        float sigmaPos = std::max(spreadRel * 0.5f * cellSize, 1e-6f);
+                        for (int k = 0; k < PG_NUM_LOBES; k++) {
+                            const float* cs = cellResult.data + PG_CUMS_BASE + k * PG_SUM_STRIDE;
+                            float w = cs[3];
+                            if (w < 32.0f) continue;
+                            float len = std::sqrt(cs[0]*cs[0] + cs[1]*cs[1] + cs[2]*cs[2]);
+                            float rbar = std::min(len / w, 0.99999f);
+                            float implied = rbar * (3.0f - rbar * rbar) /
+                                            std::max(1.0f - rbar * rbar, 1e-4f);
+                            float meanDist = cs[PG_S_DIST] / w;
+                            if (meanDist < 1e-4f) continue;
+                            float cap = (meanDist / sigmaPos) * (meanDist / sigmaPos);
+                            if (cap < 500.0f && implied > 4.0f * cap) {
+                                structure = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 info.wouldSubdivide = (cellResult.level < config.max_level &&
-                    cumN >= config.subdivide_count_threshold &&
-                    (contrast > gate ||
-                     (config.subdivide_count_threshold > 0.0f &&
-                      maturityN >= kCountHatchMult * config.subdivide_count_threshold)));
+                    config.subdivide_count_threshold > 0.0f &&
+                    visits >= gateVisits && structure);
                 info.wouldCoarsen = false;
             }
 

@@ -162,12 +162,24 @@ std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) 
                 material.pbrMetallicRoughness.metallicRoughnessTexture.index);
         }
 
-        // Emissive (common to both workflows)
+        // Emissive (common to both workflows). The core glTF spec clamps
+        // emissiveFactor to [0,1]; real emission brightness rides in the
+        // KHR_materials_emissive_strength extension (Blender exports it for
+        // any Emission strength > 1). Without reading it, a Blender lamp
+        // loads at <= 1 nit and is effectively not a light.
         if (material.emissiveFactor.size() >= 3) {
+            float strength = 1.0f;
+            auto extIt = material.extensions.find("KHR_materials_emissive_strength");
+            if (extIt != material.extensions.end() &&
+                extIt->second.Has("emissiveStrength")) {
+                strength = static_cast<float>(
+                    extIt->second.Get("emissiveStrength").GetNumberAsDouble());
+                if (!(strength > 0.0f)) strength = 1.0f;
+            }
             matData.emissive = make_float3(
-                static_cast<float>(material.emissiveFactor[0]),
-                static_cast<float>(material.emissiveFactor[1]),
-                static_cast<float>(material.emissiveFactor[2])
+                static_cast<float>(material.emissiveFactor[0]) * strength,
+                static_cast<float>(material.emissiveFactor[1]) * strength,
+                static_cast<float>(material.emissiveFactor[2]) * strength
             );
         }
 

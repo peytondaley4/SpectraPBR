@@ -23,6 +23,8 @@
 #include "scene/selection_manager.h"
 #include "scene/scene_serializer.h"
 #include "scene/scene_hierarchy.h"
+#include <unordered_map>
+#include <vector>
 
 #include <filesystem>
 #include <string>
@@ -55,6 +57,18 @@ struct AppConfig {
     std::filesystem::path modelPath;
     std::filesystem::path hdrPath;
     bool remoteMode = false;
+    bool enableGuiding = false;   // --guide: path guiding ON from frame 0
+    // --cam px,py,pz[,tx,ty,tz]: fixed start camera (overrides auto-fit) —
+    // for scripted/unattended runs
+    bool hasCamera = false;
+    float camPos[3] = {0, 0, 0};
+    bool hasTarget = false;
+    float camTarget[3] = {0, 0, 0};
+    // --test-move-light frame,dx,dy,dz: at the given frame, translate the
+    // first mesh-light instance through applyInstanceTransform — exercises
+    // the exact UI edit path from a scripted run (self-test harness)
+    int testMoveFrame = 0;
+    float testMoveDelta[3] = {0, 0, 0};
     uint32_t width = 1920;
     uint32_t height = 1080;
 };
@@ -93,6 +107,21 @@ private:
 
     // Reset path guide training (call on scene changes: lights, env map, materials)
     void resetPathGuideTraining();
+
+    // Apply a full instance transform through the ONE canonical path (IAS
+    // rebuild + mesh-light geometry re-bake + launch-param refresh +
+    // accumulation/guide reset). Both the transform panel and mesh-light
+    // position edits from the light panel route through this — divergent
+    // copies of this sequence are how lights ended up frozen in place.
+    void applyInstanceTransform(uint32_t instanceId, const float transform12[12]);
+
+    // Re-extract a mesh light's world-space NEE geometry (triangles, CDF,
+    // centroid/normal/area) after its owning instance's transform changed.
+    // The triangles are baked world-space at load; without this, NEE keeps
+    // lighting the scene from the lamp's OLD position/orientation/scale
+    // while path hits see the moved mesh — stale positions AND a stale area
+    // in every MIS weight. No-op for instances without a mesh light.
+    void refreshMeshLightGeometry(uint32_t instanceId);
 
     // Input handling
     void processInput();
@@ -149,6 +178,16 @@ private:
     bool m_denoiserEnabled = false;
     float m_denoiserBlend = 0.0f;               // 0 = full denoise, 1 = passthrough
     float4* m_areaLightTris = nullptr;          // Mesh-light triangles (device)
+
+    // Object-space source triangles of each mesh light (keyed by owning
+    // instanceId), kept so refreshMeshLightGeometry can re-bake the
+    // world-space NEE triangles when the instance's transform changes.
+    struct MeshLightSource {
+        uint32_t lightIdx = 0;                  // index in LightManager's area lights
+        uint32_t triOffset = 0;                 // first triangle in m_areaLightTris
+        std::vector<float3> objVerts;           // 3 per triangle, pushed-tri order
+    };
+    std::unordered_map<uint32_t, MeshLightSource> m_meshLightSources;
     uint32_t* m_instanceLightIndices = nullptr; // instance -> area light index (device)
 
     // Scene bounds (world space, computed during loadScene)

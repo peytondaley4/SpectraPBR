@@ -74,18 +74,21 @@ extern "C" __global__ void __anyhit__shadow_alpha() {
     const HitGroupData* sbtData = reinterpret_cast<HitGroupData*>(optixGetSbtDataPointer());
     const GpuMaterial& material = sbtData->material;
 
-    // Transmissive surfaces do not occlude NEE shadow rays ("transparent
-    // shadows"). A straight shadow ray cannot follow the refracted light
-    // path, so the choice is between treating glass as fully opaque (NEE
-    // behind glass is zero, and delta lights are unreachable by path
-    // sampling -> interiors go black) or letting the shadow ray pass and
-    // ignoring refraction/Fresnel. The pass-through approximation is the
-    // standard production compromise; base-color tinting and absorption are
-    // intentionally not applied here. Caustic-accurate transport through
-    // glass still arrives via the path sampler's emission/env MIS leg.
+    // Transmissive surfaces OCCLUDE shadow rays to area/mesh/env lights: a
+    // straight NEE connection through glass carries light no physical path
+    // transports (it all refracts), so passing it both erases the glass
+    // shadow and double-counts on top of the caustic that refracted path
+    // transport (transmission chains hitting the emitter, delta-chain MIS
+    // weight 1) already delivers — the visible symptom was "no darkness
+    // behind the sphere". The single exception is DELTA lights
+    // (point/directional, payload_1 == 1): the path sampler can never hit
+    // them, so occluding would render glass interiors unresolvably black —
+    // for them the pass-through approximation remains (no tint/absorption).
     if (material.transmission > 0.0f) {
-        optixIgnoreIntersection();
-        return;
+        if (optixGetPayload_1() != 0) {
+            optixIgnoreIntersection();   // delta light: pass through
+        }
+        return;                          // non-delta: accept hit = occluded
     }
 
     // Only process alpha mask materials

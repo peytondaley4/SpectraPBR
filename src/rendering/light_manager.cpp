@@ -1,6 +1,8 @@
 #include "light_manager.h"
 #include "optix_engine.h"
 #include <cmath>
+#include <algorithm>
+#include <iostream>
 
 namespace spectra {
 
@@ -43,17 +45,30 @@ void LightManager::updatePointLight(uint32_t index, const ui::LightInfo& info) {
     pointLights[index].intensity = info.color;
 }
 
+// Readback convention (must mirror PropertyPanel::updateLightFromSliders,
+// which recomposes color_out = pickerColor * intensity): intensity is the
+// MAX component and the returned color is normalized by it, so a display ->
+// edit round trip reproduces the same emission. The old magnitude-based
+// readback inflated white lights by sqrt(3) on every touch.
+static void splitColorIntensity(const float3& c, float3& outColor, float& outIntensity) {
+    float m = std::max({c.x, c.y, c.z});
+    if (m > 1e-6f) {
+        outIntensity = m;
+        outColor = make_float3(c.x / m, c.y / m, c.z / m);
+    } else {
+        outIntensity = 0.0f;
+        outColor = make_float3(1.0f, 1.0f, 1.0f);
+    }
+}
+
 ui::LightInfo LightManager::getDirectionalLightInfo(uint32_t index) const {
     ui::LightInfo info = {};
     if (index >= dirLights.size()) return info;
     info.type = SceneNodeType::DirectionalLight;
     info.index = index;
     info.direction = dirLights[index].direction;
-    info.color = dirLights[index].irradiance;
     info.angularDiameter = dirLights[index].angularDiameter;
-    info.intensity = std::sqrt(info.color.x * info.color.x +
-                                info.color.y * info.color.y +
-                                info.color.z * info.color.z);
+    splitColorIntensity(dirLights[index].irradiance, info.color, info.intensity);
     return info;
 }
 
@@ -63,11 +78,8 @@ ui::LightInfo LightManager::getAreaLightInfo(uint32_t index) const {
     info.type = SceneNodeType::AreaLight;
     info.index = index;
     info.position = areaLights[index].position;
-    info.color = areaLights[index].emission;
     info.size = areaLights[index].size;
-    info.intensity = std::sqrt(info.color.x * info.color.x +
-                                info.color.y * info.color.y +
-                                info.color.z * info.color.z);
+    splitColorIntensity(areaLights[index].emission, info.color, info.intensity);
     return info;
 }
 
@@ -78,51 +90,64 @@ ui::LightInfo LightManager::getPointLightInfo(uint32_t index) const {
     info.index = index;
     info.position = pointLights[index].position;
     info.radius = pointLights[index].radius;
-    info.color = pointLights[index].intensity;
-    info.intensity = std::sqrt(info.color.x * info.color.x +
-                                info.color.y * info.color.y +
-                                info.color.z * info.color.z);
+    splitColorIntensity(pointLights[index].intensity, info.color, info.intensity);
     return info;
 }
 
 void LightManager::syncToGpu(OptixEngine* engine, cudaStream_t stream) {
-    auto copy = [stream](void* dst, const void* src, size_t size) {
-        if (stream) {
-            cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream);
-        } else {
-            cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
+    // Grow-only buffer sync: reallocates when the light count outgrows the
+    // device buffer (the old code allocated once at first-sync size, so any
+    // later addition wrote past the allocation), copies, and reports success.
+    // On failure the previous buffer/pointer stay valid.
+    auto syncBuffer = [stream](CUdeviceptr& dptr, size_t& capacity,
+                               const void* src, size_t count, size_t elemSize,
+                               const char* what) -> bool {
+        size_t bytes = count * elemSize;
+        if (count > capacity) {
+            CUdeviceptr newPtr = 0;
+            cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&newPtr), bytes);
+            if (err != cudaSuccess) {
+                std::cerr << "[LightManager] cudaMalloc(" << what << ") failed: "
+                          << cudaGetErrorString(err) << "\n";
+                return false;
+            }
+            if (dptr) cudaFree(reinterpret_cast<void*>(dptr));
+            dptr = newPtr;
+            capacity = count;
         }
+        cudaError_t err = stream
+            ? cudaMemcpyAsync(reinterpret_cast<void*>(dptr), src, bytes,
+                              cudaMemcpyHostToDevice, stream)
+            : cudaMemcpy(reinterpret_cast<void*>(dptr), src, bytes,
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            std::cerr << "[LightManager] light upload (" << what << ") failed: "
+                      << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+        return true;
     };
 
     // Directional lights
-    if (!dirLights.empty()) {
-        size_t size = dirLights.size() * sizeof(GpuDirectionalLight);
-        if (!d_dirLights) {
-            cudaMalloc(reinterpret_cast<void**>(&d_dirLights), size);
-        }
-        copy(reinterpret_cast<void*>(d_dirLights), dirLights.data(), size);
+    if (!dirLights.empty() &&
+        syncBuffer(d_dirLights, dirCapacity, dirLights.data(),
+                   dirLights.size(), sizeof(GpuDirectionalLight), "dir lights")) {
         engine->setDirectionalLights(reinterpret_cast<GpuDirectionalLight*>(d_dirLights),
                                       static_cast<uint32_t>(dirLights.size()));
     }
 
     // Area lights
-    if (!areaLights.empty()) {
-        size_t size = areaLights.size() * sizeof(GpuAreaLight);
-        if (!d_areaLights) {
-            cudaMalloc(reinterpret_cast<void**>(&d_areaLights), size);
-        }
-        copy(reinterpret_cast<void*>(d_areaLights), areaLights.data(), size);
+    if (!areaLights.empty() &&
+        syncBuffer(d_areaLights, areaCapacity, areaLights.data(),
+                   areaLights.size(), sizeof(GpuAreaLight), "area lights")) {
         engine->setAreaLights(reinterpret_cast<GpuAreaLight*>(d_areaLights),
                                static_cast<uint32_t>(areaLights.size()));
     }
 
     // Point lights
-    if (!pointLights.empty()) {
-        size_t size = pointLights.size() * sizeof(GpuPointLight);
-        if (!d_pointLights) {
-            cudaMalloc(reinterpret_cast<void**>(&d_pointLights), size);
-        }
-        copy(reinterpret_cast<void*>(d_pointLights), pointLights.data(), size);
+    if (!pointLights.empty() &&
+        syncBuffer(d_pointLights, pointCapacity, pointLights.data(),
+                   pointLights.size(), sizeof(GpuPointLight), "point lights")) {
         engine->setPointLights(reinterpret_cast<GpuPointLight*>(d_pointLights),
                                 static_cast<uint32_t>(pointLights.size()));
     }
@@ -136,28 +161,125 @@ void LightManager::syncToGpu(OptixEngine* engine, cudaStream_t stream) {
     //                directional lights illuminate everything, so oversample)
     //   area:        lum(emission) * area   (~flux; big bright panels matter more)
     float totalLightLum = 0.0f;
-    for (const auto& light : pointLights) {
-        totalLightLum += 0.2126f * light.intensity.x +
-                         0.7152f * light.intensity.y +
-                         0.0722f * light.intensity.z;
+    std::vector<float> weights;
+    std::vector<uint32_t> entries;
+    weights.reserve(pointLights.size() + dirLights.size() + areaLights.size());
+    entries.reserve(weights.capacity());
+    for (size_t i = 0; i < pointLights.size(); ++i) {
+        const auto& light = pointLights[i];
+        float w = 0.2126f * light.intensity.x +
+                  0.7152f * light.intensity.y +
+                  0.0722f * light.intensity.z;
+        totalLightLum += w;
+        weights.push_back(w);
+        entries.push_back((LIGHT_KIND_POINT << 24) | static_cast<uint32_t>(i));
     }
-    for (const auto& light : dirLights) {
-        totalLightLum += (0.2126f * light.irradiance.x +
-                          0.7152f * light.irradiance.y +
-                          0.0722f * light.irradiance.z) * 10.0f;
+    for (size_t i = 0; i < dirLights.size(); ++i) {
+        const auto& light = dirLights[i];
+        float w = (0.2126f * light.irradiance.x +
+                   0.7152f * light.irradiance.y +
+                   0.0722f * light.irradiance.z) * 10.0f;
+        totalLightLum += w;
+        weights.push_back(w);
+        entries.push_back((LIGHT_KIND_DIR << 24) | static_cast<uint32_t>(i));
     }
-    for (const auto& light : areaLights) {
-        totalLightLum += (0.2126f * light.emission.x +
-                          0.7152f * light.emission.y +
-                          0.0722f * light.emission.z) * light.area;
+    for (size_t i = 0; i < areaLights.size(); ++i) {
+        const auto& light = areaLights[i];
+        float w = (0.2126f * light.emission.x +
+                   0.7152f * light.emission.y +
+                   0.0722f * light.emission.z) * light.area;
+        totalLightLum += w;
+        weights.push_back(w);
+        entries.push_back((LIGHT_KIND_AREA << 24) | static_cast<uint32_t>(i));
     }
     engine->setTotalLightLuminance(totalLightLum);
+
+    // Walker/Vose alias table over the scene lights: the device picks a
+    // uniform bucket and accepts it with prob[] or takes its alias — O(1) and
+    // exactly proportional to weight/total, replacing the per-vertex linear
+    // CDF walk in raygen.cu::selectLight.
+    const size_t n = weights.size();
+    if (n == 0 || totalLightLum <= 0.0f) {
+        engine->setLightAliasTable(nullptr, nullptr, nullptr, 0);
+    } else {
+        std::vector<float> prob(n);
+        std::vector<uint32_t> alias(n);
+        std::vector<float> scaled(n);
+        std::vector<uint32_t> small, large;
+        small.reserve(n); large.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            scaled[i] = weights[i] * static_cast<float>(n) / totalLightLum;
+            (scaled[i] < 1.0f ? small : large).push_back(static_cast<uint32_t>(i));
+        }
+        while (!small.empty() && !large.empty()) {
+            uint32_t s = small.back(); small.pop_back();
+            uint32_t l = large.back(); large.pop_back();
+            prob[s] = scaled[s];
+            alias[s] = l;
+            scaled[l] = (scaled[l] + scaled[s]) - 1.0f;
+            (scaled[l] < 1.0f ? small : large).push_back(l);
+        }
+        // Leftovers are exactly 1 up to rounding
+        while (!large.empty()) { prob[large.back()] = 1.0f; alias[large.back()] = large.back(); large.pop_back(); }
+        while (!small.empty()) { prob[small.back()] = 1.0f; alias[small.back()] = small.back(); small.pop_back(); }
+
+        bool ok = true;
+        if (n > aliasCapacity) {
+            auto grow = [&](CUdeviceptr& dptr, size_t bytes, const char* what) {
+                CUdeviceptr newPtr = 0;
+                cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&newPtr), bytes);
+                if (err != cudaSuccess) {
+                    std::cerr << "[LightManager] cudaMalloc(" << what << ") failed: "
+                              << cudaGetErrorString(err) << "\n";
+                    return false;
+                }
+                if (dptr) cudaFree(reinterpret_cast<void*>(dptr));
+                dptr = newPtr;
+                return true;
+            };
+            ok = grow(d_aliasProb, n * sizeof(float), "light alias prob") &&
+                 grow(d_aliasIdx, n * sizeof(uint32_t), "light alias idx") &&
+                 grow(d_aliasEntries, n * sizeof(uint32_t), "light alias entries");
+            if (ok) aliasCapacity = n;
+        }
+        if (ok) {
+            // Synchronous copies on purpose: prob/alias/entries are locals,
+            // so an async copy could outlive them. The table is a few dozen
+            // elements — the sync cost is noise.
+            auto upload = [](CUdeviceptr dst, const void* src, size_t bytes) {
+                return cudaMemcpy(reinterpret_cast<void*>(dst), src, bytes,
+                                  cudaMemcpyHostToDevice) == cudaSuccess;
+            };
+            ok = upload(d_aliasProb, prob.data(), n * sizeof(float)) &&
+                 upload(d_aliasIdx, alias.data(), n * sizeof(uint32_t)) &&
+                 upload(d_aliasEntries, entries.data(), n * sizeof(uint32_t));
+            if (!ok) {
+                std::cerr << "[LightManager] light alias table upload failed\n";
+            }
+        }
+        if (ok) {
+            engine->setLightAliasTable(
+                reinterpret_cast<float*>(d_aliasProb),
+                reinterpret_cast<uint32_t*>(d_aliasIdx),
+                reinterpret_cast<uint32_t*>(d_aliasEntries),
+                static_cast<uint32_t>(n));
+        } else {
+            engine->setLightAliasTable(nullptr, nullptr, nullptr, 0);
+        }
+    }
 }
 
 void LightManager::cleanup() {
     if (d_dirLights) { cudaFree(reinterpret_cast<void*>(d_dirLights)); d_dirLights = 0; }
     if (d_areaLights) { cudaFree(reinterpret_cast<void*>(d_areaLights)); d_areaLights = 0; }
     if (d_pointLights) { cudaFree(reinterpret_cast<void*>(d_pointLights)); d_pointLights = 0; }
+    if (d_aliasProb) { cudaFree(reinterpret_cast<void*>(d_aliasProb)); d_aliasProb = 0; }
+    if (d_aliasIdx) { cudaFree(reinterpret_cast<void*>(d_aliasIdx)); d_aliasIdx = 0; }
+    if (d_aliasEntries) { cudaFree(reinterpret_cast<void*>(d_aliasEntries)); d_aliasEntries = 0; }
+    dirCapacity = 0;
+    areaCapacity = 0;
+    pointCapacity = 0;
+    aliasCapacity = 0;
 }
 
 static float3 normalizeFloat3(float3 v) {

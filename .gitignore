@@ -418,3 +418,10 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Nsight Compute / profiling artifacts
+*.ncu-rep
+*.nsys-rep
+
+# Windows redirect artifact
+nul

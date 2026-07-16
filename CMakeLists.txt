@@ -1,4 +1,8 @@
-cmake_minimum_required(VERSION 3.18)
+# 3.20+: generator expressions in add_custom_command(OUTPUT) — the PTX is
+# compiled per-config (Debug PTX carries -G -O0), so its path must be
+# config-qualified or multi-config generators would reuse one config's PTX
+# for the other.
+cmake_minimum_required(VERSION 3.20)
 
 # Enable CUDA language
 project(SpectraPBR LANGUAGES CXX CUDA)
@@ -18,10 +22,12 @@ endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
-# Debug definitions
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_definitions(_DEBUG)
-endif()
+# Debug definitions — per-config generator expression, NOT configure-time
+# CMAKE_BUILD_TYPE: with multi-config generators (MSVC) the build type is
+# chosen at build time (--config), so the old STREQUAL check never fired
+# there. (MSVC's /MDd also defines _DEBUG on its own; this keeps other
+# compilers consistent.)
+add_compile_definitions($<$<CONFIG:Debug>:_DEBUG>)
 
 # MSVC: opt in to correct std::aligned_storage behavior for types with
 # alignment > alignof(max_align_t) (e.g. UIQuad which contains float4).
@@ -153,10 +159,12 @@ message(STATUS "nlohmann/json fetched")
 #------------------------------------------------------------------------------
 # stb - Single-file public domain libraries (stb_truetype for font rendering)
 #------------------------------------------------------------------------------
+# stb has no release tags; pin a commit so builds are reproducible instead of
+# floating with master.
 FetchContent_Declare(
     stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG        master
+    GIT_TAG        f75e8d1cad7d90d72ef7a4661f1b994ef78b4e31
 )
 FetchContent_GetProperties(stb)
 if(NOT stb_POPULATED)
@@ -172,30 +180,10 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
     get_filename_component(cuda_file_abs ${cuda_file} ABSOLUTE)
     get_filename_component(cuda_file_name ${cuda_file} NAME_WE)
 
-    set(ptx_file "${CMAKE_BINARY_DIR}/optix_programs/${cuda_file_name}.ptx")
-
-    # Determine include paths
-    set(include_flags
-        -I${OptiX_INCLUDE_DIRS}
-        -I${CUDAToolkit_INCLUDE_DIRS}
-        -I${CMAKE_CURRENT_SOURCE_DIR}/src
-        -I${CMAKE_CURRENT_SOURCE_DIR}/src/core
-        -I${CMAKE_CURRENT_SOURCE_DIR}/optix_programs
-    )
-
-    # NVCC flags for PTX compilation
-    set(nvcc_flags
-        --ptx
-        -O3
-        --use_fast_math
-        -lineinfo
-        --machine=64
-    )
-
-    # Add architecture flags
-    foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
-        list(APPEND nvcc_flags --gpu-architecture=compute_${arch})
-    endforeach()
+    # Config-qualified: the flags below differ per config, so each config
+    # must own its PTX (a shared path would let one config's up-to-date PTX
+    # mask the other's).
+    set(ptx_file "${CMAKE_BINARY_DIR}/optix_programs/$<CONFIG>/${cuda_file_name}.ptx")
 
     # Use the first architecture for PTX output (PTX is architecture-agnostic)
     list(GET CMAKE_CUDA_ARCHITECTURES 0 first_arch)
@@ -204,25 +192,23 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
     list(GET OptiX_INCLUDE_DIRS 0 optix_include)
     list(GET CUDAToolkit_INCLUDE_DIRS 0 cuda_include)
 
-    # Header files that OptiX programs depend on
-    set(OPTIX_HEADER_DEPS
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/gpu_types.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/shared_device.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/brdf.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/vmf_device.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_grid_device.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_hash_device.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/path_guide_cell_layout.h
+    # Every device header is a PTX dependency. Globbed (with
+    # CONFIGURE_DEPENDS) instead of hand-maintained: a newly added header
+    # must trigger PTX rebuilds without someone remembering to list it here.
+    file(GLOB OPTIX_HEADER_DEPS CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/optix_programs/*.h"
     )
 
+    # Optimization follows the build config: Debug PTX is compiled -G -O0 so
+    # OPTIX_COMPILE_DEBUG_LEVEL_FULL (requested by the engine in debug
+    # builds) actually has debug info to work with; Release keeps
+    # -O3 --use_fast_math -lineinfo.
     add_custom_command(
         OUTPUT ${ptx_file}
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/optix_programs/$<CONFIG>"
         COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
                 --ptx
-                -O3
-                --use_fast_math
-                -lineinfo
+                "$<IF:$<CONFIG:Debug>,-G;-O0,-O3;--use_fast_math;-lineinfo>"
                 --machine=64
                 --gpu-architecture=compute_${first_arch}
                 -I${optix_include}
@@ -231,8 +217,9 @@ function(compile_optix_ptx target_name cuda_file output_ptx)
                 -o
                 ${ptx_file}
                 ${cuda_file_abs}
-        DEPENDS ${cuda_file_abs} ${OPTIX_HEADER_DEPS} 
+        DEPENDS ${cuda_file_abs} ${OPTIX_HEADER_DEPS}
         COMMENT "Compiling OptiX PTX: ${cuda_file_name}.cu -> ${cuda_file_name}.ptx"
+        COMMAND_EXPAND_LISTS
         VERBATIM
     )
 
@@ -372,23 +359,37 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
     COMMENT "Copying shaders to build directory"
 )
 
-# Copy PTX files
-add_custom_command(TARGET SpectraPBR POST_BUILD
+# Copy PTX next to the exe. Deliberately an ALWAYS-RUN target rather than a
+# POST_BUILD step: POST_BUILD only fires when the exe itself relinks, so a
+# device-only edit (raygen.cu, or a device header no host TU includes) would
+# rebuild build/optix_programs/*.ptx but leave the runtime copy next to the
+# exe STALE — the engine would then silently run old PTX against new host
+# struct layouts (silent memory corruption when the cell layout changes).
+# copy_if_different keeps the steady-state cost negligible.
+add_custom_target(copy_ptx ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_BINARY_DIR}/optix_programs/raygen.ptx"
+            "${RAYGEN_PTX}"
             "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_BINARY_DIR}/optix_programs/miss.ptx"
+            "${MISS_PTX}"
             "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_BINARY_DIR}/optix_programs/closesthit.ptx"
+            "${CLOSESTHIT_PTX}"
             "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_BINARY_DIR}/optix_programs/anyhit.ptx"
+            "${ANYHIT_PTX}"
             "$<TARGET_FILE_DIR:SpectraPBR>/optix_programs/"
-    COMMENT "Copying PTX files to build directory"
+    COMMENT "Syncing PTX files to the executable directory"
 )
+# Depend on the TARGET, not the .ptx files: with the Visual Studio generator
+# a custom command whose OUTPUT is depended on by two targets gets the rule
+# DUPLICATED into both — two nvcc instances racing on the same .ptx in a
+# parallel build. Target-level dependency orders without duplicating.
+add_dependencies(copy_ptx optix_ptx)
+# NOTE: copy_ptx is part of ALL (the default build, which build.bat uses).
+# `cmake --build build --target SpectraPBR` alone does NOT sync PTX — the
+# dependency cannot point the other way without creating a cycle.
 
 # Copy fonts for UI
 add_custom_command(TARGET SpectraPBR POST_BUILD
@@ -413,10 +414,10 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
 install(TARGETS SpectraPBR RUNTIME DESTINATION bin)
 install(DIRECTORY shaders/ DESTINATION bin/shaders)
 install(FILES
-    ${CMAKE_BINARY_DIR}/optix_programs/raygen.ptx
-    ${CMAKE_BINARY_DIR}/optix_programs/miss.ptx
-    ${CMAKE_BINARY_DIR}/optix_programs/closesthit.ptx
-    ${CMAKE_BINARY_DIR}/optix_programs/anyhit.ptx
+    ${RAYGEN_PTX}
+    ${MISS_PTX}
+    ${CLOSESTHIT_PTX}
+    ${ANYHIT_PTX}
     DESTINATION bin/optix_programs
 )
 

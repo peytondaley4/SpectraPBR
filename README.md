@@ -219,3 +219,7 @@ SpectraPBR/
 ## License
 
 [Add your license information here]
+
+[CellInspect] Hit pos: (0.80685, 1.55101, 0.199052) Bounds: [-46.6055..46.6055, -5.77765..9.92478, -46.6055..46.6055] Cells: 7192
+[CellInspect] Hit pos: (0.80685, 1.55101, 0.199052) Bounds: [-46.6055..46.6055, -5.77765..9.92478, -46.6055..46.6055] Cells: 7256
+[OptiX] SBT updated with 3 materials (6 records)

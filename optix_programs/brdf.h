@@ -185,16 +185,23 @@ __forceinline__ __device__ float3 fresnelDispatch(float VdotH, const float3& bas
 
 // GGX Normal Distribution Function (D term)
 // alpha = roughness^2 (roughness squared)
+// The denominator guard must stay far below the smallest reachable pi*d*d
+// (callers clamp alpha >= 0.001, so d >= a2 >= 1e-6 and pi*d*d >= 3.1e-12):
+// an additive epsilon comparable to pi*d*d flattens the peak of smooth lobes,
+// and since sampleGGXVNDF draws from the TRUE analytic density, any distortion
+// here desyncs pdfGGXVNDF from the sampler and biases every MIS weight.
 __forceinline__ __device__ float D_GGX(float NdotH, float alpha) {
     float a2 = alpha * alpha;
     float d = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    return a2 / (M_PI * d * d + BRDF_EPSILON);
+    return a2 / fmaxf(M_PI * d * d, 1e-12f);
 }
 
-// Smith G1 masking function for GGX
+// Smith G1 masking function for GGX.
+// Max-guard, not additive: G1 feeds pdfGGXVNDF, so the same sampler-agreement
+// argument as D_GGX applies (denominator >= alpha >= 0.001 at all call sites).
 __forceinline__ __device__ float G1_GGX(float NdotV, float alpha) {
     float a2 = alpha * alpha;
-    return 2.0f * NdotV / (NdotV + sqrtf(a2 + (1.0f - a2) * NdotV * NdotV) + BRDF_EPSILON);
+    return 2.0f * NdotV / fmaxf(NdotV + sqrtf(a2 + (1.0f - a2) * NdotV * NdotV), 1e-8f);
 }
 
 // Smith height-correlated masking-shadowing VISIBILITY term:
@@ -282,8 +289,9 @@ __forceinline__ __device__ float3 sampleGGXVNDF(
 
 // PDF for VNDF sampling of reflected direction L.
 // Derivation: p(L) = D_v(H) / (4*VdotH) = G1*VdotH*D / (NdotV*4*VdotH) = G1*D / (4*NdotV)
+// Guard by max, not addition, for the same sampler-agreement reason as D_GGX.
 __forceinline__ __device__ float pdfGGXVNDF(float D, float G1, float NdotV) {
-    return D * G1 / (4.0f * NdotV + BRDF_EPSILON);
+    return D * G1 / fmaxf(4.0f * NdotV, 1e-8f);
 }
 
 //------------------------------------------------------------------------------
@@ -320,14 +328,15 @@ __forceinline__ __device__ float V_Neubelt(float NdotV, float NdotL) {
 }
 
 //------------------------------------------------------------------------------
-// Diffuse / Specular Lobe Mixture
+// Clearcoat / Diffuse / Specular Lobe Mixture
 //
-// The indirect estimator samples a MIXTURE of the cosine (diffuse) lobe and
-// the GGX VNDF (specular) lobe. Sampling VNDF only — the previous behavior —
-// leaves the diffuse term effectively unsampled on smooth materials (the VNDF
-// PDF is near-delta), which means unbounded variance or, with firefly clamps,
-// lost diffuse GI. The mixture PDF below is shared by the sampler, the MIS
-// weights, and the path-guide combination; all three MUST agree.
+// The indirect estimator samples a MIXTURE of the cosine (diffuse) lobe, the
+// GGX VNDF (specular) lobe, and (at QUALITY_HIGH+) the clearcoat GGX VNDF
+// lobe. Sampling VNDF only — the previous behavior — leaves the diffuse term
+// effectively unsampled on smooth materials (the VNDF PDF is near-delta),
+// which means unbounded variance or, with firefly clamps, lost diffuse GI.
+// The mixture PDF below is shared by the sampler, the MIS weights, and the
+// path-guide combination; all three MUST agree.
 //------------------------------------------------------------------------------
 
 // Probability of selecting the specular lobe when sampling this BSDF.
@@ -370,6 +379,23 @@ __forceinline__ __device__ float sheenSelectProb(
     return fminf(lumSheen / (lumSheen + lumDiff + 1e-4f), 0.5f);
 }
 
+// Probability of selecting the clearcoat lobe. The coat sits on top of every
+// base lobe, so it takes the FIRST slice of the selection budget and the base
+// machinery keeps the remainder. The weight is the coat's approximate
+// directional albedo, clearcoat * F_cc(NdotV): with that weight the peak f/p
+// of the coat lobe cancels to ~1, so a smooth coat over any base no longer
+// arrives as rare huge-weight samples through the cosine/base-GGX tails.
+// Deterministic in (NdotV, material, quality) — same contract as
+// specularSelectProb — and capped at 0.5 so the base lobes are never starved.
+// Zero below QUALITY_HIGH: evalPbrBSDF only contains the coat lobe at HIGH+,
+// and the sampler must not propose a lobe the evaluator does not have.
+__forceinline__ __device__ float clearcoatSelectProb(
+    float NdotV, float clearcoat, unsigned int quality)
+{
+    if (quality < QUALITY_HIGH || clearcoat <= 0.0f) return 0.0f;
+    return fminf(clearcoat * fresnelDielectricExternal(NdotV, DIELECTRIC_IOR), 0.5f);
+}
+
 // Uniform hemisphere sampling (the sheen leg's proposal)
 __forceinline__ __device__ float3 sampleUniformHemisphere(float u1, float u2) {
     float z = u1;
@@ -383,11 +409,12 @@ __forceinline__ __device__ float3 sampleUniformHemisphere(float u1, float u2) {
 #define PDF_UNIFORM_HEMISPHERE (1.0f / (2.0f * M_PI))
 
 // Mixture PDF for direction L given view V and shading normal N.
-// pSpec / pSheen must come from specularSelectProb / sheenSelectProb with the
-// same inputs the sampler used.
+// pSpec / pSheen / pCC must come from specularSelectProb / sheenSelectProb /
+// clearcoatSelectProb with the same inputs the sampler used.
 __forceinline__ __device__ float pdfBSDFMixture(
     const float3& V, const float3& L, const float3& N,
-    float roughness, float pSpec, float pSheen)
+    float roughness, float clearcoatRoughness,
+    float pSpec, float pSheen, float pCC)
 {
     float NdotL = dot(N, L);
     if (NdotL <= 0.0f) return 0.0f;
@@ -395,22 +422,32 @@ __forceinline__ __device__ float pdfBSDFMixture(
     // Non-specular leg: cosine diffuse blended with the uniform sheen proposal
     float pdfDiffuse = NdotL / M_PI;
     float pdfDiffLeg = (1.0f - pSheen) * pdfDiffuse + pSheen * PDF_UNIFORM_HEMISPHERE;
-    if (pSpec <= 0.0f) return pdfDiffLeg;
+    if (pSpec <= 0.0f && pCC <= 0.0f) return pdfDiffLeg;
 
     float3 H = normalize(V + L);
     float NdotH = fmaxf(dot(N, H), 0.0f);
     float NdotV = fmaxf(dot(N, V), BRDF_EPSILON);
-    float alpha = fmaxf(roughness * roughness, 0.001f);
-    float pdfSpec = pdfGGXVNDF(D_GGX(NdotH, alpha), G1_GGX(NdotV, alpha), NdotV);
 
-    return pSpec * pdfSpec + (1.0f - pSpec) * pdfDiffLeg;
+    float pdfBase = pdfDiffLeg;
+    if (pSpec > 0.0f) {
+        float alpha = fmaxf(roughness * roughness, 0.001f);
+        float pdfSpec = pdfGGXVNDF(D_GGX(NdotH, alpha), G1_GGX(NdotV, alpha), NdotV);
+        pdfBase = pSpec * pdfSpec + (1.0f - pSpec) * pdfDiffLeg;
+    }
+    if (pCC <= 0.0f) return pdfBase;
+
+    // Clearcoat leg: VNDF density of the coat's own GGX lobe
+    float ccAlpha = fmaxf(clearcoatRoughness * clearcoatRoughness, 0.001f);
+    float pdfCC = pdfGGXVNDF(D_GGX(NdotH, ccAlpha), G1_GGX(NdotV, ccAlpha), NdotV);
+    return pCC * pdfCC + (1.0f - pCC) * pdfBase;
 }
 
-// Sample a direction from the diffuse/specular mixture.
+// Sample a direction from the clearcoat/diffuse/specular mixture.
 // Returns false if the sampled direction is below the shading hemisphere.
 __forceinline__ __device__ bool sampleBSDFMixture(
     const float3& V, const float3& N,
-    float roughness, float pSpec, float pSheen,
+    float roughness, float clearcoatRoughness,
+    float pSpec, float pSheen, float pCC,
     float uSelect, float u1, float u2,
     float3& outL)
 {
@@ -418,20 +455,32 @@ __forceinline__ __device__ bool sampleBSDFMixture(
     buildOrthonormalBasis(N, T, B);
 
     float3 L;
-    if (uSelect < pSpec) {
-        // Specular: GGX VNDF (Heitz 2018) — visible normals only
-        float alpha = fmaxf(roughness * roughness, 0.001f);
+    if (uSelect < pCC) {
+        // Clearcoat: GGX VNDF with the coat's own alpha
+        float ccAlpha = fmaxf(clearcoatRoughness * clearcoatRoughness, 0.001f);
         float3 Ve = make_float3(dot(V, T), dot(V, B), dot(V, N));
-        float3 Hl = sampleGGXVNDF(Ve, alpha, u1, u2);
+        float3 Hl = sampleGGXVNDF(Ve, ccAlpha, u1, u2);
         float3 H = T * Hl.x + B * Hl.y + N * Hl.z;
         L = 2.0f * dot(V, H) * H - V;
     } else {
-        // Non-specular: remap the leftover select variable (uniform given
-        // uSelect >= pSpec) to choose sheen-uniform vs cosine diffuse.
-        float rSel = (uSelect - pSpec) / fmaxf(1.0f - pSpec, 1e-6f);
-        float3 Ll = (rSel < pSheen) ? sampleUniformHemisphere(u1, u2)
-                                    : sampleCosineHemisphere(u1, u2);
-        L = T * Ll.x + B * Ll.y + N * Ll.z;
+        // Base lobes get the leftover budget; remap the select variable
+        // (uniform given uSelect >= pCC).
+        float uBase = (uSelect - pCC) / fmaxf(1.0f - pCC, 1e-6f);
+        if (uBase < pSpec) {
+            // Specular: GGX VNDF (Heitz 2018) — visible normals only
+            float alpha = fmaxf(roughness * roughness, 0.001f);
+            float3 Ve = make_float3(dot(V, T), dot(V, B), dot(V, N));
+            float3 Hl = sampleGGXVNDF(Ve, alpha, u1, u2);
+            float3 H = T * Hl.x + B * Hl.y + N * Hl.z;
+            L = 2.0f * dot(V, H) * H - V;
+        } else {
+            // Non-specular: remap again (uniform given uBase >= pSpec) to
+            // choose sheen-uniform vs cosine diffuse.
+            float rSel = (uBase - pSpec) / fmaxf(1.0f - pSpec, 1e-6f);
+            float3 Ll = (rSel < pSheen) ? sampleUniformHemisphere(u1, u2)
+                                        : sampleCosineHemisphere(u1, u2);
+            L = T * Ll.x + B * Ll.y + N * Ll.z;
+        }
     }
 
     L = normalize(L);
@@ -456,6 +505,7 @@ __forceinline__ __device__ float3 evalPbrBSDF(
     unsigned int quality,
     float pSpec,        // from specularSelectProb (same inputs as the sampler)
     float pSheen,       // from sheenSelectProb (same inputs as the sampler)
+    float pCC,          // from clearcoatSelectProb (same inputs as the sampler)
     float* outPdf)      // optional: mixture PDF of L (nullptr to skip)
 {
     float NdotL = dot(N, L);
@@ -464,10 +514,17 @@ __forceinline__ __device__ float3 evalPbrBSDF(
         if (outPdf) *outPdf = 0.0f;
         return make_float3(0.0f, 0.0f, 0.0f);
     }
+    // Single source of truth for the mixture density: delegate to
+    // pdfBSDFMixture so this fused path can never drift from the sampler /
+    // MIS formula (a hand-mirrored copy here had already diverged in its
+    // NdotL clamping; the sampler's true density uses the raw NdotL).
+    if (outPdf) {
+        *outPdf = pdfBSDFMixture(V, L, N, roughness, clearcoatRoughness,
+                                 pSpec, pSheen, pCC);
+    }
     NdotL = fmaxf(NdotL, BRDF_EPSILON);
 
     if (quality == QUALITY_FAST) {
-        if (outPdf) *outPdf = NdotL / M_PI;
         return baseColor / M_PI;
     }
 
@@ -480,15 +537,7 @@ __forceinline__ __device__ float3 evalPbrBSDF(
 
     // Shared microfacet terms
     float D = D_GGX(NdotH, alpha);
-    float G1V = G1_GGX(NdotV, alpha);
     float Vis = V_SmithGGX(NdotV, NdotL, alpha);
-
-    if (outPdf) {
-        float pdfSpec = pdfGGXVNDF(D, G1V, NdotV);
-        float pdfDiff = NdotL / M_PI;
-        float pdfDiffLeg = (1.0f - pSheen) * pdfDiff + pSheen * PDF_UNIFORM_HEMISPHERE;
-        *outPdf = pSpec * pdfSpec + (1.0f - pSpec) * pdfDiffLeg;
-    }
 
     // Exact Fresnel (dielectric / conductor dispatch)
     float3 F = fresnelDispatch(VdotH, baseColor, metallic);

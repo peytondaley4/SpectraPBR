@@ -14,7 +14,10 @@
 //   p3 = barycentric u (float bits)
 //   p4 = barycentric v (float bits)
 //
-// Shadow rays use a single register: p0 = occluded (init 1, miss writes 0).
+// Shadow rays use two registers:
+//   p0 = occluded (init 1, miss writes 0)
+//   p1 = isDelta (1 = point/directional target; __anyhit__shadow_alpha reads
+//        it to let transmissive surfaces pass delta-light shadow rays)
 //------------------------------------------------------------------------------
 
 struct HitInfo {

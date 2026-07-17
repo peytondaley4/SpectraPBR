@@ -52,9 +52,10 @@
 // limit on how fast the guide subdivides and its mixtures converge (a wide view
 // gives each world-cell little traffic, so cells stay coarse/noisy unless the
 // camera concentrates rays on them). Raised to 0.5 to halve maturity time at
-// the cost of ~2x the training atomic traffic. WEIGHT_SCALE must stay 1/PROB.
+// the cost of ~2x the training atomic traffic. WEIGHT_SCALE is derived so it
+// always stays 1/PROB.
 #define PG_TRAIN_PROB        0.5f
-#define PG_TRAIN_WEIGHT_SCALE 2.0f   // 1 / PG_TRAIN_PROB
+#define PG_TRAIN_WEIGHT_SCALE (1.0f / PG_TRAIN_PROB)
 
 // Max share of the continuation budget the guide may claim on a surface the
 // BSDF-selection logic considers fully specular (pSpec == 1, i.e. metallic
@@ -309,6 +310,15 @@ __forceinline__ __device__ Surface loadSurface(
     if (material.doubleSided && backface) {
         shadingNormal = -shadingNormal;
     }
+    // Interpolation/normal mapping can push the shading normal below the view
+    // horizon (backfaces of single-sided meshes, grazing silhouettes). The
+    // VNDF sampler and pdfBSDFMixture are only valid for dot(N, V) > 0, so
+    // fall back to the ray-facing geometric normal there — sampler, PDF, and
+    // NEE MIS must all see the same valid frame. The transmission event reads
+    // origShadingNormal/faceNormal and resolves its own orientation.
+    if (dot(shadingNormal, rayDir) >= 0.0f) {
+        shadingNormal = s.geomNormal;
+    }
     s.shadingNormal = shadingNormal;
 
     // Clearcoat only contributes at QUALITY_HIGH and up — skip its texture
@@ -323,6 +333,8 @@ __forceinline__ __device__ Surface loadSurface(
             s.clearcoatRoughness *= tex2DLod<float4>(material.clearcoatRoughnessTex, texCoord.x, texCoord.y, texLOD).y;
         }
     }
+    // Same floor as base roughness: bounds the coat lobe's peak D (and f/p).
+    s.clearcoatRoughness = fmaxf(s.clearcoatRoughness, 0.04f);
 
     s.sheenColor = material.sheenColor;
     s.sheenRoughness = material.sheenRoughness;
@@ -469,7 +481,7 @@ __forceinline__ __device__ float guideLobePdf(const GuideLobe& lobe, const float
 // MIS-weighting it down here would lose direct light.
 __forceinline__ __device__ float3 sampleDirectLight(
     const Surface& s, const float3& V,
-    float pSpec, float pSheen, float guideAlpha, const GuideLobe& guideLobe,
+    float pSpec, float pSheen, float pCC, float guideAlpha, const GuideLobe& guideLobe,
     unsigned int& seed, bool finalVertex)
 {
     float grandTotal = params.total_light_luminance + params.env_selection_weight;
@@ -493,7 +505,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
             if (traceShadowRay(s.pos, s.geomNormal, L, distance, /*deltaLight=*/true)) {
                 float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                     s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                    params.quality_mode, pSpec, pSheen, nullptr);
+                    params.quality_mode, pSpec, pSheen, pCC, nullptr);
                 // Delta light: no MIS (path sampler cannot hit it)
                 contrib = f * light.intensity * (NdotL / (distance * distance * selProb));
             }
@@ -507,7 +519,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
             if (traceShadowRay(s.pos, s.geomNormal, L, sceneFarDistance(), /*deltaLight=*/true)) {
                 float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                     s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                    params.quality_mode, pSpec, pSheen, nullptr);
+                    params.quality_mode, pSpec, pSheen, pCC, nullptr);
                 contrib = f * light.irradiance * (NdotL / selProb);
             }
         }
@@ -553,7 +565,8 @@ __forceinline__ __device__ float3 sampleDirectLight(
                         float misW = 1.0f;
                         if (isMeshLight && !finalVertex) {
                             // BSDF/guide sampling can also hit this geometry — MIS.
-                            float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec, pSheen);
+                            float pPath = pdfBSDFMixture(V, L, N, s.roughness,
+                                s.clearcoatRoughness, pSpec, pSheen, pCC);
                             if (guideAlpha > 0.0f) {
                                 float pGuide = guideLobePdf(guideLobe, L);
                                 pPath = guideAlpha * pGuide + (1.0f - guideAlpha) * pPath;
@@ -563,7 +576,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
 
                         float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                             s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                            params.quality_mode, pSpec, pSheen, nullptr);
+                            params.quality_mode, pSpec, pSheen, pCC, nullptr);
                         contrib = f * light.emission * (NdotL * misW / pLight);
                     }
                 }
@@ -586,7 +599,8 @@ __forceinline__ __device__ float3 sampleDirectLight(
                     // Path sampler reaches the env on miss — MIS.
                     float misW = 1.0f;
                     if (!finalVertex) {
-                        float pPath = pdfBSDFMixture(V, L, N, s.roughness, pSpec, pSheen);
+                        float pPath = pdfBSDFMixture(V, L, N, s.roughness,
+                            s.clearcoatRoughness, pSpec, pSheen, pCC);
                         if (guideAlpha > 0.0f) {
                             float pGuide = guideLobePdf(guideLobe, L);
                             pPath = guideAlpha * pGuide + (1.0f - guideAlpha) * pPath;
@@ -598,7 +612,7 @@ __forceinline__ __device__ float3 sampleDirectLight(
                         params.environment_intensity);
                     float3 f = evalPbrBSDF(V, L, N, s.baseColor, s.metallic, s.roughness,
                         s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-                        params.quality_mode, pSpec, pSheen, nullptr);
+                        params.quality_mode, pSpec, pSheen, pCC, nullptr);
                     contrib = f * envRadiance * (NdotL * misW / pLight);
                 }
             }
@@ -749,7 +763,12 @@ __forceinline__ __device__ float3 tracePath(
                         params.env_pmf, params.env_width, params.env_height);
                     w = prevPdf / (prevPdf + pLight);
                 }
-                radiance = radiance + clampContribution(throughput * envRadiance * w);
+                // Depth 0 is deterministic (throughput = 1, w = 1): clamping a
+                // zero-variance term has no firefly benefit and only dims the
+                // visible background until the growing threshold releases it.
+                float3 envContrib = throughput * envRadiance * w;
+                radiance = radiance + (depth == 0 ? envContrib
+                                                  : clampContribution(envContrib));
                 terminalEnv = envRadiance;
             }
             break;
@@ -809,7 +828,11 @@ __forceinline__ __device__ float3 tracePath(
                 }
             }
             emissionContrib = s.emissive * w;
-            radiance = radiance + clampContribution(throughput * emissionContrib);
+            // Camera-visible emission (depth 0) is deterministic — same
+            // zero-variance reasoning as the depth-0 env miss above.
+            float3 pathEmission = throughput * emissionContrib;
+            radiance = radiance + (depth == 0 ? pathEmission
+                                              : clampContribution(pathEmission));
         }
 
         //── Depth cap ────────────────────────────────────────────────────────
@@ -828,6 +851,14 @@ __forceinline__ __device__ float3 tracePath(
             float eta = entering ? (1.0f / s.ior) : s.ior;
             float3 N = entering ? s.origShadingNormal : -s.origShadingNormal;
             float3 gN = entering ? s.faceNormal : -s.faceNormal;
+            // The side (and hence eta) is already resolved from the geometric
+            // face normal above. A shading normal tilted past the view horizon
+            // would make fresnelDielectric re-flip the side-resolved eta
+            // (spurious TIR) and hand refract() a wrong-side normal — fall
+            // back to the geometric normal for this event when that happens.
+            if (dot(N, V) <= 0.0f) {
+                N = gN;
+            }
 
             float F = fresnelDielectric(dot(N, V), eta);
 
@@ -890,6 +921,7 @@ __forceinline__ __device__ float3 tracePath(
         float NdotV = fmaxf(dot(s.shadingNormal, V), BRDF_EPSILON);
         float pSpec = specularSelectProb(NdotV, s.baseColor, s.metallic, params.quality_mode);
         float pSheen = sheenSelectProb(s.sheenColor, s.baseColor, s.metallic, params.quality_mode);
+        float pCC = clearcoatSelectProb(NdotV, s.clearcoat, params.quality_mode);
 
         //── Path-guide lookup (sampling + training context) ─────────────────
         // The guide learns INCIDENT RADIANCE, which is only a good sampling
@@ -1187,7 +1219,7 @@ __forceinline__ __device__ float3 tracePath(
         }
 
         //── Next event estimation (one light sample, one shadow ray) ────────
-        float3 neeContrib = sampleDirectLight(s, V, pSpec, pSheen, guideAlpha,
+        float3 neeContrib = sampleDirectLight(s, V, pSpec, pSheen, pCC, guideAlpha,
             guideLobe, seed, atCap);
         // Off-cap, the stochastic transmission event above evaluates the
         // (1-t)*opaque + t*transmission blend by branching, so surviving to
@@ -1272,7 +1304,8 @@ __forceinline__ __device__ float3 tracePath(
             haveDir = true;
         } else {
             incrementGuideStat(GUIDE_STAT_BSDF_SAMPLED);
-            haveDir = sampleBSDFMixture(V, s.shadingNormal, s.roughness, pSpec, pSheen,
+            haveDir = sampleBSDFMixture(V, s.shadingNormal, s.roughness,
+                s.clearcoatRoughness, pSpec, pSheen, pCC,
                 randomFloat(seed), randomFloat(seed), randomFloat(seed), L);
         }
 
@@ -1295,7 +1328,8 @@ __forceinline__ __device__ float3 tracePath(
 
         // Combined PDF: the one-sample MIS estimator divides by the mixture
         // density — no separate weight needed.
-        float pdfBsdf = pdfBSDFMixture(V, L, s.shadingNormal, s.roughness, pSpec, pSheen);
+        float pdfBsdf = pdfBSDFMixture(V, L, s.shadingNormal, s.roughness,
+            s.clearcoatRoughness, pSpec, pSheen, pCC);
         float combinedPdf;
         if (guideAlpha > 0.0f) {
             float pdfGuide = guideLobePdf(guideLobe, L);
@@ -1318,7 +1352,7 @@ __forceinline__ __device__ float3 tracePath(
 
         float3 f = evalPbrBSDF(V, L, s.shadingNormal, s.baseColor, s.metallic, s.roughness,
             s.clearcoat, s.clearcoatRoughness, s.sheenColor, s.sheenRoughness,
-            params.quality_mode, pSpec, pSheen, nullptr);
+            params.quality_mode, pSpec, pSheen, pCC, nullptr);
 
         float3 beta = f * (NdotL / combinedPdf) * rrInv;
         throughput = throughput * beta;
@@ -1454,6 +1488,8 @@ extern "C" __global__ void __raygen__simple() {
     float3 accumulatedColor = make_float3(0.0f, 0.0f, 0.0f);
     float3 accumulatedAlbedo = make_float3(0.0f, 0.0f, 0.0f);
     float3 accumulatedNormal = make_float3(0.0f, 0.0f, 0.0f);
+    float selCoverage = 0.0f;   // samples whose first hit is the selected instance
+    float selRimSum = 0.0f;
 
     for (unsigned int sampleIdx = 0; sampleIdx < spp; ++sampleIdx) {
         unsigned int seed = mixSeed(pixelX, pixelY, params.frame_index, sampleIdx);
@@ -1499,10 +1535,13 @@ extern "C" __global__ void __raygen__simple() {
         float3 sample = tracePath(params.camera.position, rayDir, seed,
             &firstInstance, &selectionRim, &sampleAlbedo, &sampleNormal);
 
-        // Editor selection highlight (display-only tint, not physical)
+        // Editor selection highlight: record coverage/rim only. The tint is
+        // applied to the DISPLAYED value below, never to the accumulation
+        // buffer — selection while guiding skips the accumulation reset, and
+        // a baked-in tint would permanently stain the converged image.
         if (firstInstance != 0xFFFFFFFFu && firstInstance == params.selected_instance_id) {
-            sample = sample * make_float3(1.1f, 1.15f, 1.4f)
-                   + make_float3(0.2f, 0.4f, 1.0f) * selectionRim;
+            selCoverage += 1.0f;
+            if (isfinite(selectionRim)) selRimSum += selectionRim;
         }
 
         // Degenerate-sample guard: a NaN would poison the accumulation buffer
@@ -1511,6 +1550,15 @@ extern "C" __global__ void __raygen__simple() {
         float sampleLum = sample.x + sample.y + sample.z;
         if (!isfinite(sampleLum)) {
             sample = make_float3(0.0f, 0.0f, 0.0f);
+        }
+        // Same guard for the denoiser AOVs: their progressive averages never
+        // recover from a NaN either (degenerate geometry can make the
+        // first-hit shading normal NaN even when the color sample is finite).
+        if (!isfinite(sampleAlbedo.x + sampleAlbedo.y + sampleAlbedo.z)) {
+            sampleAlbedo = make_float3(0.0f, 0.0f, 0.0f);
+        }
+        if (!isfinite(sampleNormal.x + sampleNormal.y + sampleNormal.z)) {
+            sampleNormal = make_float3(0.0f, 0.0f, 0.0f);
         }
 
         accumulatedColor = accumulatedColor + sample;
@@ -1523,6 +1571,7 @@ extern "C" __global__ void __raygen__simple() {
     float3 newAlbedo = accumulatedAlbedo * invSpp;
     float3 newNormal = accumulatedNormal * invSpp;
 
+    float3 displayColor;
     if (params.accumulated_frames > 0 && params.accumulation_buffer != nullptr) {
         float4 accumulated = params.accumulation_buffer[linear_idx];
         float n = (float)(params.accumulated_frames + 1);
@@ -1533,13 +1582,26 @@ extern "C" __global__ void __raygen__simple() {
             accumulated.z + (newColor.z - accumulated.z) / n);
 
         params.accumulation_buffer[linear_idx] = make_float4(blended.x, blended.y, blended.z, 1.0f);
-        params.output_buffer[linear_idx] = make_float4(blended.x, blended.y, blended.z, 1.0f);
+        displayColor = blended;
     } else {
         if (params.accumulation_buffer != nullptr) {
             params.accumulation_buffer[linear_idx] = make_float4(newColor.x, newColor.y, newColor.z, 1.0f);
         }
-        params.output_buffer[linear_idx] = make_float4(newColor.x, newColor.y, newColor.z, 1.0f);
+        displayColor = newColor;
     }
+
+    // Editor selection highlight (display-only tint, not physical): applied to
+    // the blended value at display time — per-sample tinting would both bake
+    // the highlight into the accumulation buffer and make its brightness vary
+    // with spp/noise. Coverage-weighted so AA edge pixels tint partially.
+    if (selCoverage > 0.0f) {
+        float frac = selCoverage * invSpp;
+        float3 tint = lerp(make_float3(1.0f, 1.0f, 1.0f),
+                           make_float3(1.1f, 1.15f, 1.4f), frac);
+        displayColor = displayColor * tint
+                     + make_float3(0.2f, 0.4f, 1.0f) * (selRimSum * invSpp);
+    }
+    params.output_buffer[linear_idx] = make_float4(displayColor.x, displayColor.y, displayColor.z, 1.0f);
 
     // Denoiser AOV progressive accumulation (same frame counter as radiance)
     if (params.aov_albedo_buffer != nullptr) {

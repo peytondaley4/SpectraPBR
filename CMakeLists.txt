@@ -335,8 +335,14 @@ add_dependencies(SpectraPBR optix_ptx)
 #------------------------------------------------------------------------------
 # Copy resources to build directory
 #------------------------------------------------------------------------------
-# Copy shaders
-add_custom_command(TARGET SpectraPBR POST_BUILD
+# Copy shaders, fonts and HDRIs next to the exe. Deliberately an ALWAYS-RUN
+# target rather than a POST_BUILD step, for the same reason as copy_ptx below:
+# POST_BUILD only fires when the exe itself relinks, so an edit that touches
+# ONLY a shader would leave the runtime copy next to the exe STALE — the app
+# would silently render with the old shader. copy_if_different keeps the
+# shader cost negligible; copy_directory has no if_different variant before
+# CMake 3.26, so fonts/HDRIs are re-copied each build (bounded cost).
+add_custom_target(copy_assets ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/shaders"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/display.vert"
@@ -356,7 +362,15 @@ add_custom_command(TARGET SpectraPBR POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hemisphere.frag"
             "$<TARGET_FILE_DIR:SpectraPBR>/shaders/"
-    COMMENT "Copying shaders to build directory"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
+            "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/assets/hdri"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/hdri"
+            "$<TARGET_FILE_DIR:SpectraPBR>/assets/hdri"
+    COMMENT "Syncing shaders and assets to the executable directory"
 )
 
 # Copy PTX next to the exe. Deliberately an ALWAYS-RUN target rather than a
@@ -387,26 +401,10 @@ add_custom_target(copy_ptx ALL
 # DUPLICATED into both — two nvcc instances racing on the same .ptx in a
 # parallel build. Target-level dependency orders without duplicating.
 add_dependencies(copy_ptx optix_ptx)
-# NOTE: copy_ptx is part of ALL (the default build, which build.bat uses).
-# `cmake --build build --target SpectraPBR` alone does NOT sync PTX — the
-# dependency cannot point the other way without creating a cycle.
-
-# Copy fonts for UI
-add_custom_command(TARGET SpectraPBR POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
-            "$<TARGET_FILE_DIR:SpectraPBR>/assets/fonts"
-    COMMENT "Copying fonts to build directory"
-)
-
-add_custom_command(TARGET SpectraPBR POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:SpectraPBR>/assets/hdri"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_CURRENT_SOURCE_DIR}/assets/hdri"
-            "$<TARGET_FILE_DIR:SpectraPBR>/assets/hdri"
-    COMMENT "Copying HDRI files to build directory"
-)
+# NOTE: copy_ptx and copy_assets are part of ALL (the default build, which
+# build.bat uses). `cmake --build build --target SpectraPBR` alone does NOT
+# sync PTX, shaders or assets — the dependency cannot point the other way
+# without creating a cycle.
 
 #------------------------------------------------------------------------------
 # Installation

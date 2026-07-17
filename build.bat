@@ -9,7 +9,7 @@ REM   build.bat debug      Debug configuration instead of Release
 REM   build.bat clean      wipe the build directory first (full rebuild)
 REM   Args combine:        build.bat clean debug run
 REM
-REM Requirements: CMake 3.18+, CUDA Toolkit, OptiX SDK, Visual Studio C++.
+REM Requirements: CMake 3.20+, CUDA Toolkit, OptiX SDK, Visual Studio C++.
 REM If CMake cannot find OptiX automatically (it searches
 REM   C:\ProgramData\NVIDIA Corporation\OptiX SDK *), set:
 REM   set OptiX_INSTALL_DIR=C:\path\to\OptiX SDK x.x.x
@@ -38,7 +38,7 @@ if %DO_CLEAN%==1 (
 )
 
 echo [build] Configuring (%CONFIG%, sm_%SPECTRA_CUDA_ARCH%) ...
-cmake -S . -B %BUILD_DIR% -DCMAKE_CUDA_ARCHITECTURES=%SPECTRA_CUDA_ARCH%
+cmake -S . -B %BUILD_DIR% -DCMAKE_BUILD_TYPE=%CONFIG% -DCMAKE_CUDA_ARCHITECTURES=%SPECTRA_CUDA_ARCH%
 if errorlevel 1 (
     echo.
     echo [build] CMake configure FAILED. If OptiX was not found, set
@@ -67,7 +67,7 @@ echo [build] OK: %EXE%
 if %DO_RUN%==1 (
     echo [build] Launching ...
     REM Run from the exe directory: shaders/, optix_programs/ (PTX) and
-    REM assets/ are copied next to the exe by the CMake post-build steps.
+    REM assets/ are synced next to the exe by the CMake copy targets.
     pushd "%EXE_DIR%"
     SpectraPBR.exe
     popd

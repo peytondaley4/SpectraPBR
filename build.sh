@@ -9,7 +9,7 @@
 #   ./build.sh clean      wipe the build directory first (full rebuild)
 #   Args combine:         ./build.sh clean debug run
 #
-# Requirements: CMake 3.18+, CUDA Toolkit, OptiX SDK, GCC 9+/Clang 10+.
+# Requirements: CMake 3.20+, CUDA Toolkit, OptiX SDK, GCC 9+/Clang 10+.
 # If CMake cannot find OptiX automatically, export:
 #   export OptiX_INSTALL_DIR=~/NVIDIA-OptiX-SDK-x.x.x
 #
@@ -48,6 +48,6 @@ echo "[build] OK: $EXE_DIR/SpectraPBR"
 if [ "$DO_RUN" -eq 1 ]; then
     echo "[build] Launching ..."
     # Run from the exe directory: shaders/, optix_programs/ (PTX) and assets/
-    # are copied next to the exe by the CMake post-build steps.
+    # are synced next to the exe by the CMake copy targets.
     (cd "$EXE_DIR" && ./SpectraPBR)
 fi

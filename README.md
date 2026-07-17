@@ -6,7 +6,7 @@ A real-time physically-based rendering application using NVIDIA OptiX for ray tr
 
 Before building, ensure you have the following installed:
 
-1. **CMake** (version 3.18 or higher)
+1. **CMake** (version 3.20 or higher)
    - Download from: https://cmake.org/download/
    - Or install via: `winget install Kitware.CMake`
 
@@ -219,7 +219,3 @@ SpectraPBR/
 ## License
 
 [Add your license information here]
-
-[CellInspect] Hit pos: (0.80685, 1.55101, 0.199052) Bounds: [-46.6055..46.6055, -5.77765..9.92478, -46.6055..46.6055] Cells: 7192
-[CellInspect] Hit pos: (0.80685, 1.55101, 0.199052) Bounds: [-46.6055..46.6055, -5.77765..9.92478, -46.6055..46.6055] Cells: 7256
-[OptiX] SBT updated with 3 materials (6 records)

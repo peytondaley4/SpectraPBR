@@ -170,10 +170,6 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    // Initialize buffer indices
-    m_writeBuffer = 0;
-    m_displayBuffer = 0;
-
     // Create UI texture (RGBA32F for alpha compositing) - single buffered
     glGenTextures(1, &m_uiTexture);
     glBindTexture(GL_TEXTURE_2D, m_uiTexture);
@@ -196,11 +192,6 @@ bool GLContext::createDisplayResources(const std::filesystem::path& shaderDir) {
               << NUM_SCENE_BUFFERS << " buffers] + " << getBufferSize() / (1024 * 1024) << " MB UI)\n";
 
     return true;
-}
-
-void GLContext::updateTextureFromPBO() {
-    // Legacy single-buffer path: update from first buffer
-    updateTextureFromPBO(0);
 }
 
 void GLContext::updateTextureFromPBO(int bufferIndex) {
@@ -315,9 +306,14 @@ void GLContext::setResolution(uint32_t width, uint32_t height) {
         // handles pre-resize, buffer recreation, and post-resize.
         glfwSetWindowSize(m_window, width, height);
     } else {
-        // In fullscreen mode, glfwSetWindowSize doesn't trigger the callback,
-        // so run the resize sequence directly.
-        onFramebufferResized(static_cast<int>(width), static_cast<int>(height));
+        // In fullscreen mode, change the video mode on the current monitor.
+        // The resulting GLFW framebuffer-size callback (owned by the
+        // Application) drives the resize sequence, same as the windowed path.
+        GLFWmonitor* monitor = glfwGetWindowMonitor(m_window);
+        if (!monitor) monitor = glfwGetPrimaryMonitor();
+        glfwSetWindowMonitor(m_window, monitor, 0, 0,
+                             static_cast<int>(width), static_cast<int>(height),
+                             GLFW_DONT_CARE);
     }
 }
 
@@ -353,10 +349,6 @@ void GLContext::recreateBuffers() {
         glBufferData(GL_PIXEL_UNPACK_BUFFER, getBufferSize(), nullptr, GL_DYNAMIC_DRAW);
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    // Reset buffer indices
-    m_writeBuffer = 0;
-    m_displayBuffer = 0;
 
     // Recreate UI PBO
     if (m_uiPbo) {

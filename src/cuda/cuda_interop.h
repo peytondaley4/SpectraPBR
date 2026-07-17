@@ -47,39 +47,27 @@ public:
     // Shutdown CUDA
     void shutdown();
 
-    // Register OpenGL PBO with CUDA (legacy single-buffer)
-    // Returns false on failure
-    bool registerPBO(uint32_t pbo, size_t size);
-
     // Register triple-buffered PBOs with CUDA
+    // Returns false on failure
     bool registerPBOs(uint32_t pbo0, uint32_t pbo1, uint32_t pbo2, size_t size);
 
     // Register UI PBO with CUDA
     bool registerUIPBO(uint32_t pbo, size_t size);
 
-    // Unregister PBO (call before resizing)
-    void unregisterPBO();
-
-    // Unregister all triple-buffered PBOs
+    // Unregister all triple-buffered PBOs (call before resizing)
     void unregisterPBOs();
 
     // Unregister UI PBO
     void unregisterUIPBO();
 
-    // Map PBO for CUDA access (legacy single-buffer)
-    // Returns device pointer, or nullptr on failure
-    float* mapPBO();
-
     // Map specific buffer for CUDA access (triple buffering)
+    // Returns device pointer, or nullptr on failure
     float* mapBuffer(int index);
 
     // Map UI PBO for CUDA access (uses UI stream, not render stream)
     float* mapUIPBO();
 
-    // Unmap PBO (must call after rendering, before OpenGL uses it)
-    void unmapPBO();
-
-    // Unmap specific buffer (triple buffering)
+    // Unmap specific buffer (must call after rendering, before OpenGL uses it)
     void unmapBuffer(int index);
 
     // Unmap UI PBO (uses UI stream, not render stream)
@@ -118,9 +106,6 @@ public:
     // Print memory usage
     void printMemoryUsage() const;
 
-    // Triple buffering: check if using multi-buffer mode
-    bool isTripleBuffered() const { return m_tripleBuffered; }
-
 private:
     int m_deviceId = -1;
     CUcontext m_cudaContext = nullptr;
@@ -132,7 +117,6 @@ private:
     cudaEvent_t m_renderComplete[NUM_SCENE_BUFFERS] = {};
     bool m_pboMapped[NUM_SCENE_BUFFERS] = {};
     size_t m_pboSize = 0;
-    bool m_tripleBuffered = false;
 
     // UI PBO interop (single-buffered)
     cudaGraphicsResource_t m_uiPboResource = nullptr;

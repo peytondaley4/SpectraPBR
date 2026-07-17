@@ -62,16 +62,7 @@ bool CudaInterop::init() {
 
 void CudaInterop::shutdown() {
     // Unmap and unregister all triple-buffered PBOs
-    if (m_tripleBuffered) {
-        unregisterPBOs();
-    } else {
-        if (m_pboMapped[0]) {
-            unmapPBO();
-        }
-        if (m_pboResources[0]) {
-            unregisterPBO();
-        }
-    }
+    unregisterPBOs();
     if (m_uiPboMapped) {
         unmapUIPBO();
     }
@@ -98,30 +89,6 @@ void CudaInterop::shutdown() {
     m_deviceId = -1;
 }
 
-bool CudaInterop::registerPBO(uint32_t pbo, size_t size) {
-    // Legacy single-buffer registration - uses slot 0
-    if (m_pboResources[0]) {
-        unregisterPBO();
-    }
-
-    CUDA_CHECK(cudaGraphicsGLRegisterBuffer(
-        &m_pboResources[0],
-        pbo,
-        cudaGraphicsMapFlagsWriteDiscard  // We only write, never read
-    ));
-
-    // Create event for this buffer
-    if (!m_renderComplete[0]) {
-        CUDA_CHECK(cudaEventCreate(&m_renderComplete[0]));
-    }
-
-    m_pboSize = size;
-    m_tripleBuffered = false;
-    std::cout << "[CUDA] Registered PBO " << pbo << " (" << size / (1024 * 1024) << " MB)\n";
-
-    return true;
-}
-
 bool CudaInterop::registerPBOs(uint32_t pbo0, uint32_t pbo1, uint32_t pbo2, size_t size) {
     // Unregister any existing PBOs
     unregisterPBOs();
@@ -142,30 +109,11 @@ bool CudaInterop::registerPBOs(uint32_t pbo0, uint32_t pbo1, uint32_t pbo2, size
     }
 
     m_pboSize = size;
-    m_tripleBuffered = true;
 
     std::cout << "[CUDA] Registered triple-buffered PBOs " << pbo0 << "/" << pbo1 << "/" << pbo2
               << " (" << size / (1024 * 1024) << " MB each)\n";
 
     return true;
-}
-
-void CudaInterop::unregisterPBO() {
-    // Legacy single-buffer unregistration
-    if (m_pboMapped[0]) {
-        unmapPBO();
-    }
-    if (m_pboResources[0]) {
-        CUDA_CHECK_NORETURN(cudaGraphicsUnregisterResource(m_pboResources[0]));
-        m_pboResources[0] = nullptr;
-        std::cout << "[CUDA] Unregistered PBO\n";
-    }
-    if (m_renderComplete[0]) {
-        cudaEventDestroy(m_renderComplete[0]);
-        m_renderComplete[0] = nullptr;
-    }
-    m_pboSize = 0;
-    m_tripleBuffered = false;
 }
 
 void CudaInterop::unregisterPBOs() {
@@ -184,7 +132,6 @@ void CudaInterop::unregisterPBOs() {
         m_pboMapped[i] = false;
     }
     m_pboSize = 0;
-    m_tripleBuffered = false;
 
     std::cout << "[CUDA] Unregistered all PBOs\n";
 }
@@ -216,11 +163,6 @@ void CudaInterop::unregisterUIPBO() {
         m_uiPboSize = 0;
         std::cout << "[CUDA] Unregistered UI PBO\n";
     }
-}
-
-float* CudaInterop::mapPBO() {
-    // Legacy single-buffer map - uses slot 0
-    return mapBuffer(0);
 }
 
 float* CudaInterop::mapBuffer(int index) {
@@ -256,11 +198,6 @@ float* CudaInterop::mapBuffer(int index) {
 
     m_pboMapped[index] = true;
     return static_cast<float*>(devPtr);
-}
-
-void CudaInterop::unmapPBO() {
-    // Legacy single-buffer unmap - uses slot 0
-    unmapBuffer(0);
 }
 
 void CudaInterop::unmapBuffer(int index) {

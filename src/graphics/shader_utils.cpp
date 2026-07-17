@@ -67,6 +67,10 @@ GLuint linkProgram(GLuint vertexShader, GLuint fragmentShader) {
     GLint success;
     glGetProgramiv(program, GL_LINK_STATUS, &success);
 
+    // Detach while the program still exists (the failure path deletes it)
+    glDetachShader(program, vertexShader);
+    glDetachShader(program, fragmentShader);
+
     if (!success) {
         GLint logLength;
         glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
@@ -80,9 +84,6 @@ GLuint linkProgram(GLuint vertexShader, GLuint fragmentShader) {
         program = 0;
     }
 
-    // Detach and delete shaders regardless of link success
-    glDetachShader(program, vertexShader);
-    glDetachShader(program, fragmentShader);
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
 

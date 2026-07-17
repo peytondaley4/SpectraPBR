@@ -57,11 +57,8 @@ public:
     // shaderDir: directory containing display.vert and display.frag
     bool createDisplayResources(const std::filesystem::path& shaderDir);
 
-    // Update display texture from PBO (legacy single-buffer)
-    // Call after CUDA has written to the mapped PBO
-    void updateTextureFromPBO();
-
     // Update display texture from specific PBO index (triple buffering)
+    // Call after CUDA has written to the mapped PBO
     void updateTextureFromPBO(int bufferIndex);
 
     // Update UI texture from UI PBO
@@ -86,22 +83,11 @@ public:
     void setExposure(float exposure) { m_exposure = exposure; }
     float getExposure() const { return m_exposure; }
 
-    // Get PBO for CUDA interop registration (legacy single-buffer)
-    GLuint getPBO() const { return m_pbos[0]; }
-
-    // Get specific PBO by index (triple buffering)
+    // Get specific PBO by index for CUDA interop registration (triple buffering)
     GLuint getPBO(int index) const { return m_pbos[index]; }
 
     // Get UI PBO for CUDA interop registration
     GLuint getUIPBO() const { return m_uiPbo; }
-
-    // Triple buffering buffer index management
-    int getWriteBufferIndex() const { return m_writeBuffer; }
-    int getDisplayBufferIndex() const { return m_displayBuffer; }
-    void advanceBuffers() {
-        m_writeBuffer = (m_writeBuffer + 1) % NUM_SCENE_BUFFERS;
-        m_displayBuffer = (m_displayBuffer + 1) % NUM_SCENE_BUFFERS;
-    }
 
     // Get current dimensions
     uint32_t getWidth() const { return m_width; }
@@ -149,8 +135,6 @@ private:
     // Display resources (triple-buffered for scene)
     GLuint m_displayTextures[NUM_SCENE_BUFFERS] = {};  // Triple-buffered textures
     GLuint m_pbos[NUM_SCENE_BUFFERS] = {};             // Triple-buffered PBOs
-    int m_writeBuffer = 0;                              // Buffer GPU is writing to
-    int m_displayBuffer = 0;                            // Buffer being displayed
     GLuint m_displayProgram = 0;
     GLuint m_emptyVAO = 0;  // For fullscreen triangle
 

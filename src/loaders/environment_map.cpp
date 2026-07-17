@@ -128,8 +128,11 @@ bool EnvironmentMap::buildAliasTable(const float* rgbData) {
     const uint32_t n = m_width * m_height;
     const float PI = 3.14159265358979323846f;
 
+    // Accumulate in double: a float running sum over millions of texels rounds
+    // small (dark-texel) weights to zero, drifting the pmf the device divides
+    // by away from the alias table's realized selection probabilities.
     std::vector<float> weighted(n);
-    m_totalLuminance = 0.0f;
+    double totalLuminance = 0.0;
     for (uint32_t y = 0; y < m_height; y++) {
         float v = (y + 0.5f) / m_height;          // 0 (top) .. 1 (bottom)
         float sinTheta = std::sin(v * PI);
@@ -140,20 +143,21 @@ bool EnvironmentMap::buildAliasTable(const float* rgbData) {
             float b = rgbData[idx * 3 + 2];
             float w = (0.2126f * r + 0.7152f * g + 0.0722f * b) * sinTheta;
             weighted[idx] = w;
-            m_totalLuminance += w;
+            totalLuminance += w;
         }
     }
-    if (m_totalLuminance <= 0.0f) {
+    if (totalLuminance <= 0.0) {
         std::cerr << "[EnvironmentMap] Warning: environment map has zero luminance\n";
-        m_totalLuminance = 1.0f;  // avoid division by zero
+        totalLuminance = 1.0;  // avoid division by zero
     }
+    m_totalLuminance = static_cast<float>(totalLuminance);
 
     // Per-texel selection probability (normalized). This is exactly the
     // marginalPdf*conditionalPdf product the old CDF environmentPdf computed, so
     // the device PDF formula pmf[texel]*(W*H)/(2*pi^2*sin theta) is unchanged.
     std::vector<float> pmf(n);
-    const float invTotal = 1.0f / m_totalLuminance;
-    for (uint32_t i = 0; i < n; i++) pmf[i] = weighted[i] * invTotal;
+    const double invTotal = 1.0 / totalLuminance;
+    for (uint32_t i = 0; i < n; i++) pmf[i] = static_cast<float>(weighted[i] * invTotal);
 
     // Walker/Vose alias construction. scaled[i] = pmf[i]*n; pair light buckets
     // (<1) with heavy ones (>=1) until every bucket holds <=2 outcomes.

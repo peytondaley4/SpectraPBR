@@ -7,6 +7,7 @@
 #include <tiny_obj_loader.h>
 
 #include "model_loader.h"
+#include <cstdint>
 #include <iostream>
 #include <unordered_map>
 #include <glm/glm.hpp>
@@ -382,11 +383,16 @@ std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) 
         result.materials.push_back(MaterialData{});
     }
 
-    // Load meshes
+    // Load meshes. Skipped primitives leave holes in glTF primitive order, so
+    // record where each primitive landed in result.meshes (UINT32_MAX = skipped)
+    // for the instance creation in processNode below.
+    std::vector<std::vector<uint32_t>> primToLoadedMesh(model.meshes.size());
     for (size_t meshIdx = 0; meshIdx < model.meshes.size(); ++meshIdx) {
         const auto& mesh = model.meshes[meshIdx];
+        primToLoadedMesh[meshIdx].assign(mesh.primitives.size(), UINT32_MAX);
 
-        for (const auto& primitive : mesh.primitives) {
+        for (size_t primIdx = 0; primIdx < mesh.primitives.size(); ++primIdx) {
+            const auto& primitive = mesh.primitives[primIdx];
             if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
                 std::cout << "[ModelLoader] Skipping non-triangle primitive\n";
                 continue;
@@ -503,6 +509,28 @@ std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) 
                 }
             }
 
+            // Validate indices before generateFlatNormals/generateTangents
+            // dereference mesh.vertices[index] on the host (and before the GAS
+            // build consumes them on the device).
+            if (meshData.indices.size() % 3 != 0) {
+                std::cerr << "[ModelLoader] " << path.filename().string()
+                          << ": mesh " << meshIdx << " primitive " << primIdx
+                          << " index count " << meshData.indices.size()
+                          << " is not a multiple of 3, skipping\n";
+                continue;
+            }
+            uint32_t maxIndex = 0;
+            for (uint32_t index : meshData.indices) {
+                if (index > maxIndex) maxIndex = index;
+            }
+            if (!meshData.indices.empty() && maxIndex >= vertexCount) {
+                std::cerr << "[ModelLoader] " << path.filename().string()
+                          << ": mesh " << meshIdx << " primitive " << primIdx
+                          << " has index " << maxIndex << " >= vertex count "
+                          << vertexCount << ", skipping\n";
+                continue;
+            }
+
             // Generate normals if missing
             if (!normals) {
                 generateFlatNormals(meshData);
@@ -513,6 +541,7 @@ std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) 
                 generateTangents(meshData);
             }
 
+            primToLoadedMesh[meshIdx][primIdx] = static_cast<uint32_t>(result.meshes.size());
             result.meshes.push_back(std::move(meshData));
         }
     }
@@ -568,15 +597,13 @@ std::optional<LoadedModel> ModelLoader::load(const std::filesystem::path& path) 
 
         // If this node has a mesh, create instances for it
         if (node.mesh >= 0) {
-            // Count primitives up to this mesh to get correct mesh indices
-            size_t baseMeshIdx = 0;
-            for (int m = 0; m < node.mesh; ++m) {
-                baseMeshIdx += model.meshes[m].primitives.size();
-            }
-
-            for (size_t p = 0; p < model.meshes[node.mesh].primitives.size(); ++p) {
+            const auto& loadedMeshes = primToLoadedMesh[node.mesh];
+            for (size_t p = 0; p < loadedMeshes.size(); ++p) {
+                if (loadedMeshes[p] == UINT32_MAX) {
+                    continue;  // Primitive was skipped during loading
+                }
                 ModelInstance instance;
-                instance.meshIndex = static_cast<uint32_t>(baseMeshIdx + p);
+                instance.meshIndex = loadedMeshes[p];
 
                 // Store as 3x4 row-major (OptiX format)
                 const float* m = glm::value_ptr(glm::transpose(worldTransform));
@@ -901,12 +928,26 @@ void ModelLoader::generateFlatNormals(MeshData& mesh) {
                      mesh.vertices[i2].position.y,
                      mesh.vertices[i2].position.z);
 
-        glm::vec3 normal = glm::normalize(glm::cross(p1 - p0, p2 - p0));
+        glm::vec3 faceCross = glm::cross(p1 - p0, p2 - p0);
+        float crossLen2 = glm::dot(faceCross, faceCross);
+        if (crossLen2 < 1e-20f) {
+            continue;  // Degenerate face: normalizing would write NaN normals
+        }
+        glm::vec3 normal = faceCross / std::sqrt(crossLen2);
 
         float3 n = make_float3(normal.x, normal.y, normal.z);
         mesh.vertices[i0].normal = n;
         mesh.vertices[i1].normal = n;
         mesh.vertices[i2].normal = n;
+    }
+
+    // Vertices referenced only by degenerate faces keep their initial normal,
+    // which is zero on the OBJ path; give those a fixed axis so device-side
+    // normalization stays finite.
+    for (auto& v : mesh.vertices) {
+        if (v.normal.x == 0.0f && v.normal.y == 0.0f && v.normal.z == 0.0f) {
+            v.normal = make_float3(0.0f, 1.0f, 0.0f);
+        }
     }
 }
 
@@ -973,8 +1014,15 @@ void ModelLoader::generateTangents(MeshData& mesh) {
         glm::vec3 t = tangents[i];
         glm::vec3 b = bitangents[i];
 
-        // Gram-Schmidt orthonormalize
-        t = glm::normalize(t - n * glm::dot(n, t));
+        // Gram-Schmidt orthonormalize; a zero-accumulated or normal-parallel
+        // tangent would normalize to NaN, so fall back to the default tangent.
+        glm::vec3 ortho = t - n * glm::dot(n, t);
+        float orthoLen2 = glm::dot(ortho, ortho);
+        if (orthoLen2 < 1e-20f) {
+            v.tangent = make_float4(1.0f, 0.0f, 0.0f, 1.0f);
+            continue;
+        }
+        t = ortho / std::sqrt(orthoLen2);
 
         // Calculate handedness
         float w = (glm::dot(glm::cross(n, t), b) < 0.0f) ? -1.0f : 1.0f;

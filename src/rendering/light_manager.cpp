@@ -6,12 +6,45 @@
 
 namespace spectra {
 
+static float3 normalizeFloat3(float3 v) {
+    float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len > 0.0f) {
+        return make_float3(v.x / len, v.y / len, v.z / len);
+    }
+    return v;
+}
+
 void LightManager::addDirectionalLight(const GpuDirectionalLight& light) {
     dirLights.push_back(light);
 }
 
 void LightManager::addAreaLight(const GpuAreaLight& light) {
-    areaLights.push_back(light);
+    GpuAreaLight l = light;
+    // Virtual rects are sampled on the device (raygen.cu) as
+    // position + tangent*u*size.x + cross(normal, tangent)*v*size.y with
+    // pdf_area = 1/area — that assumes an orthonormal frame, so Gram-Schmidt
+    // the tangent against the normal here or the sampled parallelogram's
+    // area (and plane) disagrees with the pdf and biases NEE. Mesh lights
+    // (triCount > 0) sample their real triangles; leave their frame alone.
+    if (l.triCount == 0) {
+        l.normal = normalizeFloat3(l.normal);
+        float d = l.tangent.x * l.normal.x + l.tangent.y * l.normal.y +
+                  l.tangent.z * l.normal.z;
+        float3 t = make_float3(l.tangent.x - l.normal.x * d,
+                               l.tangent.y - l.normal.y * d,
+                               l.tangent.z - l.normal.z * d);
+        if (t.x * t.x + t.y * t.y + t.z * t.z < 1e-12f) {
+            // Tangent (near-)parallel to normal: rebuild from a safe axis
+            float3 up = (std::fabs(l.normal.y) < 0.99f)
+                ? make_float3(0.0f, 1.0f, 0.0f)
+                : make_float3(1.0f, 0.0f, 0.0f);
+            t = make_float3(up.y * l.normal.z - up.z * l.normal.y,
+                            up.z * l.normal.x - up.x * l.normal.z,
+                            up.x * l.normal.y - up.y * l.normal.x);
+        }
+        l.tangent = normalizeFloat3(t);
+    }
+    areaLights.push_back(l);
 }
 
 void LightManager::addPointLight(const GpuPointLight& light) {
@@ -280,14 +313,6 @@ void LightManager::cleanup() {
     areaCapacity = 0;
     pointCapacity = 0;
     aliasCapacity = 0;
-}
-
-static float3 normalizeFloat3(float3 v) {
-    float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (len > 0.0f) {
-        return make_float3(v.x / len, v.y / len, v.z / len);
-    }
-    return v;
 }
 
 void LightManager::createDefaultLights() {

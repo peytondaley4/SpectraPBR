@@ -32,6 +32,8 @@ constexpr uint32_t PG_SUBDIV_STAT_NOSTRUCT   = 2;
 constexpr uint32_t PG_SUBDIV_STAT_CHILDREN   = 3;
 constexpr uint32_t PG_SUBDIV_STAT_LEVEL0     = 4;
 constexpr uint32_t PG_SUBDIV_STATS_SIZE      = 20;
+static_assert(PG_SUBDIV_STAT_LEVEL0 + 16 == PG_SUBDIV_STATS_SIZE,
+              "subdiv stats layout: 16-entry level histogram must fill the tail");
 
 // Fold per-lobe interval sums into EMA cumulative sums and refit the cell's
 // vMF mixture (hard-assignment stepwise EM M-step; Banerjee/Sra kappa

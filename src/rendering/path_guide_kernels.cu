@@ -314,7 +314,7 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     uint32_t level = (uint32_t)(key >> 48);
     if (stats) {
         uint32_t l = level < 15u ? level : 15u;
-        atomicAdd(&stats[4 + l], 1u);  // live-cell level histogram
+        atomicAdd(&stats[PG_SUBDIV_STAT_LEVEL0 + l], 1u);  // live-cell level histogram
     }
     if (level >= maxLevel) return;
 
@@ -342,7 +342,7 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
     }
     float visits = c[PG_CUM_VISITS];
     if (minVisits <= 0.0f || visits < gateVisits) return;
-    if (stats) atomicAdd(&stats[1], 1u);   // gate-passed
+    if (stats) atomicAdd(&stats[PG_SUBDIV_STAT_ELIGIBLE], 1u);   // gate-passed
 
     // ── Gate 2: radiance structure — per-axis half-cell statistics on the
     // conditional MEAN log1p(radiance) of the two half-cells (negative half
@@ -428,7 +428,12 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
                     float meanDist = cumS[PG_S_DIST] / w;
                     if (meanDist < 1e-4f) continue;
                     float ratio = meanDist / sigmaPos;
-                    float cap = ratio * ratio;
+                    // Achievable ceiling, floored at 8 like the refit's cap:
+                    // below the floor the refit grants min(implied, 8)
+                    // regardless of ratio, so the guide is not resolution-
+                    // limited there. (The inspector heuristic in
+                    // application.cpp mirrors this formula.)
+                    float cap = fmaxf(ratio * ratio, 8.0f);
                     // cap >= 500: already sharp enough that refinement buys
                     // little; demand > 4x cap: real headroom, with hysteresis.
                     if (cap < 500.0f && implied > 4.0f * cap) {
@@ -439,13 +444,13 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
             }
         }
         if (!structure) {
-            if (stats) atomicAdd(&stats[2], 1u);   // structure test failed
+            if (stats) atomicAdd(&stats[PG_SUBDIV_STAT_NOSTRUCT], 1u);   // structure test failed
             return;
         }
     }
 
     unsigned long long morton = key & ((1ull << 48) - 1);
-    if (stats) atomicAdd(&stats[0], 1u);   // split
+    if (stats) atomicAdd(&stats[PG_SUBDIV_STAT_SPLIT], 1u);   // split
 
     for (uint32_t k = 0; k < 8; k++) {
         bool inserted = false;
@@ -494,7 +499,7 @@ __global__ void subdivideCellsKernel(PathGuideTableDevice table,
             d[PG_CUM_HL_X] = 0.0f; d[PG_CUM_HL_Y] = 0.0f; d[PG_CUM_HL_Z] = 0.0f;
             d[PG_INT_HL_X] = 0.0f; d[PG_INT_HL_Y] = 0.0f; d[PG_INT_HL_Z] = 0.0f;
             d[PG_LAST_HIT_FRAME] = currentFrame;
-            if (stats) atomicAdd(&stats[3], 1u);
+            if (stats) atomicAdd(&stats[PG_SUBDIV_STAT_CHILDREN], 1u);
         }
     }
 }

@@ -15,6 +15,23 @@
 #include <cmath>
 #include <cfloat>
 
+// Layout lock: LaunchParams is memcpy'd verbatim into the device __constant__
+// GpuLaunchParams (render()/pick), and GpuMaterial into SBT records, so the
+// hand-mirrored structs in src/core/shared_types.h and
+// optix_programs/gpu_types.h must agree byte-for-byte. The spectra:: and
+// global-namespace mirrors coexist in this TU because shared_types.h is
+// namespaced and gpu_types.h is not.
+#include "../../optix_programs/gpu_types.h"
+static_assert(sizeof(spectra::LaunchParams) == sizeof(::GpuLaunchParams), "LaunchParams mirror diverged");
+static_assert(offsetof(spectra::LaunchParams, camera) == offsetof(::GpuLaunchParams, camera), "LaunchParams header block diverged");
+static_assert(offsetof(spectra::LaunchParams, firefly_clamp) == offsetof(::GpuLaunchParams, firefly_clamp), "LaunchParams light block diverged");
+static_assert(offsetof(spectra::LaunchParams, path_guide_data) == offsetof(::GpuLaunchParams, path_guide_data), "LaunchParams pick/guide block diverged");
+static_assert(offsetof(spectra::LaunchParams, aov_normal_buffer) == offsetof(::GpuLaunchParams, aov_normal_buffer), "LaunchParams tail diverged");
+static_assert(sizeof(spectra::GpuMaterial) == sizeof(::GpuMaterial), "GpuMaterial mirror diverged");
+static_assert(sizeof(spectra::GpuAreaLight) == sizeof(::GpuAreaLight), "GpuAreaLight mirror diverged");
+static_assert(sizeof(spectra::CameraParams) == sizeof(::GpuCameraParams), "CameraParams mirror diverged");
+static_assert(sizeof(::GpuVertex) == 48, "device GpuVertex must be 48 bytes");
+
 namespace spectra {
 
 // OptiX logging callback
@@ -515,12 +532,6 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
         return false;
     }
 
-    // Free old hitgroup records
-    if (m_hitgroupRecords) {
-        cudaFree(reinterpret_cast<void*>(m_hitgroupRecords));
-        m_hitgroupRecords = 0;
-    }
-
     // Create hitgroup records for each material AND ray type.
     // Layout: [mat0_radiance, mat0_shadow, mat1_radiance, mat1_shadow, ...]
     // Alpha-masked materials get the anyhit-enabled hit groups so MASK
@@ -530,16 +541,21 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
     // group so shadow rays pass through them (transparent shadows) — shadow
     // rays trace with ENFORCE_ANYHIT, which overrides the per-GAS disable,
     // so this works even when a material turns transmissive at runtime.
+    //
+    // Alloc-then-swap (mirrors SceneManager's instance arrays): pack records
+    // host-side and copy into NEW device allocations first; the old SBT and
+    // materials buffer stay live until everything has succeeded, so a failed
+    // rebuild leaves render() with a fully valid previous SBT.
     size_t numRecords = materials.size() * RAY_TYPE_COUNT;
     std::vector<HitGroupRecord> records(numRecords);
-    m_materialAlphaModes.resize(materials.size());
-    m_materialShadowAnyhit.resize(materials.size());
+    std::vector<uint32_t> alphaModes(materials.size());
+    std::vector<uint32_t> shadowAnyhitFlags(materials.size());
 
     for (size_t i = 0; i < materials.size(); ++i) {
         bool masked = (materials[i].alphaMode == ALPHA_MODE_MASK);
         bool shadowAnyhit = masked || (materials[i].transmission > 0.0f);
-        m_materialAlphaModes[i] = materials[i].alphaMode;
-        m_materialShadowAnyhit[i] = shadowAnyhit ? 1u : 0u;
+        alphaModes[i] = materials[i].alphaMode;
+        shadowAnyhitFlags[i] = shadowAnyhit ? 1u : 0u;
 
         size_t radianceIdx = i * RAY_TYPE_COUNT + RAY_TYPE_RADIANCE;
         OPTIX_CHECK(optixSbtRecordPackHeader(
@@ -554,45 +570,57 @@ bool OptixEngine::buildSBT(const std::vector<GpuMaterial>& materials,
         records[shadowIdx].geometryIndex = geometryIndices[i];
     }
 
-    // Allocate and copy hitgroup records
+    // Allocate and copy hitgroup records into a NEW buffer
     size_t recordsSize = sizeof(HitGroupRecord) * records.size();
-    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&m_hitgroupRecords), recordsSize);
+    CUdeviceptr newHitgroupRecords = 0;
+    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&newHitgroupRecords), recordsSize);
     if (err != cudaSuccess) {
         std::cerr << "[OptiX] Failed to allocate hitgroup records: " << cudaGetErrorString(err) << "\n";
         return false;
     }
-    err = cudaMemcpy(reinterpret_cast<void*>(m_hitgroupRecords), records.data(),
+    err = cudaMemcpy(reinterpret_cast<void*>(newHitgroupRecords), records.data(),
                      recordsSize, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         std::cerr << "[OptiX] Failed to copy hitgroup records: " << cudaGetErrorString(err) << "\n";
+        cudaFree(reinterpret_cast<void*>(newHitgroupRecords));
         return false;
     }
 
-    m_hitgroupRecordCount = records.size();
-
-    // Upload the material array for raygen-side shading (grow-only buffer)
-    if (materials.size() > m_materialsBufferCapacity) {
-        if (m_materialsBuffer) {
-            cudaFree(reinterpret_cast<void*>(m_materialsBuffer));
-            m_materialsBuffer = 0;
-        }
-        err = cudaMalloc(reinterpret_cast<void**>(&m_materialsBuffer),
-                         sizeof(GpuMaterial) * materials.size());
-        if (err != cudaSuccess) {
-            std::cerr << "[OptiX] Failed to allocate materials buffer: " << cudaGetErrorString(err) << "\n";
-            return false;
-        }
-        m_materialsBufferCapacity = materials.size();
+    // Upload the material array for raygen-side shading into a NEW allocation,
+    // swapped in below: a failed rebuild must leave the previous materials
+    // intact, so the live buffer is never written before the commit point.
+    CUdeviceptr newMaterialsBuffer = 0;
+    err = cudaMalloc(reinterpret_cast<void**>(&newMaterialsBuffer),
+                     sizeof(GpuMaterial) * materials.size());
+    if (err != cudaSuccess) {
+        std::cerr << "[OptiX] Failed to allocate materials buffer: " << cudaGetErrorString(err) << "\n";
+        cudaFree(reinterpret_cast<void*>(newHitgroupRecords));
+        return false;
     }
-    err = cudaMemcpy(reinterpret_cast<void*>(m_materialsBuffer), materials.data(),
+    err = cudaMemcpy(reinterpret_cast<void*>(newMaterialsBuffer), materials.data(),
                      sizeof(GpuMaterial) * materials.size(), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         std::cerr << "[OptiX] Failed to copy materials buffer: " << cudaGetErrorString(err) << "\n";
+        cudaFree(reinterpret_cast<void*>(newHitgroupRecords));
+        cudaFree(reinterpret_cast<void*>(newMaterialsBuffer));
         return false;
     }
+
+    // Full success: retire the old buffers and re-point SBT + launch params
+    if (m_hitgroupRecords) {
+        cudaFree(reinterpret_cast<void*>(m_hitgroupRecords));
+    }
+    m_hitgroupRecords = newHitgroupRecords;
+    m_hitgroupRecordCount = records.size();
+    if (m_materialsBuffer) {
+        cudaFree(reinterpret_cast<void*>(m_materialsBuffer));
+    }
+    m_materialsBuffer = newMaterialsBuffer;
+    m_materialsBufferCapacity = materials.size();
+    m_materialAlphaModes = std::move(alphaModes);
+    m_materialShadowAnyhit = std::move(shadowAnyhitFlags);
     m_launchParams.materials = reinterpret_cast<const GpuMaterial*>(m_materialsBuffer);
 
-    // Update SBT
     m_sbt.hitgroupRecordBase = m_hitgroupRecords;
     m_sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupRecord);
     m_sbt.hitgroupRecordCount = static_cast<unsigned int>(m_hitgroupRecordCount);
@@ -822,7 +850,10 @@ void OptixEngine::render(float4* outputBuffer, cudaStream_t stream) {
     );
 
     if (result != OPTIX_SUCCESS) {
+        // A frame that never launched must not advance the accumulation
+        // weight: the device blends with n = accumulated_frames + 1.
         std::cerr << "[OptiX] Launch failed: " << optixGetErrorName(result) << "\n";
+        return;
     }
 
     m_frameIndex++;
@@ -875,6 +906,7 @@ void OptixEngine::setEnvironmentImportance(const float* aliasProb,
 }
 
 void OptixEngine::setQualityMode(QualityMode mode) {
+    bool changed = (m_launchParams.quality_mode != mode);
     m_launchParams.quality_mode = mode;
     // firefly_clamp is the INITIAL clamp: the device grows the effective
     // threshold as clamp * sqrt(accumulated_frames + 1) (see raygen.cu
@@ -907,6 +939,12 @@ void OptixEngine::setQualityMode(QualityMode mode) {
             m_launchParams.firefly_clamp = 100.0f;
             m_launchParams.max_bounce_depth = 8;
             break;
+    }
+    // Modes differ in depth cap, clamp, and BRDF lobe set, so their frames
+    // estimate different images; blending them into one running mean is
+    // biased. Restart accumulation whenever the mode actually changes.
+    if (changed) {
+        resetAccumulation();
     }
 }
 

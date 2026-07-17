@@ -351,8 +351,13 @@ struct MissData {
 
 //------------------------------------------------------------------------------
 // Global Launch Parameters Declaration
-// Each .cu file includes this header and gets access to params
+// Each .cu file includes this header and gets access to params.
+// CUDA-only: on a plain host compile __constant__ expands to nothing and this
+// would define a global in every including TU (the host includes this header
+// solely for the layout static_asserts in optix_engine.cpp).
 //------------------------------------------------------------------------------
+#if defined(__CUDACC__)
 extern "C" {
     __constant__ GpuLaunchParams params;
 }
+#endif

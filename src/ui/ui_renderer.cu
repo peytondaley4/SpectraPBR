@@ -297,6 +297,20 @@ void UIRenderer::buildTileData(const std::vector<UIQuad>& quads,
             if (y > maxYf) maxYf = y;
         }
 
+        // Clip-aware binning: the kernel rejects pixels outside the quad's
+        // clip rect, so shrink the binned area to the intersection and drop
+        // fully-clipped quads instead of letting them consume tile slots.
+        bool hasClip = (quad.clipMaxX > quad.clipMinX) && (quad.clipMaxY > quad.clipMinY);
+        if (hasClip) {
+            if (minXf < quad.clipMinX) minXf = quad.clipMinX;
+            if (minYf < quad.clipMinY) minYf = quad.clipMinY;
+            if (maxXf > quad.clipMaxX) maxXf = quad.clipMaxX;
+            if (maxYf > quad.clipMaxY) maxYf = quad.clipMaxY;
+            if (minXf >= maxXf || minYf >= maxYf) {
+                continue;
+            }
+        }
+
         // Convert to integer bounds
         int quadMinX = static_cast<int>(minXf);
         int quadMinY = static_cast<int>(minYf);
@@ -333,6 +347,14 @@ void UIRenderer::buildTileData(const std::vector<UIQuad>& quads,
                 TileData& tile = m_hostTileData[rowOffset + tx];
                 if (tile.quadCount < MAX_QUADS_PER_TILE) {
                     tile.quadIndices[tile.quadCount++] = static_cast<uint16_t>(q);
+                } else {
+                    // Full tile: quads arrive sorted by ascending depth (the
+                    // kernel blends in stored order), so drop the oldest
+                    // (bottom-most) entry and append — the topmost quads must
+                    // win, not the ones binned first.
+                    std::memmove(tile.quadIndices, tile.quadIndices + 1,
+                                 (MAX_QUADS_PER_TILE - 1) * sizeof(uint16_t));
+                    tile.quadIndices[MAX_QUADS_PER_TILE - 1] = static_cast<uint16_t>(q);
                 }
             }
         }

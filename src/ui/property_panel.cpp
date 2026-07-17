@@ -230,13 +230,17 @@ void PropertyPanel::showInstanceProperties(const InstanceInfo& info) {
         m_iorSlider->setValue(info.ior);
         m_iorSlider->setVisible(info.transmission > 0.0f);
     }
+    // Readback convention (must mirror updateMaterialFromSliders): emissive =
+    // pickerColor * intensity, so the slider is seeded with the SAME divisor
+    // used to normalize the picker color — otherwise any material edit
+    // rescales a dim (max component < 1) emissive by its max component.
+    float emissiveIntensity = std::max({info.emissive.x, info.emissive.y, info.emissive.z, 1.0f});
     if (m_emissivePicker) {
-        float intensity = std::max({info.emissive.x, info.emissive.y, info.emissive.z, 1.0f});
-        m_emissivePicker->setColor(make_float3(info.emissive.x / intensity, info.emissive.y / intensity, info.emissive.z / intensity));
+        m_emissivePicker->setColor(make_float3(info.emissive.x / emissiveIntensity, info.emissive.y / emissiveIntensity, info.emissive.z / emissiveIntensity));
         m_emissivePicker->setVisible(true);
     }
     if (m_emissiveIntensitySlider) {
-        m_emissiveIntensitySlider->setValue(std::max({info.emissive.x, info.emissive.y, info.emissive.z, 0.0f}));
+        m_emissiveIntensitySlider->setValue(emissiveIntensity);
         m_emissiveIntensitySlider->setVisible(true);
     }
 

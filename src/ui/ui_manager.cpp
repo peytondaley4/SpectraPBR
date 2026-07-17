@@ -7,7 +7,6 @@
 #include <iostream>
 #include <cstdio>
 #include <cmath>
-#include <GLFW/glfw3.h>
 
 namespace spectra {
 namespace ui {
@@ -92,6 +91,15 @@ void UIManager::setScreenSize(uint32_t width, uint32_t height) {
 }
 
 void UIManager::update(float deltaTime) {
+    // Deferred scene-tree rebuild (see onSceneNodeExpanded): consumed here,
+    // after input dispatch (pollEvents) has returned and before geometry
+    // collection, so no TreeNode event handler is on the stack. Multiple
+    // expand events in one frame coalesce into a single rebuild.
+    if (m_treeRebuildPending) {
+        m_treeRebuildPending = false;
+        buildHierarchicalSceneTree();
+    }
+
     for (auto& widget : m_rootWidgets) {
         if (widget->isVisible()) {
             widget->update(deltaTime);
@@ -252,21 +260,6 @@ bool UIManager::handleMouseScroll(float2 pos, float delta) {
 }
 
 bool UIManager::handleKeyDown(int key, int mods) {
-    // Handle global shortcuts
-    if (key == GLFW_KEY_H && mods == 0) {
-        toggleScenePanel();
-        return true;
-    }
-
-    if ((key == GLFW_KEY_L || key == GLFW_KEY_D) && mods == 0) {
-        toggleTheme();
-        return true;
-    }
-    if (key == GLFW_KEY_G && mods == 0) {
-        toggleGridDebugPanel();
-        return true;
-    }
-
     // Forward to focused widgets
     for (auto& widget : m_rootWidgets) {
         if (widget->isVisible() && widget->onKeyDown(key, mods)) {
@@ -460,9 +453,11 @@ void UIManager::setSelectedInstanceId(uint32_t id) {
 
     m_selectedInstanceId = id;
 
-    // Update tree selection state
+    // Update tree selection state. Lights/models/meshes share the same
+    // dataIndex space as instances, so match instance rows only.
     for (auto* node : m_sceneNodes) {
-        node->setSelected(node->getUserData() == id);
+        node->setSelected(node->getNodeType() == SceneNodeType::Instance &&
+                          node->getUserData() == id);
     }
 
     // Clear preview textures when no selection
@@ -588,8 +583,11 @@ void UIManager::onSceneNodeExpanded(TreeNode* node, bool expanded) {
         m_hierarchy->setExpanded(nodeIndex, expanded);
     }
 
-    // Rebuild tree to reflect changes
-    buildHierarchicalSceneTree();
+    // Defer the rebuild to update(): this callback runs inside the expanding
+    // TreeNode's own onMouseDown, and rebuilding here destroys that node (a
+    // use-after-free on return) along with the m_onExpand std::function whose
+    // invocation is still on the stack.
+    m_treeRebuildPending = true;
 }
 
 void UIManager::showPropertyPanel(bool show) {

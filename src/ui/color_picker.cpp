@@ -173,6 +173,15 @@ void ColorPicker::generateGeometry(std::vector<UIQuad>& outQuads, text::TextLayo
 bool ColorPicker::onMouseDown(float2 pos, int button) {
     if (!m_visible || !m_enabled) return false;
 
+    // Presses must start inside the picker: the sliders' absolute positions
+    // are only synced in collectGeometry, so when the picker is culled (e.g.
+    // scrolled out of a PropertyPanel) they hold stale coordinates and would
+    // steal clicks meant for whatever is drawn there now. The sliders lie
+    // strictly inside these bounds, so the gate loses no legitimate press.
+    // onMouseMove/onMouseUp stay unconditional so in-flight drags keep
+    // tracking outside the bounds.
+    if (!containsPoint(pos)) return false;
+
     // Forward to sliders
     if (m_redSlider && m_redSlider->onMouseDown(pos, button)) return true;
     if (m_greenSlider && m_greenSlider->onMouseDown(pos, button)) return true;

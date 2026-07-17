@@ -279,6 +279,10 @@ private:
     // Scene tree view
     ScrollView* m_sceneScrollView = nullptr;  // Non-owning, owned by m_scenePanel
     std::vector<TreeNode*> m_sceneNodes;  // Non-owning pointers to nodes in scroll view
+    // Expand/collapse events fire from inside TreeNode::onMouseDown; rebuilding
+    // the tree there destroys the node (and the std::function) still executing.
+    // The rebuild is deferred to update(), after the event stack has unwound.
+    bool m_treeRebuildPending = false;
     uint32_t m_selectedInstanceId = UINT32_MAX;
     SelectionCallback m_selectionCallback;
     LightEditCallback m_lightEditCallback;

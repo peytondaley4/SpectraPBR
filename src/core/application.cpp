@@ -458,6 +458,7 @@ bool Application::loadScene() {
         for (const auto& filePath : filesToLoad) {
             auto model = loader.load(filePath);
             if (!model) continue;
+            m_sceneManager->addLoadedModelPath(filePath.string());
 
             std::cout << "[App] Loaded model: " << model->name << "\n";
 
@@ -519,11 +520,17 @@ bool Application::loadScene() {
                         // with BSDF hits on the same geometry. Meshes with an
                         // emissive TEXTURE are skipped: NEE would evaluate the
                         // wrong (constant) emission, so those emit via path
-                        // hits only — unbiased, just noisier.
+                        // hits only — unbiased, just noisier. Alpha-MASK
+                        // materials are skipped for the same reason: NEE
+                        // samples the full triangle area and never runs the
+                        // emitter's own alpha test, so cut-out regions would
+                        // emit phantom energy that path hits (which respect
+                        // the mask) never deliver.
                         const auto& srcMesh = model->meshes[instance.meshIndex];
                         uint32_t origMatIdx = srcMesh.materialIndex;
                         if (origMatIdx < model->materials.size() &&
-                            model->materials[origMatIdx].emissiveTexPath.empty()) {
+                            model->materials[origMatIdx].emissiveTexPath.empty() &&
+                            model->materials[origMatIdx].alphaMode != ALPHA_MODE_MASK) {
                             const float3& em = model->materials[origMatIdx].emissive;
                             if (em.x + em.y + em.z > 0.01f) {
                                 const float* t = instance.transform;
@@ -1044,7 +1051,8 @@ void Application::setupCallbacks() {
 
         m_optixEngine->resetAccumulation();
         m_optixEngine->setDimensions(width, height);
-        resetPathGuideTraining();
+        // Guide training deliberately survives resize: the grid is
+        // world-space, and a resolution change alters nothing it learns from.
 
         m_camera->setAspectRatio(static_cast<float>(width) / static_cast<float>(height));
         m_uiManager->setScreenSize(width, height);
@@ -1204,7 +1212,9 @@ void Application::refreshMeshLightGeometry(uint32_t instanceId) {
 
 void Application::resetPathGuideTraining() {
     if (!m_pathGuideGrid || !m_pathGuideGrid->isInitialized()) return;
-    if (m_pathGuideMode == PathGuideMode::Disabled) return;
+    // Clears run even while guiding is Disabled: scene edits made with
+    // guiding off would otherwise leave stale trained lobes (aimed at old
+    // light positions, full maturity) to be resumed on re-enable.
 
     cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
     m_pathGuideGrid->clear(stream);  // Zero vMF lobes + stats (structure preserved)
@@ -1247,6 +1257,20 @@ void Application::renderFrame() {
         if (m_pathGuideStatsFrame >= 60) {
             m_pathGuideStatsFrame = 0;
             cudaStream_t stream = m_cudaInterop ? m_cudaInterop->getStream() : nullptr;
+            // Counters are uniformly subsampled in raygen (1/256 of pixels),
+            // so only their ratios are meaningful — report vs attempts.
+            if (verboseLogging()) {
+                auto s = m_optixEngine->readPathGuideStats();
+                if (s.attempts > 0) {
+                    float pct = 100.0f / static_cast<float>(s.attempts);
+                    std::cout << "[PathGuide] stats (60f window): attempts=" << s.attempts
+                              << " cell=" << s.cellFound * pct << "%"
+                              << " lobe=" << s.validLobe * pct << "%"
+                              << " horiz=" << s.belowHorizon * pct << "%"
+                              << " contrib=" << s.contributed * pct << "%"
+                              << " bsdf=" << s.bsdfSampled * pct << "%\n";
+                }
+            }
             m_optixEngine->resetPathGuideStats(stream);
 
             if (m_pathGuideGrid && m_pathGuideGrid->isInitialized()) {
@@ -1586,17 +1610,21 @@ void Application::keyCallback(GLFWwindow* window, int key, int scancode, int act
 
     if (action == GLFW_PRESS || action == GLFW_RELEASE) {
         bool pressed = (action == GLFW_PRESS);
-        switch (key) {
-            case GLFW_KEY_W: app->m_keyW = pressed; break;
-            case GLFW_KEY_S: app->m_keyS = pressed; break;
-            case GLFW_KEY_A: app->m_keyA = pressed; break;
-            case GLFW_KEY_D: app->m_keyD = pressed; break;
-            case GLFW_KEY_Q: app->m_keyQ = pressed; break;
-            case GLFW_KEY_E: app->m_keyE = pressed; break;
-            case GLFW_KEY_LEFT_SHIFT:
-            case GLFW_KEY_RIGHT_SHIFT:
-                app->m_keyShift = pressed; break;
-            default: break;
+        // Ctrl chords (e.g. Ctrl+S save) are commands, not movement — ignore
+        // presses; releases still pass through so held keys clear.
+        if (!(pressed && (mods & GLFW_MOD_CONTROL))) {
+            switch (key) {
+                case GLFW_KEY_W: app->m_keyW = pressed; break;
+                case GLFW_KEY_S: app->m_keyS = pressed; break;
+                case GLFW_KEY_A: app->m_keyA = pressed; break;
+                case GLFW_KEY_D: app->m_keyD = pressed; break;
+                case GLFW_KEY_Q: app->m_keyQ = pressed; break;
+                case GLFW_KEY_E: app->m_keyE = pressed; break;
+                case GLFW_KEY_LEFT_SHIFT:
+                case GLFW_KEY_RIGHT_SHIFT:
+                    app->m_keyShift = pressed; break;
+                default: break;
+            }
         }
     }
 
@@ -1650,19 +1678,19 @@ void Application::keyCallback(GLFWwindow* window, int key, int scancode, int act
 
         case GLFW_KEY_F1:
             app->m_qualityMode = QUALITY_FAST;
-            app->m_optixEngine->setQualityMode(QUALITY_FAST);
+            if (app->m_optixEngine) app->m_optixEngine->setQualityMode(QUALITY_FAST);
             break;
         case GLFW_KEY_F2:
             app->m_qualityMode = QUALITY_BALANCED;
-            app->m_optixEngine->setQualityMode(QUALITY_BALANCED);
+            if (app->m_optixEngine) app->m_optixEngine->setQualityMode(QUALITY_BALANCED);
             break;
         case GLFW_KEY_F3:
             app->m_qualityMode = QUALITY_HIGH;
-            app->m_optixEngine->setQualityMode(QUALITY_HIGH);
+            if (app->m_optixEngine) app->m_optixEngine->setQualityMode(QUALITY_HIGH);
             break;
         case GLFW_KEY_F4:
             app->m_qualityMode = QUALITY_ACCURATE;
-            app->m_optixEngine->setQualityMode(QUALITY_ACCURATE);
+            if (app->m_optixEngine) app->m_optixEngine->setQualityMode(QUALITY_ACCURATE);
             break;
 
         case GLFW_KEY_LEFT_BRACKET:
@@ -1963,7 +1991,10 @@ void Application::mouseButtonCallback(GLFWwindow* window, int button, int action
                                             std::max(1.0f - rbar * rbar, 1e-4f);
                             float meanDist = cs[PG_S_DIST] / w;
                             if (meanDist < 1e-4f) continue;
-                            float cap = (meanDist / sigmaPos) * (meanDist / sigmaPos);
+                            float ratio = meanDist / sigmaPos;
+                            // Achievable ceiling floored at 8 like the
+                            // refit's kappa cap (gate 2b mirror).
+                            float cap = std::max(ratio * ratio, 8.0f);
                             if (cap < 500.0f && implied > 4.0f * cap) {
                                 structure = true;
                                 break;

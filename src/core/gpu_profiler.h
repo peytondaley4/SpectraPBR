@@ -52,13 +52,16 @@ public:
     // Call once per frame after all GPU work is done (after sync)
     void endFrame() {
         if (!m_enabled) return;
-        
+
         m_frameCount++;
-        
+
         for (auto& [name, data] : m_timers) {
+            // Skip timers whose events haven't completed (or were never
+            // recorded) — an unchecked elapsed-time read would record 0.
+            if (cudaEventQuery(data.endEvent) != cudaSuccess) continue;
             float ms = 0.0f;
-            cudaEventElapsedTime(&ms, data.startEvent, data.endEvent);
-            
+            if (cudaEventElapsedTime(&ms, data.startEvent, data.endEvent) != cudaSuccess) continue;
+
             data.totalMs += ms;
             data.frameCount++;
             data.lastMs = ms;
@@ -151,7 +154,11 @@ private:
     cudaStream_t m_stream;
 };
 
+// Two-level paste so __LINE__ expands before concatenation (a direct
+// ##__LINE__ would name every scope _gpu_scope___LINE__).
+#define GPU_PROFILE_CAT2(a, b) a##b
+#define GPU_PROFILE_CAT(a, b) GPU_PROFILE_CAT2(a, b)
 #define GPU_PROFILE_SCOPE(profiler, name, stream) \
-    GpuProfileScope _gpu_scope_##__LINE__(profiler, name, stream)
+    GpuProfileScope GPU_PROFILE_CAT(_gpu_scope_, __LINE__)(profiler, name, stream)
 
 } // namespace spectra
